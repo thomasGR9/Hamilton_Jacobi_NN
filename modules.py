@@ -1143,7 +1143,69 @@ class IntraTrajectoryVarianceLossEfficient(nn.Module):
         
         return total_mean_variance
     
+class AdaptiveSoftRepulsionLoss(nn.Module):
+    """
+    Adaptive soft repulsion loss (vectorized, gradient-safe).
+    
+    Args:
+        epsilon: Minimum temperature value (default: 1e-3)
+        k: Scaling factor for adaptive temperature (default: 1.0)
+    """
+    def __init__(self, epsilon=1e-3, k=1.0):
+        super().__init__()
+        self.epsilon = epsilon
+        self.k = k
+        self.numerical_eps = 1e-8
 
+    def forward(self, X_final, U_final, trajectory_ids):
+        """
+        X_final: shape (batch,)
+        U_final: shape (batch,)
+        trajectory_ids: shape (batch,) ints
+        """
+        device = X_final.device
+        dtype = X_final.dtype
+
+        # Unique trajectory ids and map each sample to its group index
+        unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
+        N = unique_ids.shape[0]
+
+        if N <= 1:
+            # zero scalar that preserves graph and device/dtype
+            return X_final.sum() * 0.0
+
+        # compute group sums via scatter_add on new tensors (single kernel)
+        sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
+        sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
+        counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
+
+        X_means = sums_x / counts
+        U_means = sums_u / counts
+
+        # compute pair indices for i < j (condensed)
+        idx = torch.triu_indices(N, N, offset=1, device=device)  # shape (2, M)
+        i, j = idx[0], idx[1]
+
+        dx = X_means[i] - X_means[j]
+        du = U_means[i] - U_means[j]
+        dij = torch.sqrt(dx * dx + du * du + self.numerical_eps)  # shape (M,)
+
+        # compute detached temperature per center norm, then pairwise average
+        c_norms = torch.sqrt(X_means * X_means + U_means * U_means + self.numerical_eps).detach()
+        C_sum_pairs = 0.5 * (c_norms[i] + c_norms[j])
+        eps_t = X_final.new_tensor(self.epsilon)
+        Tij_pairs = torch.maximum(eps_t, self.k * C_sum_pairs).detach()
+
+        # exponential terms for i<j
+        exp_vals = torch.exp(-dij / (Tij_pairs + self.numerical_eps))
+
+        # original code averaged over ordered pairs (i != j). To preserve that exactly
+        # we double the sum over i<j (counts each unordered pair twice).
+        sum_ordered = 2.0 * exp_vals.sum()  # equals sum over i!=j entries
+        Z = float(N * (N - 1))
+        loss = sum_ordered / Z
+
+        return loss
 
 class ReverseStep2(nn.Module):
     """
@@ -1585,8 +1647,8 @@ def prediction_loss(
     return total_loss
 
 
-def compute_total_loss(mapping_loss, reconstruction_loss, prediction_loss,
-                      mapping_coefficient, prediction_coefficient,
+def compute_total_loss(mapping_loss, repulsion_loss, reconstruction_loss, prediction_loss,
+                      mapping_coefficient, repulsion_coefficient, prediction_coefficient,
                       mapping_loss_scale, prediction_loss_scale,
                       reconstruction_threshold, reconstruction_loss_multiplier):
     """
@@ -1594,9 +1656,11 @@ def compute_total_loss(mapping_loss, reconstruction_loss, prediction_loss,
     
     Args:
         mapping_loss: Raw mapping loss tensor (with gradients)
+        repulsion_loss: Raw repulsion loss tensor (with gradients)
         reconstruction_loss: Raw reconstruction loss tensor (with gradients)
         prediction_loss: Raw prediction loss tensor (with gradients)
         mapping_coefficient: Fixed weight for mapping loss (float, no gradients)
+        repulsion_coefficient: Fixed weight for repulsion loss (float, no gradients)
         prediction_coefficient: Fixed weight for prediction loss (float, no gradients)
         mapping_loss_scale: Fixed scale for mapping loss normalization (float, no gradients)
         prediction_loss_scale: Fixed scale for prediction loss normalization (float, no gradients)
@@ -1615,7 +1679,7 @@ def compute_total_loss(mapping_loss, reconstruction_loss, prediction_loss,
     # Two options provided - choose based on your needs
     
     # OPTION 1: Very sharp transition (almost like original but differentiable)
-    # This creates an almost step-like function but remains differentiable
+    # This creates an almost step-like function
     sharpness = 100.0  # Higher = sharper transition (closer to original if/else)
     
     smooth_factor = torch.sigmoid(
@@ -1641,6 +1705,7 @@ def compute_total_loss(mapping_loss, reconstruction_loss, prediction_loss,
     # Combine all losses with coefficients
     total_loss = (
         mapping_coefficient * mapping_loss_scaled + 
+        repulsion_coefficient * repulsion_loss +
         reconstruction_loss_scaled +
         prediction_coefficient * prediction_loss_scaled
     )
@@ -1970,6 +2035,7 @@ def train_model(
      
     #Needed objects
     var_loss_class,
+    repulsion_loss_class,
     get_data_from_trajectory_id,
     possible_t_values,
     
@@ -1986,6 +2052,7 @@ def train_model(
     mapping_loss_scale,
     prediction_loss_scale,
     mapping_coefficient,
+    repulsion_coefficient,
     prediction_coefficient,
     reconstruction_threshold,
     reconstruction_loss_multiplier,
@@ -2150,6 +2217,8 @@ def train_model(
         X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
         variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'])
 
+        repulsion_loss_ = repulsion_loss_class(X_final, U_final, batch['trajectory_ids'])
+
 
         x_recon, u_recon, t_recon = inverse_net(X_final, U_final, t_final)
         reconstruction_loss_ = reconstruction_loss(
@@ -2183,16 +2252,18 @@ def train_model(
 
         total_loss_ = compute_total_loss(
                 mapping_loss=variance_loss_, 
+                repulsion_loss = repulsion_loss_,
                 reconstruction_loss=reconstruction_loss_, 
                 prediction_loss=prediction_loss_,
                 mapping_coefficient=mapping_coefficient, 
+                repulsion_coefficient=repulsion_coefficient,
                 prediction_coefficient=prediction_coefficient,
                 mapping_loss_scale=mapping_loss_scale, 
                 prediction_loss_scale=prediction_loss_scale,
                 reconstruction_threshold=reconstruction_threshold, 
                 reconstruction_loss_multiplier=reconstruction_loss_multiplier
             )
-        return total_loss_, variance_loss_, reconstruction_loss_, prediction_loss_
+        return total_loss_, variance_loss_, repulsion_loss_, reconstruction_loss_, prediction_loss_
     
     
     
@@ -2227,11 +2298,14 @@ def train_model(
                 U_labels=U_val_labels
             )
 
+        repulsion_loss_= torch.zeros_like(variance_loss_)
         total_loss_ = compute_total_loss(
                 mapping_loss=variance_loss_, 
+                repulsion_loss=repulsion_loss_,
                 reconstruction_loss=reconstruction_loss_, 
                 prediction_loss=prediction_loss_,
                 mapping_coefficient=mapping_coefficient, 
+                repulsion_coefficient=repulsion_coefficient,
                 prediction_coefficient=prediction_coefficient,
                 mapping_loss_scale=mapping_loss_scale, 
                 prediction_loss_scale=prediction_loss_scale,
@@ -2255,6 +2329,7 @@ def train_model(
             # Initialize metrics
             train_total_loss_ = 0.0
             train_variance_loss_ = 0.0
+            train_repulsion_loss_ = 0.0
             train_reconstruction_loss_ = 0.0
             train_prediction_loss_ = 0.0
             batch_count = 0
@@ -2268,7 +2343,7 @@ def train_model(
                 optimizer.zero_grad()
 
                 # Run forward pass
-                total_loss_, variance_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch)
+                total_loss_, variance_loss_, repulsion_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch)
 
 
                 if torch.isnan(total_loss_) or torch.isinf(total_loss_):
@@ -2305,19 +2380,21 @@ def train_model(
                 # Update metrics
                 train_total_loss_ += total_loss_.item()
                 train_variance_loss_ += variance_loss_.item()
+                train_repulsion_loss_ += repulsion_loss_.item()
                 train_reconstruction_loss_ += reconstruction_loss_.item()
                 train_prediction_loss_ += prediction_loss_.item()
                 batch_count += 1
 
                 # Log progress
                 if verbose > 1 and batch_idx % log_freq_batches == 0:
-                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}")
+                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}")
 
 
                 
             # Calculate epoch metrics
             train_total_loss_ /= max(1, batch_count)
             train_variance_loss_ /= max(1, batch_count)
+            train_repulsion_loss_ /= max(1, batch_count)
             train_reconstruction_loss_ /= max(1, batch_count)
             train_prediction_loss_ /= max(1, batch_count)
 
@@ -2494,6 +2571,7 @@ def train_model(
             
             epoch_metrics['train_total_loss_'] = train_total_loss_
             epoch_metrics['train_variance_loss_'] = train_variance_loss_
+            epoch_metrics['train_repulsion_loss_'] = train_repulsion_loss_
             epoch_metrics['train_reconstruction_loss_'] = train_reconstruction_loss_
             epoch_metrics['train_prediction_loss_'] = train_prediction_loss_
 
@@ -2560,6 +2638,7 @@ def train_model(
                 print(f"\nEpoch {epoch}/{start_epoch+num_epochs} completed in {epoch_time:.2f}s")
                 print(f"Mean total train loss: {train_total_loss_:.4f}")
                 print(f"Mean variance train loss: {train_variance_loss_:.4f}")
+                print(f"Mean repulsion train loss: {train_repulsion_loss_:.4f}")
                 print(f"Mean reconstruction train loss: {train_reconstruction_loss_:.4f}")
                 print(f"Mean prediction train loss: {train_prediction_loss_:.4f}")
                 
@@ -2642,6 +2721,7 @@ def resume_training_from_checkpoint(
     
     # Needed objects
     var_loss_class,
+    repulsion_loss_class,
     get_data_from_trajectory_id,
     possible_t_values,
     
@@ -2657,6 +2737,7 @@ def resume_training_from_checkpoint(
     mapping_loss_scale,
     prediction_loss_scale,
     mapping_coefficient,
+    repulsion_coefficient,
     prediction_coefficient,
     reconstruction_threshold,
     reconstruction_loss_multiplier,
@@ -2685,7 +2766,7 @@ def resume_training_from_checkpoint(
     
     # Scheduler parameters  
     scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
-    scheduler_params={'mode': 'min', 'factor': 0.1, 'patience': 5, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+    scheduler_params=None,  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
     reset_scheduler_patience = False, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
     
     # Training parameters
@@ -2717,17 +2798,47 @@ def resume_training_from_checkpoint(
             temp_optimizer = Adam(all_params)
         elif optimizer_type == 'AdamW':
             temp_optimizer = AdamW(all_params)
-        temp_scheduler_params = scheduler_params 
-        temp_scheduler = ReduceLROnPlateau(temp_optimizer, **temp_scheduler_params)
+
+        temp_scheduler = ReduceLROnPlateau(temp_optimizer, mode='min', factor=0.1, patience=5, verbose=True) #Will be overwritten
         # Load checkpoint
         epoch, extra_info, best_val_loss = load_checkpoint(
             checkpoint_path, mapping_net, device, temp_optimizer, temp_scheduler
         )
+
+        # Override scheduler params if specified
+        if scheduler_params is not None:
+            print(f"Overriding scheduler params: {scheduler_params}")
+            for key, value in scheduler_params.items():
+                if hasattr(temp_scheduler, key):
+                    setattr(temp_scheduler, key, value)
+                    print(f"  {key}: {getattr(temp_scheduler, key)} -> {value}")
+                else:
+                    print(f"  Warning: scheduler has no attribute '{key}'")
+        else:
+            if hasattr(temp_scheduler, 'patience'):  # ReduceLROnPlateau
+                print("Using loaded scheduler")
+                print(f"  factor: {temp_scheduler.factor}")
+                print(f"  mode: {temp_scheduler.mode}")
+                print(f"  threshold: {temp_scheduler.threshold}")
+                print(f"  cooldown: {temp_scheduler.cooldown}")
+                print(f"  best: {temp_scheduler.best}")
+
+
         # Reset scheduler patience counter if requested
         if reset_scheduler_patience:
             temp_scheduler.num_bad_epochs = 0
             temp_scheduler.cooldown_counter = 0
             print(f"Reset scheduler patience counter. Will wait full {temp_scheduler.patience} epochs before reducing LR.")
+        else:
+            # Calculate remaining epochs until LR reduction
+            if temp_scheduler.cooldown_counter > 0:
+                print(f"Scheduler in cooldown mode: {temp_scheduler.cooldown_counter} epochs remaining in cooldown")
+            elif temp_scheduler.num_bad_epochs >= temp_scheduler.patience:
+                print(f"Scheduler ready to reduce LR on next bad epoch (num_bad_epochs={temp_scheduler.num_bad_epochs} >= patience={temp_scheduler.patience})")
+            else:
+                remaining_epochs = temp_scheduler.patience - temp_scheduler.num_bad_epochs
+                print(f"Scheduler status: {temp_scheduler.num_bad_epochs}/{temp_scheduler.patience} bad epochs. Will reduce LR after {remaining_epochs} more bad epochs.")
+
     else:
         epoch, extra_info, best_val_loss = load_checkpoint(
             checkpoint_path, mapping_net, device, None, None
@@ -2779,6 +2890,7 @@ def resume_training_from_checkpoint(
             
             # Needed objects
             var_loss_class=var_loss_class,
+            repulsion_loss_class=repulsion_loss_class,
             get_data_from_trajectory_id=get_data_from_trajectory_id,
             possible_t_values=possible_t_values,
             
@@ -2794,6 +2906,7 @@ def resume_training_from_checkpoint(
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
             mapping_coefficient=mapping_coefficient,
+            repulsion_coefficient=repulsion_coefficient,
             prediction_coefficient=prediction_coefficient,
             reconstruction_threshold=reconstruction_threshold,
             reconstruction_loss_multiplier=reconstruction_loss_multiplier,
@@ -2846,6 +2959,7 @@ def resume_training_from_checkpoint(
             
             # Needed objects
             var_loss_class=var_loss_class,
+            repulsion_loss_class=repulsion_loss_class,
             get_data_from_trajectory_id=get_data_from_trajectory_id,
             possible_t_values=possible_t_values,
             
@@ -2861,6 +2975,7 @@ def resume_training_from_checkpoint(
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
             mapping_coefficient=mapping_coefficient,
+            repulsion_coefficient=repulsion_coefficient,
             prediction_coefficient=prediction_coefficient,
             reconstruction_threshold=reconstruction_threshold,
             reconstruction_loss_multiplier=reconstruction_loss_multiplier,
@@ -2948,14 +3063,7 @@ def load_checkpoint(path, mapping_net, device, optimizer=None, scheduler=None):
     if scheduler is not None and 'scheduler' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler'])
         print(f"Successfully loaded scheduler")
-        if hasattr(scheduler, 'patience'):  # ReduceLROnPlateau
-            print(f"  patience: {scheduler.patience}")
-            print(f"  factor: {scheduler.factor}")
-            print(f"  mode: {scheduler.mode}")
-            print(f"  threshold: {scheduler.threshold}")
-            print(f"  cooldown: {scheduler.cooldown}")
-            print(f"  best: {scheduler.best}")
-            print(f"  num_bad_epochs: {scheduler.num_bad_epochs}")
+
     
     # Return epoch 
     return (

@@ -30,6 +30,7 @@ from modules import (
     CombinedHamiltonianLayer,
     SimpleStackedHamiltonianNetwork,
     IntraTrajectoryVarianceLossEfficient,
+    AdaptiveSoftRepulsionLoss,
     ReverseStep2,
     ReverseStep1,
     ReverseCombinedHamiltonianLayer,
@@ -72,7 +73,7 @@ val_id_df_high_energy = loaded_dfs['val_id_df_high_energy']
 
 
 def main():
-    resume_training = True
+    resume_training = False
 
     device = "cuda"
 
@@ -115,9 +116,9 @@ def main():
 
     mapping_net = SimpleStackedHamiltonianNetwork(
         #Hpw many Step_1 + Step_2 layers to stack
-        n_layers=20,
+        n_layers=10,
         # MLP Architecture parameters
-        hidden_dims= [100, 100, 100],
+        hidden_dims= [20, 40, 20],
         n_hidden_layers = None,   #Leave None if you provide list on hidden_dims
         
         # Activation parameters
@@ -126,8 +127,8 @@ def main():
         final_activation = None,   #Final layer activation function
         
         # Initialization parameters
-        weight_init = 'kaiming_uniform',
-        weight_init_params = None,
+        weight_init = 'orthogonal',
+        weight_init_params = {'gain': 1},
         bias_init = 'zeros',
         bias_init_value = 0.0,
         
@@ -147,10 +148,12 @@ def main():
 
 
     var_loss_class = IntraTrajectoryVarianceLossEfficient()
+    repulsion_loss_class = AdaptiveSoftRepulsionLoss(epsilon=0.01, k=1)
     possible_t_values = get_data_from_trajectory_id(ids_df=train_id_df, data_df=train_df, trajectory_ids=1)['t'].values.tolist() #Same possible t values for every trajectory
 
 
     save_dir = "./save_directory" 
+    save_dir_2 = "./save_directory_2" 
 
 
 
@@ -161,7 +164,7 @@ def main():
 
         inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
 
-        derived_mapping_loss_scale, derived_prediction_loss_scale = calculate_losses_scale_on_untrained(train_loader=train_dataloader, mapping_net=mapping_net, inverse_net=inverse_net, var_loss_class=var_loss_class, get_data_from_trajectory_id=get_data_from_trajectory_id, possible_t_values=possible_t_values, train_df=train_df, train_id_df=train_id_df, save_returned_values=True, save_dir=save_dir, noise_threshold_mean_divided_by_std = 2, device=device)
+        derived_mapping_loss_scale, derived_prediction_loss_scale = calculate_losses_scale_on_untrained(train_loader=train_dataloader, mapping_net=mapping_net, inverse_net=inverse_net, var_loss_class=var_loss_class, get_data_from_trajectory_id=get_data_from_trajectory_id, possible_t_values=possible_t_values, train_df=train_df, train_id_df=train_id_df, save_returned_values=True, save_dir=save_dir_2, noise_threshold_mean_divided_by_std = 2, device=device)
 
         train_model(
             # Dataloaders
@@ -176,6 +179,7 @@ def main():
 
             #Needed objects
             var_loss_class=var_loss_class,
+            repulsion_loss_class=repulsion_loss_class,
             get_data_from_trajectory_id=get_data_from_trajectory_id,
             possible_t_values=possible_t_values,
 
@@ -194,8 +198,9 @@ def main():
             mapping_loss_scale=derived_mapping_loss_scale,
             prediction_loss_scale=derived_prediction_loss_scale,
 
-            mapping_coefficient=1.5,
-            prediction_coefficient=1,
+            mapping_coefficient=1,
+            repulsion_coefficient=1.5,
+            prediction_coefficient=2,
 
             reconstruction_threshold=10**-6,
             reconstruction_loss_multiplier=5,
@@ -207,26 +212,26 @@ def main():
             optimizer_type = 'AdamW',
 
             learning_rate=1e-3,
-            weight_decay=1e-6,
+            weight_decay=1e-3,
 
             scheduler_type='plateau', 
-            scheduler_params={'mode': 'min', 'factor': 0.1, 'patience': 50, 'verbose': True},    # Dict of params specific to the scheduler. Set if it is a fresh training session.
+            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 400, 'verbose': True},    # Dict of params specific to the scheduler. Set if it is a fresh training session.
 
 
             # Training parameters
-            num_epochs=30,
+            num_epochs=800,
             grad_clip_value=None,
 
 
             # Early stopping parameters
-            early_stopping=False,
-            patience=5,
+            early_stopping=True,
+            patience=800,
             min_delta=0.001,
 
             # Checkpointing
-            save_dir=save_dir,
-            save_best_only=True,
-            save_freq_epochs=3,
+            save_dir=save_dir_2,
+            save_best_only=False,
+            save_freq_epochs=20,
             auto_rescue=True,
 
             # Logging
@@ -245,9 +250,9 @@ def main():
     
     else:
 
-        checkpoint_path = os.path.join(save_dir, "checkpoint_epoch_129.pt")
+        checkpoint_path = os.path.join(save_dir_2, "checkpoint_epoch_99.pt")
 
-        loss_scales_save_path = os.path.join(save_dir, "loss_scales.pkl")
+        loss_scales_save_path = os.path.join(save_dir_2, "loss_scales.pkl")
 
         with open(loss_scales_save_path, "rb") as f:
             loss_scales = pickle.load(f)
@@ -271,6 +276,7 @@ def main():
             
             # Needed objects
             var_loss_class= var_loss_class,
+            repulsion_loss_class=repulsion_loss_class,
             get_data_from_trajectory_id=get_data_from_trajectory_id,
             possible_t_values=possible_t_values,
             
@@ -288,8 +294,9 @@ def main():
             mapping_loss_scale=saved_mapping_loss_scale,
             prediction_loss_scale=saved_prediction_loss_scale,
 
-            mapping_coefficient=1.5,
-            prediction_coefficient=1,
+            mapping_coefficient=1,
+            repulsion_coefficient=2,
+            prediction_coefficient=2,
 
             reconstruction_threshold=10**-6,
             reconstruction_loss_multiplier=5,
@@ -313,32 +320,32 @@ def main():
             load_scheduler_and_optimizer=True,
             
             # Optimizer parameters
-            learning_rate=None,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
-            weight_decay=None,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
+            learning_rate=0.001,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
+            weight_decay=1e-3,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
             optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
             
             # Scheduler parameters  
             scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
-            scheduler_params={'mode': 'min', 'factor': 0.1, 'patience': 5, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
-            reset_scheduler_patience = False, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
+            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 101, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+            reset_scheduler_patience = True, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
             
             # Training parameters
-            num_epochs=30,  # Number of ADDITIONAL epochs to train 
+            num_epochs=100,  # Number of ADDITIONAL epochs to train 
             grad_clip_value=None, #Use None if you dont want gradient clipping, specify to use torch.nn.utils.clip_grad_norm_ in all parameters
             
             # Early stopping parameters
-            early_stopping=False,
-            patience=20,
+            early_stopping=True,
+            patience=101,
             min_delta=0.001,
             
             # Checkpointing
-            save_dir=save_dir,  # Should typically match the directory where checkpoint_path is located
+            save_dir=save_dir_2,  # Should typically match the directory where checkpoint_path is located
             save_best_only=False,
             save_freq_epochs=10,
             auto_rescue=True,
             
             # Logging
-            log_freq_batches=5,
+            log_freq_batches=10,
             verbose=2,
             
             # Device
