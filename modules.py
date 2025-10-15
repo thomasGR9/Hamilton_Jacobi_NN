@@ -1,5 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from matplotlib.patches import Ellipse
 import random
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -21,6 +23,7 @@ from datetime import datetime
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
+import torch.nn.functional as F
 
 def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
     """
@@ -360,11 +363,12 @@ class Step_1(nn.Module):
         activation: str = 'tanh',
         activation_params: Optional[dict] = None,
         final_activation: Optional[str] = None,
+        tanh_wrapper: bool = False,
         
         # Initialization parameters
         weight_init: str = 'xavier_uniform',
         weight_init_params: Optional[dict] = None,
-        bias_init: str = 'zeros',
+        bias_init: str = 'zeros', 
         bias_init_value: float = 0.0,
         
         # Architectural choices
@@ -378,21 +382,31 @@ class Step_1(nn.Module):
         a_eps_min: float = 0.1,  # Minimum value for a
         a_eps_max: float = 10.0,  # Maximum value for a  
         a_k: float = 0.1,  # Sigmoid steepness
+        a_raw_innit: float = 0.0,
+        gamma_innit: float = 5.0,
+        g_bound_innit: float = 10.0,
     ):
         """
         Initialize the velocity transformation layer with trainable parameters.
         """
         super(Step_1, self).__init__()
+
+        self.tanh_wrapper = tanh_wrapper
         
         # Initialize trainable parameters
-        self.a_raw = nn.Parameter(torch.tensor(0.0))  
+        self.a_raw = nn.Parameter(torch.tensor(a_raw_innit))  
         self.c1 = nn.Parameter(torch.tensor(0.0))
-        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.gamma = nn.Parameter(torch.tensor(gamma_innit))
         self.c2 = nn.Parameter(torch.tensor(0.0))
+
+        if tanh_wrapper:
+            self.g_bound = nn.Parameter(torch.tensor(g_bound_innit))
         
         self.a_eps_min = a_eps_min
         self.a_eps_max = a_eps_max
         self.a_k = a_k
+
+
 
         
         # Process hidden dimensions
@@ -539,6 +553,9 @@ class Step_1(nn.Module):
         
         # Forward pass through the MLP
         G = self.G_network(mlp_input)
+
+        if self.tanh_wrapper:
+            G = self.g_bound * torch.tanh(G / self.g_bound)
         
         # Compute the gradient ∂G/∂x
         dG_dx = torch.autograd.grad(
@@ -617,6 +634,7 @@ class Step_2(nn.Module):
         activation: str = 'tanh',
         activation_params: Optional[dict] = None,
         final_activation: Optional[str] = None,
+        tanh_wrapper: bool = False,
         
         # Initialization parameters
         weight_init: str = 'xavier_uniform',
@@ -635,6 +653,9 @@ class Step_2(nn.Module):
         a_eps_min: float = 0.1,
         a_eps_max: float = 10.0,
         a_k: float = 0.1,
+        a_raw_innit: float = 0.0,
+        gamma_innit: float = 5.0,
+        f_bound_innit: float = 10.0,
     ):
         super(Step_2, self).__init__()
         
@@ -642,12 +663,15 @@ class Step_2(nn.Module):
         self.a_eps_min = a_eps_min
         self.a_eps_max = a_eps_max
         self.a_k = a_k
+        self.tanh_wrapper = tanh_wrapper
         
         # Initialize trainable parameters
-        self.a_raw = nn.Parameter(torch.tensor(0.0))
+        self.a_raw = nn.Parameter(torch.tensor(a_raw_innit))
         self.c1 = nn.Parameter(torch.tensor(0.0))
-        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.gamma = nn.Parameter(torch.tensor(gamma_innit))
         self.c2 = nn.Parameter(torch.tensor(0.0))
+        if tanh_wrapper:
+            self.f_bound = nn.Parameter(torch.tensor(f_bound_innit))
         
         # Process hidden dimensions
         if isinstance(hidden_dims, int):
@@ -793,7 +817,10 @@ class Step_2(nn.Module):
         
         # Forward pass through the MLP
         F = self.F_network(mlp_input)
-        
+
+        if self.tanh_wrapper:
+            F = self.f_bound * torch.tanh(F / self.f_bound)
+
         # Compute the gradient dF_du
         dF_du = torch.autograd.grad(
             outputs=F,
@@ -867,6 +894,7 @@ class CombinedHamiltonianLayer(nn.Module):
         step1_activation: str = 'tanh',
         step1_activation_params: Optional[dict] = None,
         step1_final_activation: Optional[str] = None,
+        step1_tanh_wrapper : bool = False,
 
         
         # Step 2 parameters (F network: takes U,t → scalar)
@@ -875,6 +903,7 @@ class CombinedHamiltonianLayer(nn.Module):
         step2_activation: str = 'tanh',
         step2_activation_params: Optional[dict] = None,
         step2_final_activation: Optional[str] = None,
+        step2_tanh_wrapper : bool = False,
 
         
         # Shared initialization parameters (apply to both steps)
@@ -895,6 +924,9 @@ class CombinedHamiltonianLayer(nn.Module):
         a_eps_min: float = 0.1,  # Minimum value for a
         a_eps_max: float = 10.0,  # Maximum value for a  
         a_k: float = 0.1,  # Sigmoid steepness
+        a_raw_innit: float = 0.0,
+        gamma_innit: float = 5.0,
+        bound_innit: float = 10.0,
 
     ):
         """
@@ -916,6 +948,7 @@ class CombinedHamiltonianLayer(nn.Module):
             activation=step1_activation,
             activation_params=step1_activation_params,
             final_activation=step1_final_activation,
+            tanh_wrapper=step1_tanh_wrapper,
             weight_init=weight_init,
             weight_init_params=weight_init_params,
             bias_init=bias_init,
@@ -928,7 +961,9 @@ class CombinedHamiltonianLayer(nn.Module):
             a_eps_min= a_eps_min,  # Minimum value for a
             a_eps_max= a_eps_max,  # Maximum value for a  
             a_k= a_k,  # Sigmoid steepness
-
+            a_raw_innit = a_raw_innit,
+            gamma_innit = gamma_innit,
+            g_bound_innit=bound_innit
         )
         
         # Create Step 2: Position Transform Layer  
@@ -940,6 +975,7 @@ class CombinedHamiltonianLayer(nn.Module):
             activation=step2_activation,
             activation_params=step2_activation_params,
             final_activation=step2_final_activation,
+            tanh_wrapper=step2_tanh_wrapper,
             weight_init=weight_init,
             weight_init_params=weight_init_params,
             bias_init=bias_init,
@@ -952,6 +988,9 @@ class CombinedHamiltonianLayer(nn.Module):
             a_eps_min= a_eps_min,  # Minimum value for a
             a_eps_max= a_eps_max,  # Maximum value for a  
             a_k= a_k,  # Sigmoid steepness
+            a_raw_innit = a_raw_innit,
+            gamma_innit = gamma_innit,
+            f_bound_innit=bound_innit
 
         )
         
@@ -979,7 +1018,14 @@ class CombinedHamiltonianLayer(nn.Module):
     
 
 
+def solve_a_raw(a_eps_min, a_eps_max, a_k, a_target):
 
+    if (a_target <= a_eps_min) or (a_target >= a_eps_max):
+        raise ValueError(f"a_target must be between a_eps_min and a_eps_max. Got {a_target}")
+    
+    s = (a_target-a_eps_min) / (a_eps_max-a_eps_min)
+    a_raw = (1/a_k) * np.log(s / (1-s))
+    return a_raw
     
 class SimpleStackedHamiltonianNetwork(nn.Module):
     """
@@ -994,6 +1040,8 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         activation: str = 'tanh',
         activation_params: Optional[dict] = None,
         final_activation: Optional[str] = None,
+        final_activation_only_on_final_layer: bool = True,
+        tanh_wrapper : bool = False,
         weight_init: str = 'xavier_uniform',
         weight_init_params: Optional[dict] = None,
         bias_init: str = 'zeros',
@@ -1009,6 +1057,10 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         a_eps_min: float = 0.1,  # Minimum value for a
         a_eps_max: float = 10.0,  # Maximum value for a  
         a_k: float = 0.1,  # Sigmoid steepness
+        a_innit: float = 0.0,
+        gamma_innit: float = 5.0,
+
+        bound_innit: float = 10.0,
         **kwargs  # Catch any extra parameters
     ):
         """
@@ -1027,39 +1079,105 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         
         self.n_layers = n_layers
         self.layers = nn.ModuleList()
-        
+
+        self.activation = activation
+        self.activation_params = activation_params
+        self.final_activation = final_activation
+        self.final_activation_only_on_final_layer = final_activation_only_on_final_layer
+        self.weight_init = weight_init
+        self.weight_init_params = weight_init_params
+        self.bias_init = bias_init
+        self.bias_init_value = bias_init_value
+        self.a_eps_min = a_eps_min
+        self.a_eps_max=a_eps_max
+        self.a_k=a_k
+        self.tanh_wrapper = tanh_wrapper
+        self.a_innit = a_innit
+        self.gamma_innit = gamma_innit
+        self.bound_innit = bound_innit
+
+        a_raw_innit = solve_a_raw(a_eps_min=a_eps_min, a_eps_max=a_eps_max, a_k=a_k, a_target=a_innit)
 
         
-        for i in range(n_layers):
-            layer = CombinedHamiltonianLayer(
-                # Step 1 parameters
-                step1_hidden_dims=hidden_dims,
-                step1_n_hidden_layers=n_hidden_layers,
-                step1_activation=activation,
-                step1_activation_params=activation_params,
-                step1_final_activation=final_activation,
-                # Step 2 parameters (same as step 1 for simplicity)
-                step2_hidden_dims=hidden_dims,
-                step2_n_hidden_layers=n_hidden_layers,
-                step2_activation=activation,
-                step2_activation_params=activation_params,
-                step2_final_activation=final_activation,
-                # Shared parameters
-                weight_init=weight_init,
-                weight_init_params=weight_init_params,
-                bias_init=bias_init,
-                bias_init_value=bias_init_value,
-                use_bias=use_bias,
-                input_dim= input_dim,  # x and t
-                output_dim= output_dim,  # scalar G
-                
-                # Trainable parameter constraints
-                a_eps_min= a_eps_min,  # Minimum value for a
-                a_eps_max= a_eps_max,  # Maximum value for a  
-                a_k= a_k,  # Sigmoid steepness
-                **kwargs  # Pass any remaining kwargs
-            )
-            self.layers.append(layer)
+        if final_activation_only_on_final_layer:
+            for i in range(n_layers):
+                if i < n_layers - 1:
+                    # Intermediate layers: use the main activation
+                    layer_final_activation = activation
+                else:
+                    # Last layer: use the specified final_activation (can be None)
+                    layer_final_activation = final_activation
+                layer = CombinedHamiltonianLayer(
+                    # Step 1 parameters
+                    step1_hidden_dims=hidden_dims,
+                    step1_n_hidden_layers=n_hidden_layers,
+                    step1_activation=activation,
+                    step1_activation_params=activation_params,
+                    step1_final_activation=layer_final_activation,
+                    step1_tanh_wrapper = tanh_wrapper,
+                    # Step 2 parameters (same as step 1 for simplicity)
+                    step2_hidden_dims=hidden_dims,
+                    step2_n_hidden_layers=n_hidden_layers,
+                    step2_activation=activation,
+                    step2_activation_params=activation_params,
+                    step2_final_activation=layer_final_activation,
+                    step2_tanh_wrapper = tanh_wrapper,
+                    # Shared parameters
+                    weight_init=weight_init,
+                    weight_init_params=weight_init_params,
+                    bias_init=bias_init,
+                    bias_init_value=bias_init_value,
+                    use_bias=use_bias,
+                    input_dim= input_dim,  # x and t
+                    output_dim= output_dim,  # scalar G
+
+                    # Trainable parameter constraints
+                    a_eps_min= a_eps_min,  # Minimum value for a
+                    a_eps_max= a_eps_max,  # Maximum value for a  
+                    a_k= a_k,  # Sigmoid steepness
+                    a_raw_innit = a_raw_innit,
+                    gamma_innit = gamma_innit,
+                    bound_innit = bound_innit,
+                    **kwargs  # Pass any remaining kwargs
+                )
+                self.layers.append(layer)
+        
+        else:
+            for i in range(n_layers):
+                layer = CombinedHamiltonianLayer(
+                    # Step 1 parameters
+                    step1_hidden_dims=hidden_dims,
+                    step1_n_hidden_layers=n_hidden_layers,
+                    step1_activation=activation,
+                    step1_activation_params=activation_params,
+                    step1_final_activation=final_activation,
+                    step1_tanh_wrapper = tanh_wrapper,
+                    # Step 2 parameters (same as step 1 for simplicity)
+                    step2_hidden_dims=hidden_dims,
+                    step2_n_hidden_layers=n_hidden_layers,
+                    step2_activation=activation,
+                    step2_activation_params=activation_params,
+                    step2_final_activation=final_activation,
+                    step2_tanh_wrapper = tanh_wrapper,
+                    # Shared parameters
+                    weight_init=weight_init,
+                    weight_init_params=weight_init_params,
+                    bias_init=bias_init,
+                    bias_init_value=bias_init_value,
+                    use_bias=use_bias,
+                    input_dim= input_dim,  # x and t
+                    output_dim= output_dim,  # scalar G
+
+                    # Trainable parameter constraints
+                    a_eps_min= a_eps_min,  # Minimum value for a
+                    a_eps_max= a_eps_max,  # Maximum value for a  
+                    a_k= a_k,  # Sigmoid steepness
+                    a_raw_innit = a_raw_innit,
+                    gamma_innit = gamma_innit,
+                    bound_innit = bound_innit,
+                    **kwargs  # Pass any remaining kwargs
+                )
+                self.layers.append(layer)
     
     def forward(self, x, u, t):
         """Forward pass through all layers."""
@@ -1206,6 +1324,212 @@ class AdaptiveSoftRepulsionLoss(nn.Module):
         loss = sum_ordered / Z
 
         return loss
+    
+def hsic_loss(
+    X_final: torch.Tensor, 
+    U_final: torch.Tensor, 
+    trajectory_ids: torch.Tensor,
+    sigma_X_means: float = -1.0,
+    sigma_U_means: float = -1.0,
+    use_unbiased: bool = True,
+    epsilon: float = 1e-10,
+) -> torch.Tensor:
+    """
+    HSIC loss with guaranteed gradient flow and improved efficiency.
+    """
+    device = X_final.device
+    dtype = X_final.dtype
+    # Unique trajectory ids and map each sample to its group index
+    unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
+    N = unique_ids.shape[0]
+    if N <= 1:
+        # zero scalar that preserves graph and device/dtype
+        return X_final.sum() * 0.0
+    # compute group sums via scatter_add on new tensors (single kernel)
+    sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
+    sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
+    counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
+    X_means = sums_x / counts
+    U_means = sums_u / counts
+
+    if X_means.shape != U_means.shape:
+        raise ValueError(f"X_means and U_means must have the same shape. Got X_means: {X_means.shape}, U_means: {U_means.shape}")
+    if X_means.dim() != 1:
+        raise ValueError(f"Expected 1D tensors, got X_means.dim()={X_means.dim()}. Please squeeze or select the right dimension.")
+    
+    batch_size = X_means.shape[0]
+    min_batch = 4 if use_unbiased else 2
+    
+    # FIX 1: Return zero loss with proper gradient connection instead of error
+    if batch_size < min_batch:
+        # Create a zero tensor that maintains gradient flow
+        # Use X_means and U_means to ensure gradient connection
+        zero_loss = (X_means.sum() * 0.0 + U_means.sum() * 0.0)  # Gradient flows but equals 0
+        return zero_loss
+    
+    X_means = X_means.view(-1, 1)
+    U_means = U_means.view(-1, 1)
+    
+    K = _compute_rbf_kernel(X_means, sigma_X_means, epsilon, use_unbiased, batch_size)
+    L = _compute_rbf_kernel(U_means, sigma_U_means, epsilon, use_unbiased, batch_size)
+    
+    if use_unbiased:
+        b = float(batch_size)  # Convert to float once for efficiency
+        
+        # Pre-compute for efficiency
+        KL = K @ L
+        K_sum = K.sum()
+        L_sum = L.sum()
+        KL_sum = KL.sum()
+        KL_trace = KL.trace()
+        
+        # Direct computation without intermediate variables (more efficient)
+        hsic = (KL_trace + (K_sum * L_sum) / ((b - 1) * (b - 2)) - 
+                2.0 * KL_sum / (b - 2)) / (b * (b - 3))
+    else:
+        b = float(batch_size)
+        
+        # More efficient centering without repeated mean computations
+        K_mean = K.mean()
+        L_mean = L.mean()
+        K_row_mean = K.mean(dim=1, keepdim=True)
+        L_row_mean = L.mean(dim=1, keepdim=True)
+        
+        # Direct computation of centered kernel product
+        K_centered = K - K_row_mean - K_row_mean.t() + K_mean
+        L_centered = L - L_row_mean - L_row_mean.t() + L_mean
+        
+        hsic = (K_centered * L_centered).sum() / (b * b)
+    
+    # FIX 2: Replace clamp with torch.maximum (more explicit gradient behavior)
+    # Or use F.relu which is equivalent but clearer for non-negativity
+    # Actually, if computed correctly, HSIC should be non-negative
+    # But for numerical stability with float operations:
+    zero = torch.tensor(0.0, device=hsic.device, dtype=hsic.dtype, requires_grad=False)
+    hsic = torch.maximum(hsic, zero)
+    
+    return hsic
+
+def hsic_loss_statistics_only(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sigma_x: float = -1.0,
+    sigma_y: float = -1.0,
+    use_unbiased: bool = True,
+    epsilon: float = 1e-10,
+) -> torch.Tensor:
+    """
+    HSIC loss with guaranteed gradient flow and improved efficiency.
+    """
+    if x.shape != y.shape:
+        raise ValueError(f"x and y must have the same shape. Got x: {x.shape}, y: {y.shape}")
+    if x.dim() != 1:
+        raise ValueError(f"Expected 1D tensors, got x.dim()={x.dim()}. Please squeeze or select the right dimension.")
+    
+    batch_size = x.shape[0]
+    min_batch = 4 if use_unbiased else 2
+    
+    # FIX 1: Return zero loss with proper gradient connection instead of error
+    if batch_size < min_batch:
+        # Create a zero tensor that maintains gradient flow
+        # Use x and y to ensure gradient connection
+        zero_loss = (x.sum() * 0.0 + y.sum() * 0.0)  # Gradient flows but equals 0
+        return zero_loss
+    
+    x = x.view(-1, 1)
+    y = y.view(-1, 1)
+    
+    K = _compute_rbf_kernel(x, sigma_x, epsilon, use_unbiased, batch_size)
+    L = _compute_rbf_kernel(y, sigma_y, epsilon, use_unbiased, batch_size)
+    
+    if use_unbiased:
+        b = float(batch_size)  # Convert to float once for efficiency
+        
+        # Pre-compute for efficiency
+        KL = K @ L
+        K_sum = K.sum()
+        L_sum = L.sum()
+        KL_sum = KL.sum()
+        KL_trace = KL.trace()
+        
+        # Direct computation without intermediate variables (more efficient)
+        hsic = (KL_trace + (K_sum * L_sum) / ((b - 1) * (b - 2)) - 
+                2.0 * KL_sum / (b - 2)) / (b * (b - 3))
+    else:
+        b = float(batch_size)
+        
+        # More efficient centering without repeated mean computations
+        K_mean = K.mean()
+        L_mean = L.mean()
+        K_row_mean = K.mean(dim=1, keepdim=True)
+        L_row_mean = L.mean(dim=1, keepdim=True)
+        
+        # Direct computation of centered kernel product
+        K_centered = K - K_row_mean - K_row_mean.t() + K_mean
+        L_centered = L - L_row_mean - L_row_mean.t() + L_mean
+        
+        hsic = (K_centered * L_centered).sum() / (b * b)
+    
+    # FIX 2: Replace clamp with torch.maximum (more explicit gradient behavior)
+    # Or use F.relu which is equivalent but clearer for non-negativity
+    # Actually, if computed correctly, HSIC should be non-negative
+    # But for numerical stability with float operations:
+    zero = torch.tensor(0.0, device=hsic.device, dtype=hsic.dtype, requires_grad=False)
+    hsic = torch.maximum(hsic, zero)
+    
+    return hsic
+
+
+def _compute_rbf_kernel(
+    z: torch.Tensor,
+    sigma: float,
+    epsilon: float,
+    use_unbiased: bool,
+    batch_size: int,
+) -> torch.Tensor:
+    """
+    Compute RBF kernel matrix with improved efficiency and gradient safety.
+    """
+    # More efficient distance computation
+    # Using einsum for clarity and potential optimization
+    zz = z @ z.t()
+    z_squared = zz.diagonal()  # More efficient than diag()
+    
+    # Compute squared distances efficiently
+    dist_sq = z_squared.unsqueeze(1) + z_squared.unsqueeze(0) - 2.0 * zz
+    
+    # Ensure non-negative (F.relu is explicit about gradient behavior)
+    dist_sq = F.relu(dist_sq)
+    
+    if sigma < 0:
+        # Adaptive bandwidth using median heuristic
+        # More efficient: get upper triangular part directly
+        mask = torch.triu(torch.ones(batch_size, batch_size, device=z.device, dtype=torch.bool), diagonal=1)
+        off_diag_dists = dist_sq[mask]
+        
+        if off_diag_dists.numel() > 0:
+            # CORRECT: Detach for bandwidth computation
+            median_dist = off_diag_dists.detach().median()
+            # Use torch.maximum instead of clamp for clarity
+            bandwidth_sq = torch.maximum(median_dist, 
+                                        torch.tensor(epsilon, device=z.device, dtype=z.dtype))
+        else:
+            # FIX 3: Explicitly set requires_grad=False for the constant
+            bandwidth_sq = torch.tensor(1.0, dtype=z.dtype, device=z.device, requires_grad=False)
+    else:
+        # FIX 3: Create tensor with explicit requires_grad=False
+        bandwidth_sq = torch.tensor(max(sigma ** 2, epsilon), 
+                                   dtype=z.dtype, device=z.device, requires_grad=False)
+    
+    # Compute RBF kernel
+    K = torch.exp(-0.5 * dist_sq / bandwidth_sq)
+    
+    if use_unbiased:
+        # More efficient: modify diagonal in-place after clone
+        K = K.clone()
+        K.fill_diagonal_(0.0)
+    
+    return K
 
 class ReverseStep2(nn.Module):
     """
@@ -1313,6 +1637,7 @@ class ReverseCombinedHamiltonianLayer(nn.Module):
         self.reverse_step2 = ReverseStep2(
             forward_combined_layer.step_2,  # Share with forward Step_2
         )
+
         
         self.reverse_step1 = ReverseStep1(
             forward_combined_layer.step_1,  # Share with forward Step_1
@@ -1647,9 +1972,9 @@ def prediction_loss(
     return total_loss
 
 
-def compute_total_loss(mapping_loss, repulsion_loss, reconstruction_loss, prediction_loss,
+def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_loss, prediction_loss,
                       mapping_coefficient, repulsion_coefficient, prediction_coefficient,
-                      mapping_loss_scale, prediction_loss_scale,
+                      mapping_loss_scale, prediction_loss_scale, hsic_loss_slope,
                       reconstruction_threshold, reconstruction_loss_multiplier):
     """
     Compute final total loss with scale normalization and gradient-safe safety switch.
@@ -1674,6 +1999,10 @@ def compute_total_loss(mapping_loss, repulsion_loss, reconstruction_loss, predic
     # Scale mapping and prediction losses by fixed scales (gradients preserved)
     mapping_loss_scaled = mapping_loss / mapping_loss_scale
     prediction_loss_scaled = prediction_loss / prediction_loss_scale
+
+    
+
+    hsic_loss_scaled = hsic_loss * hsic_loss_slope
     
     # ===== GRADIENT-SAFE SAFETY SWITCH =====
     # Two options provided - choose based on your needs
@@ -1706,6 +2035,7 @@ def compute_total_loss(mapping_loss, repulsion_loss, reconstruction_loss, predic
     total_loss = (
         mapping_coefficient * mapping_loss_scaled + 
         repulsion_coefficient * repulsion_loss +
+        hsic_loss_scaled +
         reconstruction_loss_scaled +
         prediction_coefficient * prediction_loss_scaled
     )
@@ -2020,7 +2350,8 @@ def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, 
             print(f"Saved values at {save_path}")
         return variance_loss_epoch_mean, prediction_loss_epoch_mean
 
-
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def train_model(
     # Dataloaders
@@ -2056,6 +2387,7 @@ def train_model(
     prediction_coefficient,
     reconstruction_threshold,
     reconstruction_loss_multiplier,
+    hsic_loss_max_want,
     on_distribution_val_criterio_weight = 0.75,
     
     
@@ -2146,6 +2478,91 @@ def train_model(
                 # Save current state  
                 save_checkpoint(rescue_path, mapping_net, optimizer, scheduler, epoch, best_val_loss,
                                extra_info={'interrupted_at_batch': batch_idx, 'exception': traceback.format_exc()})
+                run_hyperparameters ={}
+                run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
+                run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
+                run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
+                run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
+                run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+            
+                n_parameters = count_parameters(mapping_net)
+                run_hyperparameters['model_trainable_parameter_count'] = n_parameters
+            
+                model_n_layers = mapping_net.n_layers
+                run_hyperparameters['model_n_layers'] = model_n_layers
+            
+                model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
+                run_hyperparameters['model_hidden_dims'] = model_hidden_dims
+            
+                model_activation = mapping_net.activation 
+                run_hyperparameters['model_activation'] = model_activation
+            
+                model_activation_params = mapping_net.activation_params 
+                run_hyperparameters['model_activation_params'] = model_activation_params
+            
+                model_final_activation = mapping_net.final_activation 
+                run_hyperparameters['model_final_activation'] = model_final_activation
+
+                model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
+                run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
+
+                model_tanh_wrapper = mapping_net.tanh_wrapper
+                run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
+            
+                model_weight_init = mapping_net.weight_init 
+                run_hyperparameters['model_weight_init'] = model_weight_init
+            
+                model_weight_init_params = mapping_net.weight_init_params 
+                run_hyperparameters['model_weight_init_params'] = model_weight_init_params
+            
+                model_bias_init = mapping_net.bias_init 
+                run_hyperparameters['model_bias_init'] = model_bias_init
+            
+                model_bias_init_value = mapping_net.bias_init_value 
+                run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+            
+                model_a_eps_min = mapping_net.a_eps_min 
+                run_hyperparameters['model_a_eps_min'] = model_a_eps_min
+            
+                model_a_eps_max = mapping_net.a_eps_max
+                run_hyperparameters['model_a_eps_max'] = model_a_eps_max
+                
+                model_a_k = mapping_net.a_k
+                run_hyperparameters['model_a_k'] = model_a_k
+
+                model_a_innit = mapping_net.a_innit
+                run_hyperparameters['model_a_innit'] = model_a_innit
+
+                model_gamma_innit = mapping_net.gamma_innit
+                run_hyperparameters['model_gamma_innit'] = model_gamma_innit
+
+                model_bound_innit = mapping_net.bound_innit
+                run_hyperparameters['model_bound_innit'] = model_bound_innit
+            
+                repulsion_loss_epsilon = repulsion_loss_class.epsilon
+                run_hyperparameters['repulsion_loss_epsilon'] = repulsion_loss_epsilon
+            
+                repulsion_loss_k = repulsion_loss_class.k
+                run_hyperparameters['repulsion_loss_k'] = repulsion_loss_k
+            
+                run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
+                run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+            
+                run_hyperparameters['mapping_coefficient'] = mapping_coefficient
+                run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
+                run_hyperparameters['prediction_coefficient'] = prediction_coefficient
+                run_hyperparameters['reconstruction_threshold'] = reconstruction_threshold
+                run_hyperparameters['reconstruction_loss_multiplier'] = reconstruction_loss_multiplier
+                run_hyperparameters['hsic_loss_max_want'] = hsic_loss_max_want
+                run_hyperparameters['on_distribution_val_criterio_weight'] = on_distribution_val_criterio_weight
+                run_hyperparameters['grad_clip_value'] = grad_clip_value
+                
+            
+            
+                with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch}.json"), "w") as f:
+                    # Convert any non-serializable objects
+                    serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
+                    json.dump(serializable_run_hyperparameters, f, indent=2)
 
                 print(f"Rescue checkpoint saved to: {rescue_path}")
                 print(f"You can resume training from this checkpoint later.")
@@ -2171,18 +2588,41 @@ def train_model(
     val_batches_training_set = len(val_loader_training_set)
     
     
-    # Create the original all_params list for gradient clipping
-    all_params = mapping_net.parameters()
+    # Create parameter lists 
+    mlp_params = []
+    transform_params = []
+    scale_params = []
+
+    for name, param in mapping_net.named_parameters():
+        if ('G_network' in name) or ('F_network' in name):
+            mlp_params.append(param)
+        elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
+            scale_params.append(param)
+        else: #c1, c2, gamma
+            transform_params.append(param)
+        
+    
+
+
+
     
 
 
     if optimizer==None:
         if optimizer_type == 'Adam':
             print(f"Initializing new Adam optimizer with learning rate: {learning_rate}")
-            optimizer = Adam(all_params, lr=learning_rate)
+            optimizer = Adam([
+                {'params': mlp_params, 'lr': learning_rate},
+                {'params': scale_params, 'lr': learning_rate},
+                {'params': transform_params, 'lr': learning_rate},
+            ])
         elif optimizer_type == 'AdamW':
             print(f"Initializing new AdamW optimizer with learning rate: {learning_rate}, and weight decay {weight_decay}")
-            optimizer = AdamW(all_params, lr=learning_rate, weight_decay=weight_decay)  
+            optimizer = AdamW([
+                {'params': mlp_params, 'weight_decay': weight_decay},
+                {'params': scale_params, 'weight_decay': 0.0},
+                {'params': transform_params, 'weight_decay': weight_decay},
+            ], lr=learning_rate)  
         else:
             raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")       
     
@@ -2213,11 +2653,12 @@ def train_model(
 
     
     # Define a function to run the forward pass
-    def forward_pass(batch):
+    def forward_pass(batch, hsic_loss_slope):
         X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
         variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'])
 
         repulsion_loss_ = repulsion_loss_class(X_final, U_final, batch['trajectory_ids'])
+        hsic_loss_ = hsic_loss(X_final, U_final, batch['trajectory_ids'], sigma_X_means=-1, sigma_U_means=-1, use_unbiased=True)
 
 
         x_recon, u_recon, t_recon = inverse_net(X_final, U_final, t_final)
@@ -2253,17 +2694,19 @@ def train_model(
         total_loss_ = compute_total_loss(
                 mapping_loss=variance_loss_, 
                 repulsion_loss = repulsion_loss_,
+                hsic_loss = hsic_loss_,
                 reconstruction_loss=reconstruction_loss_, 
                 prediction_loss=prediction_loss_,
                 mapping_coefficient=mapping_coefficient, 
                 repulsion_coefficient=repulsion_coefficient,
                 prediction_coefficient=prediction_coefficient,
+                hsic_loss_slope=hsic_loss_slope,
                 mapping_loss_scale=mapping_loss_scale, 
                 prediction_loss_scale=prediction_loss_scale,
                 reconstruction_threshold=reconstruction_threshold, 
                 reconstruction_loss_multiplier=reconstruction_loss_multiplier
             )
-        return total_loss_, variance_loss_, repulsion_loss_, reconstruction_loss_, prediction_loss_
+        return total_loss_, variance_loss_, repulsion_loss_, hsic_loss_, reconstruction_loss_, prediction_loss_
     
     
     
@@ -2299,15 +2742,18 @@ def train_model(
             )
 
         repulsion_loss_= torch.zeros_like(variance_loss_)
+        hsic_loss_= torch.zeros_like(variance_loss_)
         total_loss_ = compute_total_loss(
                 mapping_loss=variance_loss_, 
                 repulsion_loss=repulsion_loss_,
+                hsic_loss = hsic_loss_,
                 reconstruction_loss=reconstruction_loss_, 
                 prediction_loss=prediction_loss_,
                 mapping_coefficient=mapping_coefficient, 
                 repulsion_coefficient=repulsion_coefficient,
                 prediction_coefficient=prediction_coefficient,
                 mapping_loss_scale=mapping_loss_scale, 
+                hsic_loss_slope=1.0,
                 prediction_loss_scale=prediction_loss_scale,
                 reconstruction_threshold=reconstruction_threshold, 
                 reconstruction_loss_multiplier=reconstruction_loss_multiplier
@@ -2324,12 +2770,15 @@ def train_model(
             epoch_metrics = {}
             epoch_start_time = time.time()
 
+            
+
             # Set all models to training mode
             mapping_net.train()
             # Initialize metrics
             train_total_loss_ = 0.0
             train_variance_loss_ = 0.0
             train_repulsion_loss_ = 0.0
+            train_hsic_loss_ = 0.0
             train_reconstruction_loss_ = 0.0
             train_prediction_loss_ = 0.0
             batch_count = 0
@@ -2340,10 +2789,19 @@ def train_model(
 
             # Training loop
             for batch_idx, batch in enumerate(train_loader):
+                
+                
+
+                number_of_trajectories_in_batch =  torch.unique(batch['trajectory_ids']).shape[0]
+                linear_tensor = torch.arange(1, number_of_trajectories_in_batch+1, requires_grad=False)
+                hsic_loss_max_calculated = hsic_loss_statistics_only(x=torch.Tensor(linear_tensor), y=torch.Tensor(linear_tensor), sigma_x = -1, sigma_y = -1, use_unbiased = True, epsilon = 1e-10).item()
+                hsic_loss_slope = hsic_loss_max_want / hsic_loss_max_calculated
+
+
                 optimizer.zero_grad()
 
                 # Run forward pass
-                total_loss_, variance_loss_, repulsion_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch)
+                total_loss_, variance_loss_, repulsion_loss_, hsic_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch, hsic_loss_slope)
 
 
                 if torch.isnan(total_loss_) or torch.isinf(total_loss_):
@@ -2372,7 +2830,7 @@ def train_model(
 
                 # Gradient clipping
                 if grad_clip_value is not None:
-                    torch.nn.utils.clip_grad_norm_(all_params, grad_clip_value)
+                    torch.nn.utils.clip_grad_norm_(mlp_params+transform_params+scale_params, grad_clip_value)
 
                 # Optimizer step
                 optimizer.step()
@@ -2381,13 +2839,14 @@ def train_model(
                 train_total_loss_ += total_loss_.item()
                 train_variance_loss_ += variance_loss_.item()
                 train_repulsion_loss_ += repulsion_loss_.item()
+                train_hsic_loss_ += hsic_loss_.item()
                 train_reconstruction_loss_ += reconstruction_loss_.item()
                 train_prediction_loss_ += prediction_loss_.item()
                 batch_count += 1
 
                 # Log progress
                 if verbose > 1 and batch_idx % log_freq_batches == 0:
-                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}")
+                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}")
 
 
                 
@@ -2395,6 +2854,7 @@ def train_model(
             train_total_loss_ /= max(1, batch_count)
             train_variance_loss_ /= max(1, batch_count)
             train_repulsion_loss_ /= max(1, batch_count)
+            train_hsic_loss_ /= max(1, batch_count)
             train_reconstruction_loss_ /= max(1, batch_count)
             train_prediction_loss_ /= max(1, batch_count)
 
@@ -2572,6 +3032,7 @@ def train_model(
             epoch_metrics['train_total_loss_'] = train_total_loss_
             epoch_metrics['train_variance_loss_'] = train_variance_loss_
             epoch_metrics['train_repulsion_loss_'] = train_repulsion_loss_
+            epoch_metrics['train_hsic_loss_'] = train_hsic_loss_
             epoch_metrics['train_reconstruction_loss_'] = train_reconstruction_loss_
             epoch_metrics['train_prediction_loss_'] = train_prediction_loss_
 
@@ -2639,6 +3100,7 @@ def train_model(
                 print(f"Mean total train loss: {train_total_loss_:.4f}")
                 print(f"Mean variance train loss: {train_variance_loss_:.4f}")
                 print(f"Mean repulsion train loss: {train_repulsion_loss_:.4f}")
+                print(f"Mean HSIC train loss: {train_hsic_loss_:.4f}")
                 print(f"Mean reconstruction train loss: {train_reconstruction_loss_:.4f}")
                 print(f"Mean prediction train loss: {train_prediction_loss_:.4f}")
                 
@@ -2677,12 +3139,102 @@ def train_model(
                 if verbose > 0:
                     print(f"Early stopping triggered in epoch: {epoch}")
                 break
+
+        run_hyperparameters ={}
+
+        run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
+        run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
+        run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
+        run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
+        run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+
+        n_parameters = count_parameters(mapping_net)
+        run_hyperparameters['model_trainable_parameter_count'] = n_parameters
+
+        model_n_layers = mapping_net.n_layers
+        run_hyperparameters['model_n_layers'] = model_n_layers
+
+        model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
+        run_hyperparameters['model_hidden_dims'] = model_hidden_dims
+
+        model_activation = mapping_net.activation 
+        run_hyperparameters['model_activation'] = model_activation
+
+        model_activation_params = mapping_net.activation_params 
+        run_hyperparameters['model_activation_params'] = model_activation_params
+
+        model_final_activation = mapping_net.final_activation 
+        run_hyperparameters['model_final_activation'] = model_final_activation
+
+        model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
+        run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
+
+        model_tanh_wrapper = mapping_net.tanh_wrapper
+        run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
+
+        model_weight_init = mapping_net.weight_init 
+        run_hyperparameters['model_weight_init'] = model_weight_init
+
+        model_weight_init_params = mapping_net.weight_init_params 
+        run_hyperparameters['model_weight_init_params'] = model_weight_init_params
+
+        model_bias_init = mapping_net.bias_init 
+        run_hyperparameters['model_bias_init'] = model_bias_init
+
+        model_bias_init_value = mapping_net.bias_init_value 
+        run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+        model_a_eps_min = mapping_net.a_eps_min 
+        run_hyperparameters['model_a_eps_min'] = model_a_eps_min
+
+        model_a_eps_max = mapping_net.a_eps_max
+        run_hyperparameters['model_a_eps_max'] = model_a_eps_max
+
+        model_a_k = mapping_net.a_k
+        run_hyperparameters['model_a_k'] = model_a_k
+
+        model_a_innit = mapping_net.a_innit
+        run_hyperparameters['model_a_innit'] = model_a_innit
+
+        model_gamma_innit = mapping_net.gamma_innit
+        run_hyperparameters['model_gamma_innit'] = model_gamma_innit
+
+        model_bound_innit = mapping_net.bound_innit
+        run_hyperparameters['model_bound_innit'] = model_bound_innit
+
+        repulsion_loss_epsilon = repulsion_loss_class.epsilon
+        run_hyperparameters['repulsion_loss_epsilon'] = repulsion_loss_epsilon
+
+        repulsion_loss_k = repulsion_loss_class.k
+        run_hyperparameters['repulsion_loss_k'] = repulsion_loss_k
+
+        run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
+        run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+
+        run_hyperparameters['mapping_coefficient'] = mapping_coefficient
+        run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
+        run_hyperparameters['prediction_coefficient'] = prediction_coefficient
+        run_hyperparameters['reconstruction_threshold'] = reconstruction_threshold
+        run_hyperparameters['reconstruction_loss_multiplier'] = reconstruction_loss_multiplier
+        run_hyperparameters['hsic_loss_max_want'] = hsic_loss_max_want
+        run_hyperparameters['on_distribution_val_criterio_weight'] = on_distribution_val_criterio_weight
+        run_hyperparameters['grad_clip_value'] = grad_clip_value
+    
+
+
+        with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch+1}.json"), "w") as f:
+            # Convert any non-serializable objects
+            serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
+            json.dump(serializable_run_hyperparameters, f, indent=2)
             
     except Exception as e:
         if auto_rescue:
             print(f"\nTraining interrupted by exception: {e}")
             save_rescue_checkpoint()
         raise  # Re-raise the exception after saving
+    
+
+
 
     finally:
         try:
@@ -2741,6 +3293,7 @@ def resume_training_from_checkpoint(
     prediction_coefficient,
     reconstruction_threshold,
     reconstruction_loss_multiplier,
+    hsic_loss_max_want,
     on_distribution_val_criterio_weight=0.75,
     
     # === RESUME MODE SELECTION ===
@@ -2793,11 +3346,26 @@ def resume_training_from_checkpoint(
     ):
     """Resume training from a checkpoint"""
     if load_scheduler_and_optimizer:
-        all_params = mapping_net.parameters()
+        mlp_params = []
+        transform_params = []
+        scale_params = []
+
+        for name, param in mapping_net.named_parameters():
+            if ('G_network' in name) or ('F_network' in name):
+                mlp_params.append(param)
+            elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
+                scale_params.append(param)
+            else: #c1, c2, gamma
+                transform_params.append(param)
+
         if optimizer_type == 'Adam':
-            temp_optimizer = Adam(all_params)
+            temp_optimizer = Adam(mlp_params+scale_params+transform_params)
         elif optimizer_type == 'AdamW':
-            temp_optimizer = AdamW(all_params)
+            temp_optimizer = AdamW([
+                {'params': mlp_params, 'weight_decay': weight_decay},
+                {'params': scale_params, 'weight_decay': 0.0},
+                {'params': transform_params, 'weight_decay': weight_decay},
+            ])
 
         temp_scheduler = ReduceLROnPlateau(temp_optimizer, mode='min', factor=0.1, patience=5, verbose=True) #Will be overwritten
         # Load checkpoint
@@ -2910,6 +3478,7 @@ def resume_training_from_checkpoint(
             prediction_coefficient=prediction_coefficient,
             reconstruction_threshold=reconstruction_threshold,
             reconstruction_loss_multiplier=reconstruction_loss_multiplier,
+            hsic_loss_max_want = hsic_loss_max_want,
             on_distribution_val_criterio_weight=on_distribution_val_criterio_weight,
             
             # Optimizer parameters - using loaded states
@@ -2979,6 +3548,7 @@ def resume_training_from_checkpoint(
             prediction_coefficient=prediction_coefficient,
             reconstruction_threshold=reconstruction_threshold,
             reconstruction_loss_multiplier=reconstruction_loss_multiplier,
+            hsic_loss_max_want = hsic_loss_max_want,
             on_distribution_val_criterio_weight=on_distribution_val_criterio_weight,
             
             # Optimizer parameters - creating fresh
@@ -3074,3 +3644,924 @@ def load_checkpoint(path, mapping_net, device, optimizer=None, scheduler=None):
 
 
 
+
+def calculate_phi_A(x0, u0, k=1, mass=1):
+    constant = -(k / mass)
+    #For analytical solutions
+    A = np.sqrt(np.square(x0)+(np.square(u0)/(-constant)))
+    omega = np.sqrt(-constant)
+    phi = np.arctan2(x0/A, u0/(omega*A))
+    return phi, A
+
+
+def add_phi_A_columns(df):
+    # Apply the function row-wise and expand the result into two columns
+    df[['phi', 'A']] = df.apply(
+        lambda row: pd.Series(calculate_phi_A(x0=row['x0'], u0=row['u0'], k=1, mass=1)), axis=1
+    )
+
+    # Reorder columns: insert phi and A right after 'energy'
+    cols = list(df.columns)
+    energy_idx = cols.index('energy')
+    
+    # Remove the new columns from the end
+    cols.remove('phi')
+    cols.remove('A')
+    
+    # Insert them right after 'energy'
+    cols[energy_idx+1:energy_idx+1] = ['phi', 'A']
+    
+    # Return reordered dataframe
+    return df[cols]
+
+
+def plot_differencies(df):
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    axes = axes.flatten()
+    
+    # Row 1: X_mean vs A and phi
+    axes[0].scatter(df['X_mean'], df['A'], s=20)
+    axes[0].set_xlabel('X_mean')
+    axes[0].set_ylabel('A')
+    axes[0].set_title('A vs X_mean')
+    
+    axes[1].scatter(df['X_mean'], df['phi'], s=20)
+    axes[1].set_xlabel('X_mean')
+    axes[1].set_ylabel('phi')
+    axes[1].set_title('phi vs X_mean')
+    
+    # Row 2: U_mean vs A and phi
+    axes[2].scatter(df['U_mean'], df['A'], s=20)
+    axes[2].set_xlabel('U_mean')
+    axes[2].set_ylabel('A')
+    axes[2].set_title('A vs U_mean')
+    
+    axes[3].scatter(df['U_mean'], df['phi'], s=20)
+    axes[3].set_xlabel('U_mean')
+    axes[3].set_ylabel('phi')
+    axes[3].set_title('phi vs U_mean')
+    
+    # Row 3: A vs phi and X_mean vs U_mean
+    axes[4].scatter(df['A'], df['phi'], s=20)
+    axes[4].set_xlabel('A')
+    axes[4].set_ylabel('phi')
+    axes[4].set_title('phi vs A')
+    
+    axes[5].scatter(df['X_mean'], df['U_mean'], s=20)
+    axes[5].set_xlabel('X_mean')
+    axes[5].set_ylabel('U_mean')
+    axes[5].set_title('U_mean vs X_mean')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
+def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_trajectory, t, trajectory_id,
+                                     point_indexes_observed, figsize=(12, 7), connect_points=False):
+    """
+    Plot ground truth vs predictions with loss metric and time visualization.
+    
+    Parameters:
+    -----------
+    x : tensor
+        Ground truth x values
+    u : tensor
+        Ground truth u values
+    x_pred : tensor
+        Predicted x values
+    u_pred : tensor
+        Predicted u values
+    pred_loss_full_trajectory : tensor
+        Loss metric (scalar)
+    t : tensor
+        Time values for the trajectory
+    trajectory_id : int or str
+        Trajectory identifier
+    point_indexes_observed : list
+        List of observed point indexes
+    figsize : tuple, optional
+        Figure size (width, height)
+    connect_points : bool, optional
+        Whether to connect points with lines (for trajectories)
+    """
+    # Convert tensors to numpy
+    x_np = x.detach().cpu().numpy().flatten()
+    u_np = u.detach().cpu().numpy().flatten()
+    x_pred_np = x_pred.detach().cpu().numpy().flatten()
+    u_pred_np = u_pred.detach().cpu().numpy().flatten()
+    t_np = t.detach().cpu().numpy().flatten()
+    loss_value = pred_loss_full_trajectory.item()
+    
+    # Print observed times (not shown in plot)
+    t_observed = t[point_indexes_observed].detach().cpu().numpy()
+    print(f"Observed time points: {t_observed}")
+    
+    # Get number of observed points
+    num_observed = len(point_indexes_observed)
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot with time-based colormaps (using very different color schemes)
+    scatter_gt = ax.scatter(x_np, u_np, c=t_np, cmap='Blues', 
+                            label='Ground Truth', alpha=0.8, s=60, edgecolors='darkblue', linewidths=0.5)
+    scatter_pred = ax.scatter(x_pred_np, u_pred_np, c=t_np, cmap='Reds', 
+                              label='Prediction', alpha=0.8, s=60, edgecolors='darkred', linewidths=0.5)
+
+    # Connect points with lines if requested
+    if connect_points:
+        ax.plot(x_np, u_np, 'b-', alpha=0.3, linewidth=1.5)
+        ax.plot(x_pred_np, u_pred_np, 'r-', alpha=0.3, linewidth=1.5)
+
+    # Mark initial points (t=0) with stars only
+    ax.scatter(x_np[0], u_np[0], c='blue', marker='*', s=400, 
+               edgecolors='black', linewidths=2.5, label='Start (Ground Truth)', zorder=5)
+    ax.scatter(x_pred_np[0], u_pred_np[0], c='red', marker='*', s=400, 
+               edgecolors='black', linewidths=2.5, label='Start (Prediction)', zorder=5)
+
+    # Add colorbars for time (side by side)
+    cbar_gt = plt.colorbar(scatter_gt, ax=ax, pad=0.02, fraction=0.046)
+    cbar_gt.set_label('Time (Ground Truth)', fontsize=10, color='darkblue', fontweight='bold')
+    cbar_gt.ax.tick_params(labelsize=9)
+    
+    cbar_pred = plt.colorbar(scatter_pred, ax=ax, pad=0.12, fraction=0.046)
+    cbar_pred.set_label('Time (Prediction)', fontsize=10, color='darkred', fontweight='bold')
+    cbar_pred.ax.tick_params(labelsize=9)
+    
+    # Add labels and title
+    ax.set_xlabel('x', fontsize=12)
+    ax.set_ylabel('u', fontsize=12)
+    ax.set_title(f'Prediction vs Ground Truth - Trajectory ID: {trajectory_id}', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+
+    # Add loss metric, time range, and number of observed points as text box
+    textstr = f'Loss: {loss_value:.4f}\nTime range: [{t_np[0]:.2f}, {t_np[-1]:.2f}]\nObserved points: {num_observed}'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, 
+            fontsize=11, verticalalignment='top', bbox=props)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def test_model_in_single_trajectory(get_data_from_trajectory_id_function, prediction_loss_function, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device, point_indexes_observed, connect_points):
+    test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+    if point_indexes_observed: #Test prediction ability on full trajectory given points on the trajectory
+        X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+        X_final_mean = X_final.mean()
+        U_final_mean = U_final.mean()
+        X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+        U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+        x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+        pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+        plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points)
+
+
+
+def analyze_means_with_constants(
+    save_dir_path,
+    specific_epoch='last',
+    train_id_df_added=None,
+    val_id_df_added=None,
+    val_id_df_high_energy_added=None
+):
+    """
+    Extracts X_mean and U_mean for all trajectories at a specific epoch from
+    each of the 3 directories, and combines them with (A, phi) constants
+    from the provided DataFrames.
+
+    Args:
+        save_dir_path (str): Path to the directory containing epoch_* folders.
+        specific_epoch (int or str): Epoch number (e.g., 5) or 'last' for the last epoch.
+        train_id_df_added (pd.DataFrame): DataFrame with columns ['trajectory_id', 'A', 'phi'] for train set.
+        val_id_df_added (pd.DataFrame): DataFrame with columns ['trajectory_id', 'A', 'phi'] for validation set.
+        val_id_df_high_energy_added (pd.DataFrame): DataFrame with columns ['trajectory_id', 'A', 'phi'] for high energy validation set.
+
+    Returns:
+        tuple: (val_df, val_train_set_df, val_high_energy_df)
+               Each is a DataFrame with columns ['trajectory_id', 'X_mean', 'U_mean', 'A', 'phi'].
+    """
+
+    # --- Helper function to load data for a specific subdirectory ---
+    def extract_means_for_dir(epoch_path, subdir_name, constants_df):
+        subdir_path = os.path.join(epoch_path, subdir_name)
+        if not os.path.exists(subdir_path):
+            print(f"⚠️ Warning: {subdir_path} not found.")
+            return pd.DataFrame(columns=['trajectory_id', 'X_mean', 'U_mean', 'A', 'phi'])
+
+        data = []
+        for file in os.listdir(subdir_path):
+            if not file.startswith("trajectory_id_") or not file.endswith(".json"):
+                continue
+            try:
+                traj_id = int(file.split("_")[2])
+                file_path = os.path.join(subdir_path, file)
+                with open(file_path, "r") as f:
+                    json_data = json.load(f)
+                X_mean = json_data.get("X_mean", None)
+                U_mean = json_data.get("U_mean", None)
+
+                if constants_df is not None and traj_id in constants_df["trajectory_id"].values:
+                    row = constants_df[constants_df["trajectory_id"] == traj_id].iloc[0]
+                    A, phi = row["A"], row["phi"]
+                else:
+                    A, phi = None, None
+
+                data.append({
+                    "trajectory_id": traj_id,
+                    "X_mean": X_mean,
+                    "U_mean": U_mean,
+                    "A": A,
+                    "phi": phi
+                })
+            except Exception as e:
+                print(f"⚠️ Error reading {file}: {e}")
+
+        return pd.DataFrame(data)
+
+    # --- Determine which epoch directory to use ---
+    epoch_dirs = sorted(
+        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
+        key=lambda x: int(x.split("_")[1])
+    )
+
+    if not epoch_dirs:
+        raise FileNotFoundError(f"No epoch directories found in {save_dir_path}")
+
+    if specific_epoch == 'last':
+        epoch_dir_name = epoch_dirs[-1]
+    else:
+        epoch_dir_name = f"epoch_{specific_epoch}"
+        if epoch_dir_name not in epoch_dirs:
+            raise ValueError(f"Epoch {specific_epoch} not found in {save_dir_path}")
+
+    epoch_path = os.path.join(save_dir_path, epoch_dir_name)
+    print(f"📂 Using data from epoch: {epoch_dir_name}")
+
+    # --- Extract for each of the 3 trajectory sets ---
+    val_df = extract_means_for_dir(epoch_path, "val_trajectories_data", val_id_df_added)
+    val_train_set_df = extract_means_for_dir(epoch_path, "val_train_set_trajectories_data", train_id_df_added)
+    val_high_energy_df = extract_means_for_dir(epoch_path, "val_high_energy_trajectories_data", val_id_df_high_energy_added)
+
+    print("✅ Data extraction complete.")
+    return val_df, val_train_set_df, val_high_energy_df
+
+
+def visualize_trajectory_movements_with_std_ellipses(
+    save_dir_path,
+    number_of_points_to_plot=5,
+    right_plot_alpha=0.3,
+    verbose=False,
+    specific_epoch='last',
+    visualize_true_constants=False,
+    train_id_df_added=None,
+    val_id_df_added=None,
+    val_id_df_high_energy_added=None
+):
+    """
+    Visualizes how X_mean/U_mean evolve (left plot) and how X_std/U_std change (right plot)
+    using ellipses at the same coordinates to represent standard deviation magnitudes.
+    
+    Args:
+        save_dir_path: Path to the directory containing epoch folders
+        number_of_points_to_plot: Number of trajectory IDs to randomly select
+        right_plot_alpha: Transparency level for ellipses in right plots (0.0 to 1.0)
+        verbose: If True, print trajectory values for a specific epoch
+        specific_epoch: Either an integer epoch number or 'last' for the last epoch
+        visualize_true_constants: If True, plot (A, phi) of selected trajectories on left plots
+        *_id_df_added: DataFrames containing true constants for each dataset
+    """
+
+    traj_dirs = [
+        "val_trajectories_data",
+        "val_train_set_trajectories_data",
+        "val_high_energy_trajectories_data"
+    ]
+
+    # Ensure correct mapping between directory and DataFrame
+    df_map = {
+        "val_trajectories_data": val_id_df_added,
+        "val_train_set_trajectories_data": train_id_df_added,
+        "val_high_energy_trajectories_data": val_id_df_high_energy_added
+    }
+
+    epoch_dirs = sorted(
+        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
+        key=lambda x: int(x.split("_")[1])
+    )
+    num_epochs = len(epoch_dirs)
+    if num_epochs == 0:
+        print("❌ No epoch directories found.")
+        return
+
+    # Color palettes
+    epoch_cmap = cm.get_cmap("viridis")
+    epoch_colors = [epoch_cmap(i / (num_epochs - 1)) for i in range(num_epochs)]
+    traj_id_cmap = cm.get_cmap("tab10")
+
+    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(12, 12))
+    fig.subplots_adjust(hspace=0.4, wspace=0.3)
+
+    for row_idx, traj_dir in enumerate(traj_dirs):
+        print(f"\n📊 Processing directory: {traj_dir}")
+
+        df = df_map.get(traj_dir, None)
+        first_epoch_path = os.path.join(save_dir_path, epoch_dirs[0], traj_dir)
+        if not os.path.exists(first_epoch_path):
+            print(f"⚠️ Directory {first_epoch_path} not found. Skipping.")
+            continue
+
+        all_files = [f for f in os.listdir(first_epoch_path) if f.startswith("trajectory_id_") and f.endswith(".json")]
+        if not all_files:
+            print(f"⚠️ No trajectory files found in {first_epoch_path}.")
+            continue
+
+        trajectory_ids = [int(f.split("_")[2]) for f in all_files]
+        random.seed(42)
+        selected_ids = random.sample(trajectory_ids, min(number_of_points_to_plot, len(trajectory_ids)))
+
+        # Consistent unique colors per trajectory ID
+        traj_colors = {tid: traj_id_cmap(i / max(len(selected_ids) - 1, 1)) for i, tid in enumerate(selected_ids)}
+
+        traj_data = {
+            tid: {"X_mean": [], "U_mean": [], "X_std": [], "U_std": []}
+            for tid in selected_ids
+        }
+
+        for epoch_dir in epoch_dirs:
+            epoch_path = os.path.join(save_dir_path, epoch_dir, traj_dir)
+            for tid in selected_ids:
+                file_path = os.path.join(epoch_path, f"trajectory_id_{tid}_data.json")
+                if not os.path.exists(file_path):
+                    continue
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                traj_data[tid]["X_mean"].append(data["X_mean"])
+                traj_data[tid]["U_mean"].append(data["U_mean"])
+                traj_data[tid]["X_std"].append(data["X_std"])
+                traj_data[tid]["U_std"].append(data["U_std"])
+
+        # --- Left plot: Means ---
+        ax_mean = axes[row_idx, 0]
+        ax_mean.set_title(f"{traj_dir.replace('_', ' ')} - Mean Evolution")
+        ax_mean.set_xlabel("X_mean")
+        ax_mean.set_ylabel("U_mean")
+        ax_mean.grid(True, linestyle="--", alpha=0.5)
+
+        for tid in selected_ids:
+            Xs = traj_data[tid]["X_mean"]
+            Us = traj_data[tid]["U_mean"]
+            color = traj_colors[tid]
+            if len(Xs) < 2:
+                continue
+            for j in range(len(Xs) - 1):
+                ax_mean.plot([Xs[j], Xs[j+1]], [Us[j], Us[j+1]], color=epoch_colors[j], alpha=0.8, linewidth=2)
+            ax_mean.scatter(Xs[0], Us[0], color="red", marker="o", s=40)
+            ax_mean.scatter(Xs[-1], Us[-1], color="black", marker="x", s=40)
+
+        # Highlight specific epoch with colored star
+        epoch_idx = None
+        if specific_epoch is not None:
+            if specific_epoch == 'last':
+                epoch_idx = len(epoch_dirs) - 1
+            else:
+                epoch_name = f"epoch_{specific_epoch}"
+                if epoch_name in epoch_dirs:
+                    epoch_idx = epoch_dirs.index(epoch_name)
+
+        if epoch_idx is not None:
+            for tid in selected_ids:
+                Xs = traj_data[tid]["X_mean"]
+                Us = traj_data[tid]["U_mean"]
+                if epoch_idx < len(Xs):
+                    ax_mean.scatter(
+                        Xs[epoch_idx],
+                        Us[epoch_idx],
+                        color=traj_colors[tid],
+                        marker='*',
+                        s=300,
+                        edgecolor='black',
+                        linewidth=1.5,
+                        zorder=10
+                    )
+
+        # --- Optional True Constants Visualization ---
+        if visualize_true_constants and df is not None:
+            const_points = df[df["trajectory_id"].isin(selected_ids)]
+            for _, row in const_points.iterrows():
+                tid = row["trajectory_id"]
+                color = traj_colors.get(tid, "orange")
+                ax_mean.scatter(
+                    row["phi"], row["A"],
+                    color=color, s=120, marker="D",
+                    edgecolor="black", linewidth=1.5, zorder=15
+                )
+        ax_mean.legend(["Trajectory evolution", "Start", "End", "Specific epoch / True (A, φ)"], fontsize=8)
+
+        # --- Right plot: Std Ellipses ---
+        ax_std = axes[row_idx, 1]
+        ax_std.set_title(f"{traj_dir.replace('_', ' ')} - Std Ellipses")
+        ax_std.set_xlabel("X_mean")
+        ax_std.set_ylabel("U_mean")
+        ax_std.grid(True, linestyle="--", alpha=0.5)
+
+        for tid in selected_ids:
+            Xs = traj_data[tid]["X_mean"]
+            Us = traj_data[tid]["U_mean"]
+            Xstds = traj_data[tid]["X_std"]
+            Ustds = traj_data[tid]["U_std"]
+            color = traj_colors[tid]
+            for j in range(len(Xs)):
+                e = Ellipse(
+                    (Xs[j], Us[j]),
+                    width=Xstds[j] * 2,
+                    height=Ustds[j] * 2,
+                    facecolor=color,
+                    edgecolor="black",
+                    alpha=right_plot_alpha
+                )
+                ax_std.add_patch(e)
+            ax_std.plot(Xs, Us, color=color, alpha=right_plot_alpha, linewidth=1, label=f"Traj {tid}")
+
+        # Highlight specific epoch in right plot
+        if epoch_idx is not None:
+            for tid in selected_ids:
+                Xs = traj_data[tid]["X_mean"]
+                Us = traj_data[tid]["U_mean"]
+                if epoch_idx < len(Xs):
+                    ax_std.scatter(
+                        Xs[epoch_idx], Us[epoch_idx],
+                        color=traj_colors[tid],
+                        marker='*', s=300,
+                        edgecolor='black', linewidth=1.5, zorder=10
+                    )
+
+        ax_std.legend(loc="best", fontsize=8, framealpha=0.7)
+
+        # Colorbar for epoch progression (left plot)
+        norm = plt.Normalize(vmin=0, vmax=num_epochs - 1)
+        sm = plt.cm.ScalarMappable(cmap=epoch_cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=axes[row_idx, 0], orientation="horizontal", fraction=0.05, pad=0.1)
+        cbar.set_label("Epoch progression")
+
+        # --- Verbose output ---
+        if verbose and epoch_idx is not None:
+            epoch_name = epoch_dirs[epoch_idx]
+            print(f"\nFor the {epoch_name} in {traj_dir} the values are:")
+            for tid in selected_ids:
+                if epoch_idx < len(traj_data[tid]["X_mean"]):
+                    X_mean = traj_data[tid]["X_mean"][epoch_idx]
+                    X_std = traj_data[tid]["X_std"][epoch_idx]
+                    U_mean = traj_data[tid]["U_mean"][epoch_idx]
+                    U_std = traj_data[tid]["U_std"][epoch_idx]
+
+                    # Get A, phi from dataframe if available
+                    A, phi = None, None
+                    if df is not None and tid in df["trajectory_id"].values:
+                        row = df[df["trajectory_id"] == tid].iloc[0]
+                        A, phi = row["A"], row["phi"]
+
+                    print(f"{tid}: X_mean = {X_mean:.4f} ± {X_std:.4f}, "
+                          f"U_mean = {U_mean:.4f} ± {U_std:.4f} "
+                          f"and A={A}, phi={phi}")
+                else:
+                    print(f"{tid}: No data available")
+
+    plt.tight_layout()
+    plt.show()
+    print("\n✅ Mean + Std (ellipse) visualization complete.")
+
+
+
+
+
+def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=False, verbose=False):
+    """
+    Visualizes selected metrics from epoch directories.
+
+    Args:
+        save_dir_path (str): Path to the main directory containing 'epoch_n' subdirectories.
+        metrics_to_plot (list of str): List of metric names to visualize.
+        plot_on_same_graph (bool): If True, group related metrics (train/val variants) on the same plot.
+        verbose (bool): If True, prints summary statistics for each metric.
+    """
+
+    # --- Collect all epoch directories ---
+    epoch_dirs = sorted(
+        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
+        key=lambda x: int(x.split("_")[1])
+    )
+
+    # --- Collect data ---
+    metrics_data = {metric: [] for metric in metrics_to_plot}
+    epochs = []
+
+    for d in epoch_dirs:
+        epoch_path = os.path.join(save_dir_path, d, "epoch_metrics.json")
+        if not os.path.isfile(epoch_path):
+            print(f"⚠️ Skipping {d} (no epoch_metrics.json found)")
+            continue
+
+        with open(epoch_path, "r") as f:
+            data = json.load(f)
+
+        epoch_num = data.get("epoch", int(d.split("_")[1]))
+        epochs.append(epoch_num)
+
+        for metric in metrics_to_plot:
+            metrics_data[metric].append(data.get(metric, None))
+
+    # --- Verbose logging of statistics ---
+    if verbose:
+        print("\n📊 Metric summaries:")
+        for metric in metrics_to_plot:
+            values = [v for v in metrics_data[metric] if v is not None]
+            if not values:
+                print(f"  ⚠️ Metric {metric} has no valid values.")
+                continue
+
+            min_val = min(values)
+            min_epoch = epochs[metrics_data[metric].index(min_val)]
+            last_5 = values[-5:] if len(values) >= 5 else values
+            print(
+                f"  Lowest loss of metric '{metric}' recorded in epoch {min_epoch} "
+                f"with the value: {min_val:.6f}, "
+                f"the losses of the last 5 epochs are: {last_5}"
+            )
+
+    # --- Color scheme for each data source ---
+    data_colors = {
+        "train": "tab:blue",
+        "val": "tab:orange",
+        "val_high_energy": "tab:green",
+        "val_training_set": "tab:red",
+        "other": "tab:gray"
+    }
+
+    # --- Helper: identify data prefix and core metric ---
+    def split_metric_name(metric):
+        """
+        Returns (data_prefix, core_metric)
+        Handles trailing underscores and variants like _high_energy / _training_set.
+        """
+        m = metric.rstrip("_")  # remove trailing underscores
+
+        prefix = "other"
+        core = m
+
+        if m.startswith("train_"):
+            prefix = "train"
+            core = m[len("train_"):]
+        elif m.startswith("val_"):
+            core = m[len("val_"):]
+            if "_high_energy" in core:
+                prefix = "val_high_energy"
+                core = core.replace("_high_energy", "")
+            elif "_training_set" in core:
+                prefix = "val_training_set"
+                core = core.replace("_training_set", "")
+            else:
+                prefix = "val"
+
+        core = core.rstrip("_")
+        return prefix, core
+
+    # --- Plotting ---
+    if plot_on_same_graph:
+        # Group metrics by core metric name
+        grouped = {}
+        for metric in metrics_to_plot:
+            prefix, core = split_metric_name(metric)
+            grouped.setdefault(core, {})[prefix] = metric
+
+        for core_metric, variants in grouped.items():
+            plt.figure(figsize=(8, 5))
+            for prefix, metric in variants.items():
+                plt.plot(
+                    epochs,
+                    metrics_data[metric],
+                    marker='o',
+                    label=metric,
+                    color=data_colors.get(prefix, None)
+                )
+
+            plt.title(f"{core_metric.replace('_', ' ').title()} across datasets")
+            plt.xlabel("Epoch")
+            plt.ylabel(core_metric)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+    else:
+        for metric in metrics_to_plot:
+            prefix, _ = split_metric_name(metric)
+            plt.figure(figsize=(8, 5))
+            plt.plot(
+                epochs,
+                metrics_data[metric],
+                marker='o',
+                label=metric,
+                color=data_colors.get(prefix, None)
+            )
+            plt.title(f"{metric.replace('_', ' ').title()} over epochs")
+            plt.xlabel("Epoch")
+            plt.ylabel(metric)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+    print("\n✅ Visualization complete.")
+
+
+
+
+def analyze_folders_means(save_dir_path, locate_epoch=None):
+    """
+    Analyzes the mean and standard deviation of X_mean and U_mean across all trajectory IDs
+    for each epoch and trajectory directory.
+    
+    Creates 3 plots showing how X_std_full and U_std_full evolve over epochs.
+    
+    Args:
+        save_dir_path: Path to the directory containing epoch folders
+        locate_epoch: If provided (integer), highlights this epoch in plots and prints its statistics
+    """
+    
+    traj_dirs = [
+        "val_trajectories_data",
+        "val_train_set_trajectories_data",
+        "val_high_energy_trajectories_data"
+    ]
+    
+    epoch_dirs = sorted(
+        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
+        key=lambda x: int(x.split("_")[1])
+    )
+    num_epochs = len(epoch_dirs)
+    if num_epochs == 0:
+        print("❌ No epoch directories found.")
+        return
+    
+    print(f"📊 Analyzing {num_epochs} epochs across {len(traj_dirs)} directories...")
+    
+    # Color map for epoch progression
+    cmap = cm.get_cmap("plasma")
+    colors = [cmap(i / (num_epochs - 1)) for i in range(num_epochs)]
+    
+    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(14, 15))
+    fig.suptitle("Evolution of Statistics Across Epochs", fontsize=16, fontweight='bold')
+    fig.subplots_adjust(hspace=0.35, wspace=0.3)
+    
+    # Store data for all directories (for locate_epoch functionality)
+    all_data = {}
+    
+    for row_idx, traj_dir in enumerate(traj_dirs):
+        print(f"\n📁 Processing directory: {traj_dir}")
+        
+        # Storage for aggregated statistics per epoch
+        X_mean_full_per_epoch = []
+        X_std_full_per_epoch = []
+        U_mean_full_per_epoch = []
+        U_std_full_per_epoch = []
+        
+        for epoch_idx, epoch_dir in enumerate(epoch_dirs):
+            epoch_path = os.path.join(save_dir_path, epoch_dir, traj_dir)
+            
+            if not os.path.exists(epoch_path):
+                print(f"⚠️ Directory {epoch_path} not found. Skipping epoch.")
+                X_mean_full_per_epoch.append(np.nan)
+                X_std_full_per_epoch.append(np.nan)
+                U_mean_full_per_epoch.append(np.nan)
+                U_std_full_per_epoch.append(np.nan)
+                continue
+            
+            # Get all trajectory files in this epoch
+            all_files = [f for f in os.listdir(epoch_path) if f.startswith("trajectory_id_") and f.endswith(".json")]
+            
+            if not all_files:
+                print(f"⚠️ No trajectory files found in {epoch_path}.")
+                X_mean_full_per_epoch.append(np.nan)
+                X_std_full_per_epoch.append(np.nan)
+                U_mean_full_per_epoch.append(np.nan)
+                U_std_full_per_epoch.append(np.nan)
+                continue
+            
+            # Collect X_mean and U_mean from all trajectories
+            X_means = []
+            U_means = []
+            
+            for file_name in all_files:
+                file_path = os.path.join(epoch_path, file_name)
+                with open(file_path, "r") as f:
+                    data = json.load(f)
+                    X_means.append(data["X_mean"])
+                    U_means.append(data["U_mean"])
+            
+            # Calculate means and standard deviations across all trajectory IDs
+            X_mean_full = np.mean(X_means)
+            X_std_full = np.std(X_means)
+            U_mean_full = np.mean(U_means)
+            U_std_full = np.std(U_means)
+            
+            X_mean_full_per_epoch.append(X_mean_full)
+            X_std_full_per_epoch.append(X_std_full)
+            U_mean_full_per_epoch.append(U_mean_full)
+            U_std_full_per_epoch.append(U_std_full)
+        
+        # Store data for this directory
+        all_data[traj_dir] = {
+            'X_mean_full': X_mean_full_per_epoch,
+            'X_std_full': X_std_full_per_epoch,
+            'U_mean_full': U_mean_full_per_epoch,
+            'U_std_full': U_std_full_per_epoch
+        }
+        
+        # ===== LEFT PLOT: Standard Deviations =====
+        ax_std = axes[row_idx, 0]
+        ax_std.set_title(f"{traj_dir.replace('_', ' ')} - Std Deviation")
+        ax_std.set_xlabel("X_std_full (Std of X_means)")
+        ax_std.set_ylabel("U_std_full (Std of U_means)")
+        ax_std.grid(True, linestyle="--", alpha=0.5)
+        
+        # Plot lines connecting epochs
+        for i in range(len(X_std_full_per_epoch) - 1):
+            if not (np.isnan(X_std_full_per_epoch[i]) or np.isnan(X_std_full_per_epoch[i+1])):
+                ax_std.plot(
+                    [X_std_full_per_epoch[i], X_std_full_per_epoch[i+1]],
+                    [U_std_full_per_epoch[i], U_std_full_per_epoch[i+1]],
+                    color=colors[i],
+                    alpha=0.8,
+                    linewidth=2
+                )
+        
+        # Plot points for each epoch
+        valid_indices = [i for i in range(len(X_std_full_per_epoch)) if not np.isnan(X_std_full_per_epoch[i])]
+        for i in valid_indices:
+            ax_std.scatter(
+                X_std_full_per_epoch[i],
+                U_std_full_per_epoch[i],
+                color=colors[i],
+                s=100,
+                edgecolor='black',
+                linewidth=1.5,
+                zorder=5
+            )
+        
+        # Mark start and end
+        if valid_indices:
+            ax_std.scatter(
+                X_std_full_per_epoch[valid_indices[0]],
+                U_std_full_per_epoch[valid_indices[0]],
+                color='red',
+                marker='o',
+                s=150,
+                edgecolor='black',
+                linewidth=2,
+                zorder=6,
+                label='Start'
+            )
+            ax_std.scatter(
+                X_std_full_per_epoch[valid_indices[-1]],
+                U_std_full_per_epoch[valid_indices[-1]],
+                color='black',
+                marker='x',
+                s=150,
+                linewidth=3,
+                zorder=6,
+                label='End'
+            )
+        
+        # Highlight the specific epoch if requested
+        if locate_epoch is not None and locate_epoch < len(X_std_full_per_epoch):
+            if not np.isnan(X_std_full_per_epoch[locate_epoch]):
+                ax_std.scatter(
+                    X_std_full_per_epoch[locate_epoch],
+                    U_std_full_per_epoch[locate_epoch],
+                    color='lime',
+                    marker='*',
+                    s=400,
+                    edgecolor='darkgreen',
+                    linewidth=3,
+                    zorder=7,
+                    label=f'Epoch {locate_epoch}'
+                )
+        
+        if valid_indices or locate_epoch is not None:
+            ax_std.legend(loc='best')
+        
+        # Add colorbar for epoch progression
+        norm = plt.Normalize(vmin=0, vmax=num_epochs - 1)
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar_std = fig.colorbar(sm, ax=ax_std, orientation="horizontal", fraction=0.05, pad=0.15)
+        cbar_std.set_label("Epoch progression")
+        
+        # ===== RIGHT PLOT: Means =====
+        ax_mean = axes[row_idx, 1]
+        ax_mean.set_title(f"{traj_dir.replace('_', ' ')} - Mean Values")
+        ax_mean.set_xlabel("X_mean_full (Mean of X_means)")
+        ax_mean.set_ylabel("U_mean_full (Mean of U_means)")
+        ax_mean.grid(True, linestyle="--", alpha=0.5)
+        
+        # Plot lines connecting epochs
+        for i in range(len(X_mean_full_per_epoch) - 1):
+            if not (np.isnan(X_mean_full_per_epoch[i]) or np.isnan(X_mean_full_per_epoch[i+1])):
+                ax_mean.plot(
+                    [X_mean_full_per_epoch[i], X_mean_full_per_epoch[i+1]],
+                    [U_mean_full_per_epoch[i], U_mean_full_per_epoch[i+1]],
+                    color=colors[i],
+                    alpha=0.8,
+                    linewidth=2
+                )
+        
+        # Plot points for each epoch
+        valid_indices_mean = [i for i in range(len(X_mean_full_per_epoch)) if not np.isnan(X_mean_full_per_epoch[i])]
+        for i in valid_indices_mean:
+            ax_mean.scatter(
+                X_mean_full_per_epoch[i],
+                U_mean_full_per_epoch[i],
+                color=colors[i],
+                s=100,
+                edgecolor='black',
+                linewidth=1.5,
+                zorder=5
+            )
+        
+        # Mark start and end
+        if valid_indices_mean:
+            ax_mean.scatter(
+                X_mean_full_per_epoch[valid_indices_mean[0]],
+                U_mean_full_per_epoch[valid_indices_mean[0]],
+                color='red',
+                marker='o',
+                s=150,
+                edgecolor='black',
+                linewidth=2,
+                zorder=6,
+                label='Start'
+            )
+            ax_mean.scatter(
+                X_mean_full_per_epoch[valid_indices_mean[-1]],
+                U_mean_full_per_epoch[valid_indices_mean[-1]],
+                color='black',
+                marker='x',
+                s=150,
+                linewidth=3,
+                zorder=6,
+                label='End'
+            )
+        
+        # Highlight the specific epoch if requested
+        if locate_epoch is not None and locate_epoch < len(X_mean_full_per_epoch):
+            if not np.isnan(X_mean_full_per_epoch[locate_epoch]):
+                ax_mean.scatter(
+                    X_mean_full_per_epoch[locate_epoch],
+                    U_mean_full_per_epoch[locate_epoch],
+                    color='lime',
+                    marker='*',
+                    s=400,
+                    edgecolor='darkgreen',
+                    linewidth=3,
+                    zorder=7,
+                    label=f'Epoch {locate_epoch}'
+                )
+        
+        if valid_indices_mean or locate_epoch is not None:
+            ax_mean.legend(loc='best')
+        
+        # Add colorbar for epoch progression
+        cbar_mean = fig.colorbar(sm, ax=ax_mean, orientation="horizontal", fraction=0.05, pad=0.15)
+        cbar_mean.set_label("Epoch progression")
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics for the located epoch
+    if locate_epoch is not None:
+        print(f"\n{'='*60}")
+        print(f"Statistics for Epoch {locate_epoch}:")
+        print(f"{'='*60}")
+        for traj_dir in traj_dirs:
+            if locate_epoch < len(all_data[traj_dir]['X_mean_full']):
+                X_mean_full = all_data[traj_dir]['X_mean_full'][locate_epoch]
+                X_std_full = all_data[traj_dir]['X_std_full'][locate_epoch]
+                U_mean_full = all_data[traj_dir]['U_mean_full'][locate_epoch]
+                U_std_full = all_data[traj_dir]['U_std_full'][locate_epoch]
+                
+                if not np.isnan(X_mean_full):
+                    print(f"\n{traj_dir}:")
+                    print(f"  X: {X_mean_full:.6f} ± {X_std_full:.6f}")
+                    print(f"  U: {U_mean_full:.6f} ± {U_std_full:.6f}")
+                else:
+                    print(f"\n{traj_dir}: No data available")
+            else:
+                print(f"\n{traj_dir}: Epoch {locate_epoch} not found")
+        print(f"{'='*60}")
