@@ -52,7 +52,9 @@ from modules import (
     resume_training_from_checkpoint,
     save_checkpoint,
     load_checkpoint,
-    count_parameters
+    count_parameters,
+    init_step_params,
+    solve_a_raw,
 
 
 )
@@ -68,9 +70,11 @@ val_df = loaded_dfs['val_df']
 train_id_df = loaded_dfs['train_id_df']
 val_id_df = loaded_dfs['val_id_df']
 
+with open("df_high_energy_revised.pkl", "rb") as f:
+    df_high_energy_revised = pickle.load(f)
 
-val_df_high_energy = loaded_dfs['val_df_high_energy']
-val_id_df_high_energy = loaded_dfs['val_id_df_high_energy']
+val_df_high_energy = df_high_energy_revised['val_df_high_energy_revised']
+val_id_df_high_energy = df_high_energy_revised['val_id_df_high_energy_revised']
 
 
 
@@ -82,8 +86,8 @@ def main():
     train_dataloader = create_simple_dataloader(
     train_df=train_df,
     train_id_df=train_id_df,
-    ratio=1.8333333,
-    batch_size=264,
+    ratio=1.375000,
+    batch_size=352,
     segment_length=2,
     get_data_func=get_data_from_trajectory_id,
     device=device,
@@ -146,8 +150,23 @@ def main():
         a_eps_min= 0.5,  # Minimum value for a
         a_eps_max= 2,  # Maximum value for a  
         a_k= 0.1,
-        a_innit=1.25,
-        gamma_innit=5.0,
+
+        step_1_a_mean_innit= 1.0,
+        step_2_a_mean_innit= 1.0,
+        std_to_mean_ratio_a_mean_init= 0.3,
+
+        step_1_gamma_mean_innit= 0.5,
+        step_2_gamma_mean_innit= 0.5,
+        std_to_mean_ratio_gamma_mean_init= 0.01,
+
+        step_1_c1_mean_innit= 0.0,
+        step_2_c1_mean_innit= 0.0,
+        std_to_mean_ratio_c1_mean_init= 0.0,
+
+        step_1_c2_mean_innit= 0.0,
+        step_2_c2_mean_innit= 0.0,
+        std_to_mean_ratio_c2_mean_init= 0.0,
+
         bound_innit=0.0,
     ).to(device)
 
@@ -174,7 +193,7 @@ def main():
 
         inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
 
-        derived_mapping_loss_scale, derived_prediction_loss_scale = calculate_losses_scale_on_untrained(train_loader=train_dataloader, mapping_net=mapping_net, inverse_net=inverse_net, var_loss_class=var_loss_class, get_data_from_trajectory_id=get_data_from_trajectory_id, possible_t_values=possible_t_values, train_df=train_df, train_id_df=train_id_df, save_returned_values=True, save_dir=save_dir_5, noise_threshold_mean_divided_by_std = 2, device=device)
+        derived_mapping_loss_scale, derived_prediction_loss_scale = calculate_losses_scale_on_untrained(train_loader=train_dataloader, mapping_net=mapping_net, inverse_net=inverse_net, var_loss_class=var_loss_class, get_data_from_trajectory_id=get_data_from_trajectory_id, possible_t_values=possible_t_values, train_df=train_df, train_id_df=train_id_df, save_returned_values=True, save_dir=save_dir, noise_threshold_mean_divided_by_std = 2, device=device)
 
         train_model(
             # Dataloaders
@@ -236,11 +255,11 @@ def main():
 
             # Early stopping parameters
             early_stopping=True,
-            patience=800,
+            patience=300,
             min_delta=0.001,
 
             # Checkpointing
-            save_dir=save_dir_5,
+            save_dir=save_dir,
             save_best_only=False,
             save_freq_epochs=10,
             auto_rescue=True,
@@ -261,9 +280,9 @@ def main():
     
     else:
 
-        checkpoint_path = os.path.join(save_dir_5, "checkpoint_epoch_620.pt")
+        checkpoint_path = os.path.join(save_dir, "checkpoint_epoch_410.pt")
 
-        loss_scales_save_path = os.path.join(save_dir_5, "loss_scales.pkl")
+        loss_scales_save_path = os.path.join(save_dir, "loss_scales.pkl")
 
         with open(loss_scales_save_path, "rb") as f:
             loss_scales = pickle.load(f)
@@ -307,13 +326,13 @@ def main():
 
             mapping_coefficient=1,
             repulsion_coefficient=1,
-            prediction_coefficient=2,
+            prediction_coefficient=1.5,
             hsic_loss_max_want=0.25,
 
             reconstruction_threshold=10**-6,
             reconstruction_loss_multiplier=5,
 
-            on_distribution_val_criterio_weight=1.0,
+            on_distribution_val_criterio_weight=0.75,
             
             # === RESUME MODE SELECTION ===
             # MODE A (load_scheduler_and_optimizer=True): Resume with exact optimizer/scheduler state
@@ -332,13 +351,13 @@ def main():
             load_scheduler_and_optimizer=True,
             
             # Optimizer parameters
-            learning_rate=0.000125,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
+            learning_rate=2.5e-4,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
             weight_decay=1e-4,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
             optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
             
             # Scheduler parameters  
             scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
-            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 15, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 30, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
             reset_scheduler_patience = True, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
             
             # Training parameters
@@ -347,11 +366,11 @@ def main():
             
             # Early stopping parameters
             early_stopping=True,
-            patience=25,
+            patience=100,
             min_delta=0.001,
             
             # Checkpointing
-            save_dir=save_dir_5,  # Should typically match the directory where checkpoint_path is located
+            save_dir=save_dir,  # Should typically match the directory where checkpoint_path is located
             save_best_only=False,
             save_freq_epochs=10,
             auto_rescue=True,

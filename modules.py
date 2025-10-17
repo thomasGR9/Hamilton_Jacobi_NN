@@ -24,6 +24,8 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
 import torch.nn.functional as F
+import re
+
 
 def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
     """
@@ -384,6 +386,8 @@ class Step_1(nn.Module):
         a_k: float = 0.1,  # Sigmoid steepness
         a_raw_innit: float = 0.0,
         gamma_innit: float = 5.0,
+        c1_innit: float = 0.0,
+        c2_innit: float = 5.0,
         g_bound_innit: float = 10.0,
     ):
         """
@@ -395,9 +399,9 @@ class Step_1(nn.Module):
         
         # Initialize trainable parameters
         self.a_raw = nn.Parameter(torch.tensor(a_raw_innit))  
-        self.c1 = nn.Parameter(torch.tensor(0.0))
+        self.c1 = nn.Parameter(torch.tensor(c1_innit))
         self.gamma = nn.Parameter(torch.tensor(gamma_innit))
-        self.c2 = nn.Parameter(torch.tensor(0.0))
+        self.c2 = nn.Parameter(torch.tensor(c2_innit))
 
         if tanh_wrapper:
             self.g_bound = nn.Parameter(torch.tensor(g_bound_innit))
@@ -655,6 +659,8 @@ class Step_2(nn.Module):
         a_k: float = 0.1,
         a_raw_innit: float = 0.0,
         gamma_innit: float = 5.0,
+        c1_innit: float = 0.0,
+        c2_innit: float = 5.0,
         f_bound_innit: float = 10.0,
     ):
         super(Step_2, self).__init__()
@@ -667,9 +673,9 @@ class Step_2(nn.Module):
         
         # Initialize trainable parameters
         self.a_raw = nn.Parameter(torch.tensor(a_raw_innit))
-        self.c1 = nn.Parameter(torch.tensor(0.0))
+        self.c1 = nn.Parameter(torch.tensor(c1_innit))
         self.gamma = nn.Parameter(torch.tensor(gamma_innit))
-        self.c2 = nn.Parameter(torch.tensor(0.0))
+        self.c2 = nn.Parameter(torch.tensor(c2_innit))
         if tanh_wrapper:
             self.f_bound = nn.Parameter(torch.tensor(f_bound_innit))
         
@@ -924,9 +930,16 @@ class CombinedHamiltonianLayer(nn.Module):
         a_eps_min: float = 0.1,  # Minimum value for a
         a_eps_max: float = 10.0,  # Maximum value for a  
         a_k: float = 0.1,  # Sigmoid steepness
-        a_raw_innit: float = 0.0,
-        gamma_innit: float = 5.0,
+        step_1_a_raw_innit: float = 0.0,
+        step_1_gamma_innit: float = 5.0,
+        step_1_c1_innit: float = 0.0,
+        step_1_c2_innit: float = 5.0,
+        step_2_a_raw_innit: float = 0.0,
+        step_2_gamma_innit: float = 5.0,
+        step_2_c1_innit: float = 0.0,
+        step_2_c2_innit: float = 5.0,
         bound_innit: float = 10.0,
+    
 
     ):
         """
@@ -961,8 +974,10 @@ class CombinedHamiltonianLayer(nn.Module):
             a_eps_min= a_eps_min,  # Minimum value for a
             a_eps_max= a_eps_max,  # Maximum value for a  
             a_k= a_k,  # Sigmoid steepness
-            a_raw_innit = a_raw_innit,
-            gamma_innit = gamma_innit,
+            a_raw_innit = step_1_a_raw_innit,
+            gamma_innit = step_1_gamma_innit,
+            c1_innit=step_1_c1_innit,
+            c2_innit=step_1_c2_innit,
             g_bound_innit=bound_innit
         )
         
@@ -988,8 +1003,10 @@ class CombinedHamiltonianLayer(nn.Module):
             a_eps_min= a_eps_min,  # Minimum value for a
             a_eps_max= a_eps_max,  # Maximum value for a  
             a_k= a_k,  # Sigmoid steepness
-            a_raw_innit = a_raw_innit,
-            gamma_innit = gamma_innit,
+            a_raw_innit = step_2_a_raw_innit,
+            gamma_innit = step_2_gamma_innit,
+            c1_innit=step_2_c1_innit,
+            c2_innit=step_2_c2_innit,
             f_bound_innit=bound_innit
 
         )
@@ -1026,6 +1043,55 @@ def solve_a_raw(a_eps_min, a_eps_max, a_k, a_target):
     s = (a_target-a_eps_min) / (a_eps_max-a_eps_min)
     a_raw = (1/a_k) * np.log(s / (1-s))
     return a_raw
+
+def init_step_params(num_layers, 
+                     step_1_mean_init, 
+                     step_2_mean_init, 
+                     std_to_mean_ratio_init, 
+                     seed=None):
+    """
+    Initialize step parameters with Gaussian distribution based on specified means and std ratio.
+    
+    Mathematical formulation:
+    For all layers i = 0, 1, ..., L-1:
+        μ₁ = step_1_mean_init
+        σ₁ = |step_1_mean_init| × std_to_mean_ratio_init
+        step_1[i] ~ N(μ₁, σ₁²)
+        
+        μ₂ = step_2_mean_init
+        σ₂ = |step_2_mean_init| × std_to_mean_ratio_init
+        step_2[i] ~ N(μ₂, σ₂²)
+    
+    Args:
+        num_layers: Number of layers
+        step_1_mean_init: Mean value for step_1 parameters
+        step_2_mean_init: Mean value for step_2 parameters
+        std_to_mean_ratio_init: Ratio that defines standard deviation as ratio × mean
+                                (e.g., 0.1 means std = 0.1 × mean)
+        seed: Random seed for reproducibility (optional)
+    
+    Returns:
+        Dictionary with numpy arrays: 'step_1', 'step_2'
+    
+    Example:
+        >>> params = init_step_params(10, step_1_mean_init=1.0, 
+        ...                           step_2_mean_init=2.0, 
+        ...                           std_to_mean_ratio_init=0.1)
+        >>> # step_1 values will have mean ≈ 1.0, std ≈ 0.1
+        >>> # step_2 values will have mean ≈ 2.0, std ≈ 0.2
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Calculate standard deviations based on the mean and ratio
+    step_1_std = abs(step_1_mean_init) * std_to_mean_ratio_init
+    step_2_std = abs(step_2_mean_init) * std_to_mean_ratio_init
+    
+    # Generate values from Gaussian distribution: X ~ N(μ, σ²)
+    step_1 = np.random.randn(num_layers) * step_1_std + step_1_mean_init
+    step_2 = np.random.randn(num_layers) * step_2_std + step_2_mean_init
+    
+    return step_1.astype(np.float32), step_2.astype(np.float32)
     
 class SimpleStackedHamiltonianNetwork(nn.Module):
     """
@@ -1057,8 +1123,18 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         a_eps_min: float = 0.1,  # Minimum value for a
         a_eps_max: float = 10.0,  # Maximum value for a  
         a_k: float = 0.1,  # Sigmoid steepness
-        a_innit: float = 0.0,
-        gamma_innit: float = 5.0,
+        step_1_a_mean_innit: float = 0.0,
+        std_to_mean_ratio_a_mean_init: float = 0.3,
+        step_1_gamma_mean_innit: float = 5.0,
+        std_to_mean_ratio_gamma_mean_init: float = 0.3,
+        step_1_c1_mean_innit: float = 0.0,
+        std_to_mean_ratio_c1_mean_init: float = 0.0,
+        step_1_c2_mean_innit: float = 5.0,
+        std_to_mean_ratio_c2_mean_init: float = 0.0,
+        step_2_a_mean_innit: float = 0.0,
+        step_2_gamma_mean_innit: float = 5.0,
+        step_2_c1_mean_innit: float = 0.0,
+        step_2_c2_mean_innit: float = 5.0,
 
         bound_innit: float = 10.0,
         **kwargs  # Catch any extra parameters
@@ -1092,12 +1168,36 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         self.a_eps_max=a_eps_max
         self.a_k=a_k
         self.tanh_wrapper = tanh_wrapper
-        self.a_innit = a_innit
-        self.gamma_innit = gamma_innit
+
+        self.step_1_a_mean_innit = step_1_a_mean_innit
+        self.step_1_gamma_mean_innit = step_1_gamma_mean_innit
+        self.step_1_c1_mean_innit = step_1_c1_mean_innit
+        self.step_1_c2_mean_innit = step_1_c2_mean_innit
+
+        self.step_2_a_mean_innit = step_2_a_mean_innit
+        self.step_2_gamma_mean_innit = step_2_gamma_mean_innit
+        self.step_2_c1_mean_innit = step_2_c1_mean_innit
+        self.step_2_c2_mean_innit = step_2_c2_mean_innit
+
+        self.std_to_mean_ratio_a_mean_init = std_to_mean_ratio_a_mean_init
+        self.std_to_mean_ratio_gamma_mean_init = std_to_mean_ratio_gamma_mean_init
+        self.std_to_mean_ratio_c1_mean_init = std_to_mean_ratio_c1_mean_init
+        self.std_to_mean_ratio_c2_mean_init = std_to_mean_ratio_c2_mean_init
+
+
+
         self.bound_innit = bound_innit
 
-        a_raw_innit = solve_a_raw(a_eps_min=a_eps_min, a_eps_max=a_eps_max, a_k=a_k, a_target=a_innit)
+        step_1_a_raw_mean_innit = solve_a_raw(a_eps_min=a_eps_min, a_eps_max=a_eps_max, a_k=a_k, a_target=step_1_a_mean_innit)
+        step_2_a_raw_mean_innit = solve_a_raw(a_eps_min=a_eps_min, a_eps_max=a_eps_max, a_k=a_k, a_target=step_2_a_mean_innit)
 
+        step_1_a_raw_innit_arr, step_2_a_raw_innit_arr = init_step_params(num_layers=n_layers, step_1_mean_init=step_1_a_raw_mean_innit, step_2_mean_init=step_2_a_raw_mean_innit, std_to_mean_ratio_init=std_to_mean_ratio_a_mean_init, seed=None)
+
+        step_1_gamma_innit_arr, step_2_gamma_innit_arr = init_step_params(num_layers=n_layers, step_1_mean_init=step_1_gamma_mean_innit, step_2_mean_init=step_2_gamma_mean_innit, std_to_mean_ratio_init=std_to_mean_ratio_gamma_mean_init, seed=None)
+
+        step_1_c1_innit_arr, step_2_c1_innit_arr = init_step_params(num_layers=n_layers, step_1_mean_init=step_1_c1_mean_innit, step_2_mean_init=step_2_c1_mean_innit, std_to_mean_ratio_init=std_to_mean_ratio_c1_mean_init, seed=None)
+
+        step_1_c2_innit_arr, step_2_c2_innit_arr = init_step_params(num_layers=n_layers, step_1_mean_init=step_1_c2_mean_innit, step_2_mean_init=step_2_c2_mean_innit, std_to_mean_ratio_init=std_to_mean_ratio_c2_mean_init, seed=None)
         
         if final_activation_only_on_final_layer:
             for i in range(n_layers):
@@ -1135,8 +1235,14 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
                     a_eps_min= a_eps_min,  # Minimum value for a
                     a_eps_max= a_eps_max,  # Maximum value for a  
                     a_k= a_k,  # Sigmoid steepness
-                    a_raw_innit = a_raw_innit,
-                    gamma_innit = gamma_innit,
+                    step_1_a_raw_innit = step_1_a_raw_innit_arr[i],
+                    step_1_gamma_innit = step_1_gamma_innit_arr[i],
+                    step_1_c1_innit = step_1_c1_innit_arr[i],
+                    step_1_c2_innit = step_1_c2_innit_arr[i],
+                    step_2_a_raw_innit = step_2_a_raw_innit_arr[i],
+                    step_2_gamma_innit = step_2_gamma_innit_arr[i],
+                    step_2_c1_innit = step_2_c1_innit_arr[i],
+                    step_2_c2_innit = step_2_c2_innit_arr[i],
                     bound_innit = bound_innit,
                     **kwargs  # Pass any remaining kwargs
                 )
@@ -1172,8 +1278,14 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
                     a_eps_min= a_eps_min,  # Minimum value for a
                     a_eps_max= a_eps_max,  # Maximum value for a  
                     a_k= a_k,  # Sigmoid steepness
-                    a_raw_innit = a_raw_innit,
-                    gamma_innit = gamma_innit,
+                    step_1_a_raw_innit = step_1_a_raw_innit_arr[i],
+                    step_1_gamma_innit = step_1_gamma_innit_arr[i],
+                    step_1_c1_innit = step_1_c1_innit_arr[i],
+                    step_1_c2_innit = step_1_c2_innit_arr[i],
+                    step_2_a_raw_innit = step_2_a_raw_innit_arr[i],
+                    step_2_gamma_innit = step_2_gamma_innit_arr[i],
+                    step_2_c1_innit = step_2_c1_innit_arr[i],
+                    step_2_c2_innit = step_2_c2_innit_arr[i],
                     bound_innit = bound_innit,
                     **kwargs  # Pass any remaining kwargs
                 )
@@ -2530,11 +2642,45 @@ def train_model(
                 model_a_k = mapping_net.a_k
                 run_hyperparameters['model_a_k'] = model_a_k
 
-                model_a_innit = mapping_net.a_innit
-                run_hyperparameters['model_a_innit'] = model_a_innit
+                model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
+                run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
 
-                model_gamma_innit = mapping_net.gamma_innit
-                run_hyperparameters['model_gamma_innit'] = model_gamma_innit
+                model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
+                run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
+
+                model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
+                run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
+
+
+                model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
+                run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
+
+                model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
+                run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
+
+
+
+                model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
+                run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
+
+                model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
+                run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
+
+                model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
+                run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
+
+
+                model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
+
+                model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
+
+                model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
+
+                model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
 
                 model_bound_innit = mapping_net.bound_innit
                 run_hyperparameters['model_bound_innit'] = model_bound_innit
@@ -2999,7 +3145,7 @@ def train_model(
                     val_reconstruction_loss_training_set += reconstruction_loss_
                     val_prediction_loss_training_set += prediction_loss_
                     if verbose > 1 and batch_idx % log_freq_batches == 0:
-                        print(f"Batch {batch_idx}/{val_batches_training_set} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f}) - Prediction Loss: {prediction_loss_:.4f}")
+                        print(f"Batch {batch_idx}/{val_batches_training_set} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f} - Prediction Loss: {prediction_loss_:.4f}")
                     trajectory_data = {
                         'total_loss' : total_loss_,
                         'variance_loss' : variance_loss_,
@@ -3193,11 +3339,48 @@ def train_model(
         model_a_k = mapping_net.a_k
         run_hyperparameters['model_a_k'] = model_a_k
 
-        model_a_innit = mapping_net.a_innit
-        run_hyperparameters['model_a_innit'] = model_a_innit
 
-        model_gamma_innit = mapping_net.gamma_innit
-        run_hyperparameters['model_gamma_innit'] = model_gamma_innit
+        model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
+        run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
+
+        model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
+        run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
+
+        model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
+        run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
+
+
+        model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
+        run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
+
+        model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
+        run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
+
+
+
+        model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
+        run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
+
+        model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
+        run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
+
+        model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
+        run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
+
+
+        model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
+
+        model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
+
+        model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
+
+        model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
+
+
 
         model_bound_innit = mapping_net.bound_innit
         run_hyperparameters['model_bound_innit'] = model_bound_innit
@@ -3718,33 +3901,13 @@ def plot_differencies(df):
 
 
 def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_trajectory, t, trajectory_id,
-                                     point_indexes_observed, figsize=(12, 7), connect_points=False):
+                                     point_indexes_observed, figsize=(12, 7), connect_points=False,
+                                     portion_to_visualize=None):
     """
     Plot ground truth vs predictions with loss metric and time visualization.
-    
-    Parameters:
-    -----------
-    x : tensor
-        Ground truth x values
-    u : tensor
-        Ground truth u values
-    x_pred : tensor
-        Predicted x values
-    u_pred : tensor
-        Predicted u values
-    pred_loss_full_trajectory : tensor
-        Loss metric (scalar)
-    t : tensor
-        Time values for the trajectory
-    trajectory_id : int or str
-        Trajectory identifier
-    point_indexes_observed : list
-        List of observed point indexes
-    figsize : tuple, optional
-        Figure size (width, height)
-    connect_points : bool, optional
-        Whether to connect points with lines (for trajectories)
+    portion_to_visualize: list [start_idx, end_idx] -> restricts the displayed portion (index-based)
     """
+
     # Convert tensors to numpy
     x_np = x.detach().cpu().numpy().flatten()
     u_np = u.detach().cpu().numpy().flatten()
@@ -3752,11 +3915,20 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
     u_pred_np = u_pred.detach().cpu().numpy().flatten()
     t_np = t.detach().cpu().numpy().flatten()
     loss_value = pred_loss_full_trajectory.item()
-    
+
+    # Handle visualization portion
+    if portion_to_visualize is not None:
+        start_idx, end_idx = portion_to_visualize
+        x_np = x_np[start_idx:end_idx]
+        u_np = u_np[start_idx:end_idx]
+        x_pred_np = x_pred_np[start_idx:end_idx]
+        u_pred_np = u_pred_np[start_idx:end_idx]
+        t_np = t_np[start_idx:end_idx]
+
     # Print observed times (not shown in plot)
     t_observed = t[point_indexes_observed].detach().cpu().numpy()
     print(f"Observed time points: {t_observed}")
-    
+
     # Get number of observed points
     num_observed = len(point_indexes_observed)
 
@@ -3764,49 +3936,51 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
     fig, ax = plt.subplots(figsize=figsize)
 
     # Plot with time-based colormaps (using very different color schemes)
-    scatter_gt = ax.scatter(x_np, u_np, c=t_np, cmap='Blues', 
+    scatter_gt = ax.scatter(x_np, u_np, c=t_np, cmap='Blues',
                             label='Ground Truth', alpha=0.8, s=60, edgecolors='darkblue', linewidths=0.5)
-    scatter_pred = ax.scatter(x_pred_np, u_pred_np, c=t_np, cmap='Reds', 
+    scatter_pred = ax.scatter(x_pred_np, u_pred_np, c=t_np, cmap='Reds',
                               label='Prediction', alpha=0.8, s=60, edgecolors='darkred', linewidths=0.5)
 
-    # Connect points with lines if requested
+    # Connect points if requested
     if connect_points:
         ax.plot(x_np, u_np, 'b-', alpha=0.3, linewidth=1.5)
         ax.plot(x_pred_np, u_pred_np, 'r-', alpha=0.3, linewidth=1.5)
 
-    # Mark initial points (t=0) with stars only
-    ax.scatter(x_np[0], u_np[0], c='blue', marker='*', s=400, 
+    # Mark initial points with stars
+    ax.scatter(x_np[0], u_np[0], c='blue', marker='*', s=400,
                edgecolors='black', linewidths=2.5, label='Start (Ground Truth)', zorder=5)
-    ax.scatter(x_pred_np[0], u_pred_np[0], c='red', marker='*', s=400, 
+    ax.scatter(x_pred_np[0], u_pred_np[0], c='red', marker='*', s=400,
                edgecolors='black', linewidths=2.5, label='Start (Prediction)', zorder=5)
 
     # Add colorbars for time (side by side)
     cbar_gt = plt.colorbar(scatter_gt, ax=ax, pad=0.02, fraction=0.046)
     cbar_gt.set_label('Time (Ground Truth)', fontsize=10, color='darkblue', fontweight='bold')
     cbar_gt.ax.tick_params(labelsize=9)
-    
+
     cbar_pred = plt.colorbar(scatter_pred, ax=ax, pad=0.12, fraction=0.046)
     cbar_pred.set_label('Time (Prediction)', fontsize=10, color='darkred', fontweight='bold')
     cbar_pred.ax.tick_params(labelsize=9)
-    
-    # Add labels and title
+
+    # Labels and title
     ax.set_xlabel('x', fontsize=12)
     ax.set_ylabel('u', fontsize=12)
     ax.set_title(f'Prediction vs Ground Truth - Trajectory ID: {trajectory_id}', fontsize=14, fontweight='bold')
     ax.legend(fontsize=9, loc='best')
     ax.grid(True, alpha=0.3)
 
-    # Add loss metric, time range, and number of observed points as text box
+    # Annotate loss and portion info
     textstr = f'Loss: {loss_value:.4f}\nTime range: [{t_np[0]:.2f}, {t_np[-1]:.2f}]\nObserved points: {num_observed}'
+    if portion_to_visualize is not None:
+        textstr += f'\nPlotted range: [{portion_to_visualize[0]}, {portion_to_visualize[1]}]'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, 
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes,
             fontsize=11, verticalalignment='top', bbox=props)
 
     plt.tight_layout()
     plt.show()
 
 
-def test_model_in_single_trajectory(get_data_from_trajectory_id_function, prediction_loss_function, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device, point_indexes_observed, connect_points):
+def test_model_in_single_trajectory(get_data_from_trajectory_id_function, prediction_loss_function, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device, point_indexes_observed, connect_points, portion_to_visualize=None):
     test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
     x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
     u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
@@ -3820,7 +3994,7 @@ def test_model_in_single_trajectory(get_data_from_trajectory_id_function, predic
         U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
         x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
         pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
-        plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points)
+        plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points, portion_to_visualize=portion_to_visualize)
 
 
 
@@ -4565,3 +4739,187 @@ def analyze_folders_means(save_dir_path, locate_epoch=None):
             else:
                 print(f"\n{traj_dir}: Epoch {locate_epoch} not found")
         print(f"{'='*60}")
+
+
+
+
+
+def analyze_mapping_net(mapping_net, return_lists=False):
+    """
+    Analyze and visualize parameters of a mapping network that has step_1 and step_2 submodules.
+    Plots MLP parameter statistics (mean, std, L2 norm) and mapping parameters (c1, c2, gamma, a).
+    
+    Parameters
+    ----------
+    mapping_net : torch.nn.Module
+        The mapping network containing step_1 and step_2 submodules.
+    return_lists : bool, optional (default=False)
+        If True, returns all extracted parameter lists.
+    
+    Returns
+    -------
+    dict (if return_lists=True)
+        {
+            "step_1_mlp_params": dict,
+            "step_2_mlp_params": dict,
+            "step_1_c1_values": list,
+            "step_2_c1_values": list,
+            "step_1_c2_values": list,
+            "step_2_c2_values": list,
+            "step_1_gamma_values": list,
+            "step_2_gamma_values": list,
+            "step_1_a_values": list,
+            "step_2_a_values": list
+        }
+    """
+    # --- Step 1: Extract all parameters ---
+    step_1_mlp_params = {}
+    step_2_mlp_params = {}
+    step_1_c1_values, step_2_c1_values = [], []
+    step_1_c2_values, step_2_c2_values = [], []
+    step_1_gamma_values, step_2_gamma_values = [], []
+    step_1_a_values, step_2_a_values = [], []
+
+    for name, param in mapping_net.named_parameters():
+        if 'step_1' in name:
+            if 'G_network' in name:
+                step_1_mlp_params[name] = param
+            elif 'c1' in name:
+                step_1_c1_values.append(param.item())
+            elif 'c2' in name:
+                step_1_c2_values.append(param.item())
+            elif 'gamma' in name:
+                step_1_gamma_values.append(param.item())
+
+        elif 'step_2' in name:
+            if 'F_network' in name or 'G_network' in name:
+                step_2_mlp_params[name] = param
+            elif 'c1' in name:
+                step_2_c1_values.append(param.item())
+            elif 'c2' in name:
+                step_2_c2_values.append(param.item())
+            elif 'gamma' in name:
+                step_2_gamma_values.append(param.item())
+
+    # Extract a-values from sublayers
+    for layer in mapping_net.layers:
+        step_1_a_values.append(layer.step_1.a.item())
+        step_2_a_values.append(layer.step_2.a.item())
+
+    # --- Step 2: Plot mapping parameters (c1, c2, gamma, a) ---
+    num_layers = len(step_1_c1_values)
+    layer_indices = list(range(num_layers))
+
+    plt.figure(figsize=(14, 12))
+
+    # ---- Plot 1: c1 and c2 values ----
+    plt.subplot(3, 1, 1)
+    plt.plot(layer_indices, step_1_c1_values, marker='o', color='blue', label='Step 1 - c₁')
+    plt.plot(layer_indices, step_1_c2_values, marker='o', color='cyan', label='Step 1 - c₂')
+    plt.plot(layer_indices, step_2_c1_values, marker='s', color='red', label='Step 2 - c₁')
+    plt.plot(layer_indices, step_2_c2_values, marker='s', color='orange', label='Step 2 - c₂')
+    plt.title('c₁ and c₂ Parameters per Layer', fontsize=14, fontweight='bold')
+    plt.xlabel('Layer number', fontsize=12)
+    plt.ylabel('Parameter value', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(alpha=0.3)
+
+    # ---- Plot 2: gamma values ----
+    plt.subplot(3, 1, 2)
+    plt.plot(layer_indices, step_1_gamma_values, marker='o', color='green', label='Step 1 - γ')
+    plt.plot(layer_indices, step_2_gamma_values, marker='s', color='magenta', label='Step 2 - γ')
+    plt.title('γ (Gamma) Parameters per Layer', fontsize=14, fontweight='bold')
+    plt.xlabel('Layer number', fontsize=12)
+    plt.ylabel('Gamma value', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(alpha=0.3)
+
+    # ---- Plot 3: a values ----
+    plt.subplot(3, 1, 3)
+    plt.plot(layer_indices, step_1_a_values, marker='o', color='purple', label='Step 1 - a')
+    plt.plot(layer_indices, step_2_a_values, marker='s', color='brown', label='Step 2 - a')
+    plt.title('a Parameters per Layer', fontsize=14, fontweight='bold')
+    plt.xlabel('Layer number', fontsize=12)
+    plt.ylabel('a value', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # --- Step 3: Plot MLP statistics (both steps) ---
+    def plot_mlp_stats(mlp_params, step_name, color_scheme):
+        pattern = re.compile(r"layers\.(\d+)\.")
+        layer_stats = defaultdict(lambda: {"weight_values": [], "bias_values": []})
+
+        for name, param in mlp_params.items():
+            match = pattern.search(name)
+            if not match:
+                continue
+            layer_idx = int(match.group(1))
+            vals = param.detach().cpu().numpy().flatten()
+            if 'weight' in name:
+                layer_stats[layer_idx]["weight_values"].append(vals)
+            elif 'bias' in name:
+                layer_stats[layer_idx]["bias_values"].append(vals)
+
+        layer_indices = sorted(layer_stats.keys())
+        weight_means, weight_stds, weight_norms = [], [], []
+        bias_means, bias_stds, bias_norms = [], [], []
+
+        for idx in layer_indices:
+            all_w = np.concatenate(layer_stats[idx]["weight_values"]) if layer_stats[idx]["weight_values"] else np.array([0])
+            all_b = np.concatenate(layer_stats[idx]["bias_values"]) if layer_stats[idx]["bias_values"] else np.array([0])
+            weight_means.append(np.mean(all_w))
+            weight_stds.append(np.std(all_w))
+            weight_norms.append(np.linalg.norm(all_w))
+            bias_means.append(np.mean(all_b))
+            bias_stds.append(np.std(all_b))
+            bias_norms.append(np.linalg.norm(all_b))
+
+        plt.figure(figsize=(14, 10))
+
+        # Weights
+        plt.subplot(2, 1, 1)
+        plt.plot(layer_indices, weight_means, 'o-', color=color_scheme[0], label=f'{step_name} - Mean (weights)')
+        plt.plot(layer_indices, weight_stds, 's-', color=color_scheme[1], label=f'{step_name} - Std (weights)')
+        plt.plot(layer_indices, weight_norms, '--', color=color_scheme[2], label=f'{step_name} - L2 norm (weights)')
+        plt.title(f"{step_name} - G_network Weight Statistics per Layer", fontsize=14, fontweight='bold')
+        plt.xlabel("Layer index", fontsize=12)
+        plt.ylabel("Value", fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(alpha=0.3)
+
+        # Biases
+        plt.subplot(2, 1, 2)
+        plt.plot(layer_indices, bias_means, 'o-', color=color_scheme[3], label=f'{step_name} - Mean (bias)')
+        plt.plot(layer_indices, bias_stds, 's-', color=color_scheme[4], label=f'{step_name} - Std (bias)')
+        plt.plot(layer_indices, bias_norms, '--', color=color_scheme[5], label=f'{step_name} - L2 norm (bias)')
+        plt.title(f"{step_name} - G_network Bias Statistics per Layer", fontsize=14, fontweight='bold')
+        plt.xlabel("Layer index", fontsize=12)
+        plt.ylabel("Value", fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    # Step 1
+    plot_mlp_stats(step_1_mlp_params, "Step 1", ['blue', 'cyan', 'navy', 'red', 'orange', 'darkred'])
+    # Step 2
+    plot_mlp_stats(step_2_mlp_params, "Step 2", ['green', 'lime', 'darkgreen', 'purple', 'magenta', 'darkviolet'])
+
+    # --- Optional return ---
+    if return_lists:
+        return {
+            "step_1_mlp_params": step_1_mlp_params,
+            "step_2_mlp_params": step_2_mlp_params,
+            "step_1_c1_values": step_1_c1_values,
+            "step_2_c1_values": step_2_c1_values,
+            "step_1_c2_values": step_1_c2_values,
+            "step_2_c2_values": step_2_c2_values,
+            "step_1_gamma_values": step_1_gamma_values,
+            "step_2_gamma_values": step_2_gamma_values,
+            "step_1_a_values": step_1_a_values,
+            "step_2_a_values": step_2_a_values
+        }
