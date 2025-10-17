@@ -83,6 +83,12 @@ def main():
 
     device = "cuda"
 
+    if resume_training == False:
+        training_seed = 42
+    else:
+        resume_training_counter = 1
+        training_seed = 42 + resume_training_counter
+    
     train_dataloader = create_simple_dataloader(
     train_df=train_df,
     train_id_df=train_id_df,
@@ -91,7 +97,7 @@ def main():
     segment_length=2,
     get_data_func=get_data_from_trajectory_id,
     device=device,
-    seed=42
+    seed=training_seed
     )
 
     val_dataloader = create_val_dataloader_full_trajectory(
@@ -143,6 +149,7 @@ def main():
         
         # Architectural choices
         use_bias = True,
+        use_layer_norm = True,
         
         # Input/Output parameters
         input_dim = 2,  # x or u and t
@@ -250,7 +257,7 @@ def main():
 
             # Training parameters
             num_epochs=300,
-            grad_clip_value=None,
+            grad_clip_value=60.0,
 
 
             # Early stopping parameters
@@ -280,7 +287,7 @@ def main():
     
     else:
 
-        checkpoint_path = os.path.join(save_dir, "checkpoint_epoch_410.pt")
+        checkpoint_path = os.path.join(save_dir, "checkpoint_epoch_480.pt")
 
         loss_scales_save_path = os.path.join(save_dir, "loss_scales.pkl")
 
@@ -357,12 +364,12 @@ def main():
             
             # Scheduler parameters  
             scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
-            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 30, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 80, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
             reset_scheduler_patience = True, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
             
             # Training parameters
             num_epochs=300,  # Number of ADDITIONAL epochs to train 
-            grad_clip_value=None, #Use None if you dont want gradient clipping, specify to use torch.nn.utils.clip_grad_norm_ in all parameters
+            grad_clip_value=60.0, #Use None if you dont want gradient clipping, specify to use torch.nn.utils.clip_grad_norm_ in MLP parameters
             
             # Early stopping parameters
             early_stopping=True,

@@ -320,6 +320,14 @@ class SimpleHarmonicDataLoader:
             'trajectory_ids': torch.tensor(tid_list, dtype=torch.long),
             'energies': torch.tensor(energy_list, dtype=torch.float32)
         }
+    def on_epoch_start(self):
+        """
+        Regenerate batch compositions and shuffle batch order.
+        Call this at the start of each epoch for maximum randomness.
+        """
+        self._generate_epoch_plan()  # Create new batch compositions
+        np.random.shuffle(self.batches)  # Shuffle the batch order
+        print(f"Regenerated {len(self.batches)} batches for new epoch")
 
 
 def create_simple_dataloader(train_df, train_id_df, ratio, batch_size, segment_length, get_data_func, device='cuda', seed=42):
@@ -375,6 +383,7 @@ class Step_1(nn.Module):
         
         # Architectural choices
         use_bias: bool = True,
+        use_layer_norm: bool = False,
         
         # Input/Output parameters
         input_dim: int = 2,  # x and t
@@ -428,6 +437,7 @@ class Step_1(nn.Module):
             activation_params=activation_params,
             final_activation=final_activation,
             use_bias=use_bias,
+            use_layer_norm=use_layer_norm,
         )
         
         # Initialize weights
@@ -468,7 +478,7 @@ class Step_1(nn.Module):
     
     def _build_mlp(
         self, input_dim, output_dim, hidden_dims, activation, activation_params,
-        final_activation, use_bias
+        final_activation, use_bias, use_layer_norm
     ):
         """Build the MLP network with specified configuration."""
         layers = []
@@ -485,6 +495,9 @@ class Step_1(nn.Module):
             # Linear layer
             linear = nn.Linear(in_dim, out_dim, bias=use_bias)
             layers.append(linear)
+
+            if use_layer_norm and not is_last_layer:
+                layers.append(nn.LayerNorm(out_dim))
             
             # Add activation
             if is_last_layer:
@@ -648,6 +661,7 @@ class Step_2(nn.Module):
         
         # Architectural choices
         use_bias: bool = True,
+        use_layer_norm: bool = False,
         
         # Input/Output parameters
         input_dim: int = 2,  # u and t
@@ -694,6 +708,7 @@ class Step_2(nn.Module):
             activation_params=activation_params,
             final_activation=final_activation,
             use_bias=use_bias,
+            use_layer_norm=use_layer_norm,
         )
         
         # Initialize weights
@@ -734,7 +749,7 @@ class Step_2(nn.Module):
     
     def _build_mlp(
         self, input_dim, output_dim, hidden_dims, activation, activation_params,
-        final_activation, use_bias
+        final_activation, use_bias, use_layer_norm
     ):
         """Build the MLP network with specified configuration."""
         layers = []
@@ -752,6 +767,9 @@ class Step_2(nn.Module):
             linear = nn.Linear(in_dim, out_dim, bias=use_bias)
             layers.append(linear)
             
+            if use_layer_norm and not is_last_layer:
+                layers.append(nn.LayerNorm(out_dim))
+
             # Add activation
             if is_last_layer:
                 if final_activation is not None:
@@ -921,6 +939,7 @@ class CombinedHamiltonianLayer(nn.Module):
 
 
         use_bias: bool = True,
+        use_layer_norm: bool = False,
 
         # Input/Output parameters
         input_dim: int = 2,  # x and t
@@ -967,6 +986,7 @@ class CombinedHamiltonianLayer(nn.Module):
             bias_init=bias_init,
             bias_init_value=bias_init_value,
             use_bias=use_bias,
+            use_layer_norm=use_layer_norm,
             input_dim= input_dim,  # x and t
             output_dim= output_dim,  # scalar G
             
@@ -996,6 +1016,7 @@ class CombinedHamiltonianLayer(nn.Module):
             bias_init=bias_init,
             bias_init_value=bias_init_value,
             use_bias=use_bias,
+            use_layer_norm=use_layer_norm,
             input_dim= input_dim,  # x and t
             output_dim= output_dim,  # scalar G
             
@@ -1113,6 +1134,7 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         bias_init: str = 'zeros',
         bias_init_value: float = 0.0,
         use_bias: bool = True,
+        use_layer_norm: bool = False,
 
 
         # Input/Output parameters
@@ -1164,6 +1186,7 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         self.weight_init_params = weight_init_params
         self.bias_init = bias_init
         self.bias_init_value = bias_init_value
+        self.use_layer_norm = use_layer_norm
         self.a_eps_min = a_eps_min
         self.a_eps_max=a_eps_max
         self.a_k=a_k
@@ -1228,6 +1251,7 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
                     bias_init=bias_init,
                     bias_init_value=bias_init_value,
                     use_bias=use_bias,
+                    use_layer_norm=use_layer_norm,
                     input_dim= input_dim,  # x and t
                     output_dim= output_dim,  # scalar G
 
@@ -1271,6 +1295,7 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
                     bias_init=bias_init,
                     bias_init_value=bias_init_value,
                     use_bias=use_bias,
+                    use_layer_norm=use_layer_norm,
                     input_dim= input_dim,  # x and t
                     output_dim= output_dim,  # scalar G
 
@@ -2632,6 +2657,10 @@ def train_model(
             
                 model_bias_init_value = mapping_net.bias_init_value 
                 run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+                model_use_layer_norm = mapping_net.use_layer_norm 
+                run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
+                
             
                 model_a_eps_min = mapping_net.a_eps_min 
                 run_hyperparameters['model_a_eps_min'] = model_a_eps_min
@@ -2913,6 +2942,11 @@ def train_model(
     try:
         for epoch in range(start_epoch, start_epoch+num_epochs):
                 # Initialize epoch_metrics
+
+            if epoch > start_epoch:
+                train_loader.dataset.on_epoch_start()
+
+
             epoch_metrics = {}
             epoch_start_time = time.time()
 
@@ -2976,7 +3010,7 @@ def train_model(
 
                 # Gradient clipping
                 if grad_clip_value is not None:
-                    torch.nn.utils.clip_grad_norm_(mlp_params+transform_params+scale_params, grad_clip_value)
+                    torch.nn.utils.clip_grad_norm_(mlp_params, grad_clip_value)
 
                 # Optimizer step
                 optimizer.step()
@@ -3329,6 +3363,9 @@ def train_model(
 
         model_bias_init_value = mapping_net.bias_init_value 
         run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+        model_use_layer_norm = mapping_net.use_layer_norm 
+        run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
 
         model_a_eps_min = mapping_net.a_eps_min 
         run_hyperparameters['model_a_eps_min'] = model_a_eps_min
