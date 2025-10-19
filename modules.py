@@ -2108,6 +2108,26 @@ def prediction_loss(
     
     return total_loss
 
+def prediction_loss_euclidean(
+    x_pred: torch.Tensor,
+    u_pred: torch.Tensor,
+    X_labels: torch.Tensor,
+    U_labels: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute prediction loss using Euclidean distance in phase space.
+    
+    Args:
+        x_pred: Predicted positions from inverse network, shape (batch_size,)
+        u_pred: Predicted velocities from inverse network, shape (batch_size,)
+        X_labels: Ground truth positions at t_for_pred times, shape (batch_size,)
+        U_labels: Ground truth velocities at t_for_pred times, shape (batch_size,)
+    
+    Returns:
+        loss: Mean Euclidean distance in (x, u) phase space
+    """
+    euclidean_distances = torch.sqrt((x_pred - X_labels) ** 2 + (u_pred - U_labels) ** 2)
+    return torch.mean(euclidean_distances)
 
 def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_loss, prediction_loss,
                       mapping_coefficient, repulsion_coefficient, prediction_coefficient,
@@ -2493,6 +2513,7 @@ def count_parameters(model):
 def train_model(
     # Dataloaders
     train_loader,
+    randomize_each_epoch_plan,
     val_loader, 
     val_loader_high_energy,
     val_loader_training_set,
@@ -2621,6 +2642,8 @@ def train_model(
                 run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
                 run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
                 run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+                run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
+                
             
                 n_parameters = count_parameters(mapping_net)
                 run_hyperparameters['model_trainable_parameter_count'] = n_parameters
@@ -2943,7 +2966,7 @@ def train_model(
         for epoch in range(start_epoch, start_epoch+num_epochs):
                 # Initialize epoch_metrics
 
-            if epoch > start_epoch:
+            if epoch > start_epoch and randomize_each_epoch_plan:
                 train_loader.dataset.on_epoch_start()
 
 
@@ -2961,6 +2984,8 @@ def train_model(
             train_hsic_loss_ = 0.0
             train_reconstruction_loss_ = 0.0
             train_prediction_loss_ = 0.0
+            mean_grad_norm_ = 0.0
+            percentage_of_batches_clipped_in_epoch = 0.0
             batch_count = 0
 
             # Progress tracking
@@ -3002,20 +3027,28 @@ def train_model(
                             print(f"Inf gradients detected in {name}")
                             param.grad[torch.isinf(param.grad)] = 0.0
                         # Check for extreme gradients
-                        grad_norm = param.grad.norm().item()
-                        if grad_norm > 10.0:  # Threshold for reporting
-                            print(f"High gradient norm in {name}: {grad_norm}")
-                        if grad_norm < 0.00001:  
-                            print(f"Low gradient norm in {name}: {grad_norm}")
+                        grad_norm_print = param.grad.norm().item()
+                        if grad_norm_print > 10.0:  # Threshold for reporting
+                            print(f"High gradient norm in {name}: {grad_norm_print}")
+                        if grad_norm_print < 0.00001:  
+                            print(f"Low gradient norm in {name}: {grad_norm_print}")
 
                 # Gradient clipping
                 if grad_clip_value is not None:
-                    torch.nn.utils.clip_grad_norm_(mlp_params, grad_clip_value)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(mlp_params+scale_params+transform_params, grad_clip_value)
+                    if (grad_norm>grad_clip_value):
+                        percentage_of_batches_clipped_in_epoch += 1.0
+                        if verbose>1:
+                            print(f"Grad clipping activated, grad_norm before clipping: {grad_norm}")
+
 
                 # Optimizer step
                 optimizer.step()
 
                 # Update metrics
+                if grad_clip_value is not None:
+                    mean_grad_norm_ += grad_norm.item()
+                
                 train_total_loss_ += total_loss_.item()
                 train_variance_loss_ += variance_loss_.item()
                 train_repulsion_loss_ += repulsion_loss_.item()
@@ -3026,17 +3059,22 @@ def train_model(
 
                 # Log progress
                 if verbose > 1 and batch_idx % log_freq_batches == 0:
-                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}")
+                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}\n")
+                    if grad_clip_value is not None:
+                        print(f"Grad norm of batch: {grad_norm.item():.4f}")
 
 
+                        
                 
             # Calculate epoch metrics
+            mean_grad_norm_ /= max(1, batch_count)
             train_total_loss_ /= max(1, batch_count)
             train_variance_loss_ /= max(1, batch_count)
             train_repulsion_loss_ /= max(1, batch_count)
             train_hsic_loss_ /= max(1, batch_count)
             train_reconstruction_loss_ /= max(1, batch_count)
             train_prediction_loss_ /= max(1, batch_count)
+            percentage_of_batches_clipped_in_epoch /= max(1, batch_count)
 
             # Validation phase
             val_total_loss_ = 0.0
@@ -3208,7 +3246,11 @@ def train_model(
 
             # Update epoch_metrics
             epoch_metrics['epoch'] = epoch
+
+
             
+            epoch_metrics['percentage_of_batches_clipped_in_epoch'] = percentage_of_batches_clipped_in_epoch*100
+            epoch_metrics['mean_grad_norm_'] = mean_grad_norm_
             epoch_metrics['train_total_loss_'] = train_total_loss_
             epoch_metrics['train_variance_loss_'] = train_variance_loss_
             epoch_metrics['train_repulsion_loss_'] = train_repulsion_loss_
@@ -3277,6 +3319,11 @@ def train_model(
             # Print epoch summary
             if verbose > 0:
                 print(f"\nEpoch {epoch}/{start_epoch+num_epochs} completed in {epoch_time:.2f}s")
+
+
+                print(f"Percentage of batches clipped in epoch: {percentage_of_batches_clipped_in_epoch*100:.1f}%")
+                if grad_clip_value is not None:
+                    print(f"Mean grad norm: {mean_grad_norm_:.4f}")
                 print(f"Mean total train loss: {train_total_loss_:.4f}")
                 print(f"Mean variance train loss: {train_variance_loss_:.4f}")
                 print(f"Mean repulsion train loss: {train_repulsion_loss_:.4f}")
@@ -3327,6 +3374,7 @@ def train_model(
         run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
         run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
         run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+        run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
 
         n_parameters = count_parameters(mapping_net)
         run_hyperparameters['model_trainable_parameter_count'] = n_parameters
@@ -3484,6 +3532,7 @@ def resume_training_from_checkpoint(
     
     # Dataloaders
     train_loader,
+    randomize_each_epoch_plan,
     val_loader,
     val_loader_high_energy,
     val_loader_training_set,
@@ -3668,6 +3717,7 @@ def resume_training_from_checkpoint(
         return train_model(
             # Dataloaders
             train_loader=train_loader,
+            randomize_each_epoch_plan=randomize_each_epoch_plan,
             val_loader=val_loader,
             val_loader_high_energy=val_loader_high_energy,
             val_loader_training_set=val_loader_training_set,
@@ -3738,6 +3788,7 @@ def resume_training_from_checkpoint(
         return train_model(
             # Dataloaders
             train_loader=train_loader,
+            randomize_each_epoch_plan=randomize_each_epoch_plan,
             val_loader=val_loader,
             val_loader_high_energy=val_loader_high_energy,
             val_loader_training_set=val_loader_training_set,
@@ -4960,3 +5011,125 @@ def analyze_mapping_net(mapping_net, return_lists=False):
             "step_1_a_values": step_1_a_values,
             "step_2_a_values": step_2_a_values
         }
+
+def test_model_in_all_trajectories_in_df(
+    get_data_from_trajectory_id_function,
+    prediction_loss_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    inverse_net,
+    device,
+    point_indexes_observed
+):
+    """
+    Test model on all trajectories in test_id_df and return dataframe with prediction losses.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['trajectory_id', 'energy', 'prediction_loss', 'loss_per_energy'], sorted by energy
+    """
+
+    
+    # Create a copy to avoid modifying the original
+    result_df = test_id_df.copy()
+    
+    # Initialize list to store losses
+    losses = []
+    
+    # Loop through each trajectory
+    for idx, row in test_id_df.iterrows():
+        trajectory_id = int(row['trajectory_id'])
+        
+        test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+        if point_indexes_observed:
+            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+            X_final_mean = X_final.mean()
+            U_final_mean = U_final.mean()
+            X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+            U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+            x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+            pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+            losses.append(pred_loss_full_trajectory.item())
+        else:
+            losses.append(np.nan)
+    
+    # Add the losses as a new column
+    result_df['prediction_loss'] = losses
+    
+    # Add loss per energy column
+    result_df['loss_per_energy'] = result_df['prediction_loss'] / result_df['energy']
+    
+    # Select only the required columns and sort by energy
+    result_df = result_df[['trajectory_id', 'energy', 'prediction_loss', 'loss_per_energy']].sort_values('energy')
+    
+    # Print the dataframe
+    print(result_df)
+    
+    # Create first plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['energy'], result_df['prediction_loss'], marker='o', linestyle='-')
+    plt.xlabel('Energy')
+    plt.ylabel('Prediction Loss')
+    plt.title('Prediction Loss vs Energy')
+    plt.grid(True)
+    plt.show()
+    
+    # Create second plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['energy'], result_df['loss_per_energy'], marker='o', linestyle='-')
+    plt.xlabel('Energy')
+    plt.ylabel('Loss per Energy')
+    plt.title('Loss per Energy vs Energy')
+    plt.grid(True)
+    plt.show()
+    
+    return result_df
+
+
+def plot_prediction_losses(result_dfs):
+    """
+    Plot prediction loss vs energy from multiple result dataframes.
+    
+    Args:
+        result_dfs: List of dataframes with 'energy' and 'prediction_loss' columns
+    """
+
+    
+    plt.figure(figsize=(10, 6))
+    
+    # Check if we should add legend for in/out of distribution
+    add_legend = False
+    labels = [None] * len(result_dfs)
+    
+    if len(result_dfs) == 2:
+        df1, df2 = result_dfs[0], result_dfs[1]
+        min1, max1 = df1['energy'].min(), df1['energy'].max()
+        min2, max2 = df2['energy'].min(), df2['energy'].max()
+        
+        if min1 > max2:
+            # df1 has higher energies (out of distribution)
+            labels = ['Out of distribution', 'In distribution']
+            add_legend = True
+        elif min2 > max1:
+            # df2 has higher energies (out of distribution)
+            labels = ['In distribution', 'Out of distribution']
+            add_legend = True
+    
+    for i, df in enumerate(result_dfs):
+        sorted_df = df.sort_values('energy')
+        plt.plot(sorted_df['energy'], sorted_df['prediction_loss'], 
+                marker='o', linestyle='-', alpha=0.7, label=labels[i])
+    
+    plt.xlabel('Energy')
+    plt.ylabel('Prediction Loss')
+    plt.title('Prediction Loss vs Energy')
+    plt.grid(True)
+    
+    if add_legend:
+        plt.legend()
+    
+    plt.show()
