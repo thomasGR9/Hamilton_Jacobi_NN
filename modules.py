@@ -1324,139 +1324,181 @@ class SimpleStackedHamiltonianNetwork(nn.Module):
         return X, U, T
 
 
+
+class TrajectoryStats:
+    """
+    Precomputed trajectory statistics to eliminate redundant computations.
+    Maintains 100% exact behavior of original code.
+    """
+    def __init__(
+        self, 
+        X_final: torch.Tensor, 
+        U_final: torch.Tensor, 
+        trajectory_ids: torch.Tensor
+    ):
+        self.device = X_final.device
+        self.dtype = X_final.dtype
+        
+        # Core trajectory grouping (computed once)
+        self.unique_ids, self.inverse_indices = torch.unique(
+            trajectory_ids, return_inverse=True
+        )
+        self.n_trajectories = len(self.unique_ids)
+        
+        # Sums per trajectory (computed once) - EXACTLY as original
+        self.X_sums = torch.zeros(self.n_trajectories, device=self.device, dtype=self.dtype)
+        self.U_sums = torch.zeros(self.n_trajectories, device=self.device, dtype=self.dtype)
+        self.X_sums = self.X_sums.scatter_add_(0, self.inverse_indices, X_final)
+        self.U_sums = self.U_sums.scatter_add_(0, self.inverse_indices, U_final)
+        
+        # Store originals for reference
+        self.X_final = X_final
+        self.U_final = U_final
+        self.trajectory_ids = trajectory_ids
+        
+        # Precompute BOTH versions of counts to match original functions exactly
+        # Version 1: bincount converted to X_final.dtype (used by repulsion & hsic)
+        self.counts_typed = torch.bincount(
+            self.inverse_indices, 
+            minlength=self.n_trajectories
+        ).to(dtype=self.dtype, device=self.device)
+        
+        # Version 2: scatter_add with float (used by variance, prediction, etc.)
+        self.counts_float = torch.zeros(self.n_trajectories, device=self.device)
+        self.counts_float = self.counts_float.scatter_add_(
+            0, 
+            self.inverse_indices, 
+            torch.ones_like(self.inverse_indices, dtype=torch.float)
+        )
+        
+        # Means computed using typed counts (matches repulsion/hsic original behavior)
+        self.X_means = self.X_sums / self.counts_typed
+        self.U_means = self.U_sums / self.counts_typed
+
+
+
 class IntraTrajectoryVarianceLossEfficient(nn.Module):
-    """
-    Mean Variance loss with guaranteed gradient flow - exact functionality preserved
-    """
+    """Variance loss - uses precomputed stats"""
     
     def __init__(self):
-        super(IntraTrajectoryVarianceLossEfficient, self).__init__()
+        super().__init__()
             
     def forward(
         self, 
         X_final: torch.Tensor, 
         U_final: torch.Tensor, 
-        trajectory_ids: torch.Tensor
+        trajectory_ids: torch.Tensor,
+        stats = None
     ) -> torch.Tensor:
         """
-        Efficient computation using scatter operations with smooth gradient flow.
+        Args:
+            stats: Optional TrajectoryStats object to avoid recomputation
         """
-        # Get unique trajectories and their counts
-        unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
-        n_trajectories = len(unique_ids)
+        # Use precomputed stats if available
+        if stats is None:
+            unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
+            n_trajectories = len(unique_ids)
+            
+            # EXACTLY as original - uses float counts
+            counts = torch.zeros(n_trajectories, device=trajectory_ids.device)
+            counts = counts.scatter_add_(0, inverse_indices, 
+                                       torch.ones_like(inverse_indices, dtype=torch.float))
+            
+            X_sums = torch.zeros(n_trajectories, device=X_final.device, dtype=X_final.dtype)
+            U_sums = torch.zeros(n_trajectories, device=U_final.device, dtype=U_final.dtype)
+            X_sums = X_sums.scatter_add_(0, inverse_indices, X_final)
+            U_sums = U_sums.scatter_add_(0, inverse_indices, U_final)
+            
+            X_means = X_sums / counts
+            U_means = U_sums / counts
+            inverse = inverse_indices
+        else:
+            n_trajectories = stats.n_trajectories
+            # Use float counts for variance (matches original)
+            counts = stats.counts_float
+            X_means = stats.X_sums / counts
+            U_means = stats.U_sums / counts
+            inverse = stats.inverse_indices
         
-        # Count samples per trajectory
-        counts = torch.zeros(n_trajectories, device=trajectory_ids.device)
-        counts = counts.scatter_add(0, inverse_indices, 
-                                   torch.ones_like(inverse_indices, dtype=torch.float))
+        # Rest is IDENTICAL to original
+        X_centered = X_final - X_means[inverse]
+        U_centered = U_final - U_means[inverse]
         
-        # Compute means per trajectory using scatter
-        X_sums = torch.zeros(n_trajectories, device=X_final.device, dtype=X_final.dtype)
-        U_sums = torch.zeros(n_trajectories, device=U_final.device, dtype=U_final.dtype)
-        X_sums = X_sums.scatter_add(0, inverse_indices, X_final)
-        U_sums = U_sums.scatter_add(0, inverse_indices, U_final)
-        
-        X_means = X_sums / counts
-        U_means = U_sums / counts
-        
-        # Compute squared differences from means
-        X_centered = X_final - X_means[inverse_indices]
-        U_centered = U_final - U_means[inverse_indices]
-        
-        # Sum squared differences per trajectory
         X_sq_sums = torch.zeros(n_trajectories, device=X_final.device, dtype=X_final.dtype)
         U_sq_sums = torch.zeros(n_trajectories, device=U_final.device, dtype=U_final.dtype)
-        X_sq_sums = X_sq_sums.scatter_add(0, inverse_indices, X_centered ** 2)
-        U_sq_sums = U_sq_sums.scatter_add(0, inverse_indices, U_centered ** 2)
+        X_sq_sums = X_sq_sums.scatter_add_(0, inverse, X_centered ** 2)
+        U_sq_sums = U_sq_sums.scatter_add_(0, inverse, U_centered ** 2)
         
-        # Compute variances - GRADIENT SAFE VERSION
-        # Create mask as float (this allows gradient to flow, just with zero values)
         valid_mask_float = (counts > 1).float()
-        
-        # Use torch.maximum to prevent division by zero/negative
-        # This is differentiable and safe
         safe_denominator = torch.maximum(
             counts - 1, 
-            torch.ones_like(counts)  # Minimum value of 1
+            torch.ones_like(counts)
         )
         
-        # Compute variances for all trajectories
         X_variances_all = X_sq_sums / safe_denominator
         U_variances_all = U_sq_sums / safe_denominator
-        
-        # Apply mask through multiplication (preserves gradient flow)
-        # For count <= 1: mask = 0, so variance = 0
-        # For count > 1: mask = 1, so variance = computed value
         X_variances = X_variances_all * valid_mask_float
         U_variances = U_variances_all * valid_mask_float
         
-        # Weighted sum of variances
         total_variance = X_variances.sum() + U_variances.sum()
-        
-        # Mean variance
         total_mean_variance = total_variance / max(n_trajectories, 1)
         
         return total_mean_variance
     
 class AdaptiveSoftRepulsionLoss(nn.Module):
-    """
-    Adaptive soft repulsion loss (vectorized, gradient-safe).
-    
-    Args:
-        epsilon: Minimum temperature value (default: 1e-3)
-        k: Scaling factor for adaptive temperature (default: 1.0)
-    """
+    """Adaptive soft repulsion loss - uses precomputed stats"""
     def __init__(self, epsilon=1e-3, k=1.0):
         super().__init__()
         self.epsilon = epsilon
         self.k = k
         self.numerical_eps = 1e-8
 
-    def forward(self, X_final, U_final, trajectory_ids):
+    def forward(self, X_final, U_final, trajectory_ids, stats=None):
         """
-        X_final: shape (batch,)
-        U_final: shape (batch,)
-        trajectory_ids: shape (batch,) ints
+        Args:
+            stats: Optional TrajectoryStats object to avoid recomputation
         """
         device = X_final.device
         dtype = X_final.dtype
+        
+        # Use precomputed stats if available
+        if stats is None:
+            unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
+            N = unique_ids.shape[0]
+            
+            if N <= 1:
+                return X_final.sum() * 0.0
+            
+            # EXACTLY as original
+            sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
+            sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
+            counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
+            
+            X_means = sums_x / counts
+            U_means = sums_u / counts
+        else:
+            N = stats.n_trajectories
+            if N <= 1:
+                return X_final.sum() * 0.0
+            
+            X_means = stats.X_means
+            U_means = stats.U_means
 
-        # Unique trajectory ids and map each sample to its group index
-        unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
-        N = unique_ids.shape[0]
-
-        if N <= 1:
-            # zero scalar that preserves graph and device/dtype
-            return X_final.sum() * 0.0
-
-        # compute group sums via scatter_add on new tensors (single kernel)
-        sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
-        sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
-        counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
-
-        X_means = sums_x / counts
-        U_means = sums_u / counts
-
-        # compute pair indices for i < j (condensed)
-        idx = torch.triu_indices(N, N, offset=1, device=device)  # shape (2, M)
+        # Rest is IDENTICAL to original
+        idx = torch.triu_indices(N, N, offset=1, device=device)
         i, j = idx[0], idx[1]
 
         dx = X_means[i] - X_means[j]
         du = U_means[i] - U_means[j]
-        dij = torch.sqrt(dx * dx + du * du + self.numerical_eps)  # shape (M,)
+        dij = torch.sqrt(dx * dx + du * du + self.numerical_eps)
 
-        # compute detached temperature per center norm, then pairwise average
         c_norms = torch.sqrt(X_means * X_means + U_means * U_means + self.numerical_eps).detach()
         C_sum_pairs = 0.5 * (c_norms[i] + c_norms[j])
         eps_t = X_final.new_tensor(self.epsilon)
         Tij_pairs = torch.maximum(eps_t, self.k * C_sum_pairs).detach()
 
-        # exponential terms for i<j
         exp_vals = torch.exp(-dij / (Tij_pairs + self.numerical_eps))
-
-        # original code averaged over ordered pairs (i != j). To preserve that exactly
-        # we double the sum over i<j (counts each unordered pair twice).
-        sum_ordered = 2.0 * exp_vals.sum()  # equals sum over i!=j entries
+        sum_ordered = 2.0 * exp_vals.sum()
         Z = float(N * (N - 1))
         loss = sum_ordered / Z
 
@@ -1470,25 +1512,36 @@ def hsic_loss(
     sigma_U_means: float = -1.0,
     use_unbiased: bool = True,
     epsilon: float = 1e-10,
+    stats = None
 ) -> torch.Tensor:
-    """
-    HSIC loss with guaranteed gradient flow and improved efficiency.
-    """
+    """HSIC loss - uses precomputed stats"""
     device = X_final.device
     dtype = X_final.dtype
-    # Unique trajectory ids and map each sample to its group index
-    unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
-    N = unique_ids.shape[0]
-    if N <= 1:
-        # zero scalar that preserves graph and device/dtype
-        return X_final.sum() * 0.0
-    # compute group sums via scatter_add on new tensors (single kernel)
-    sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
-    sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
-    counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
-    X_means = sums_x / counts
-    U_means = sums_u / counts
+    
+    # Use precomputed stats if available
+    if stats is None:
+        unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
+        N = unique_ids.shape[0]
+        
+        if N <= 1:
+            return X_final.sum() * 0.0
+        
+        # EXACTLY as original
+        sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
+        sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
+        counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
+        
+        X_means = sums_x / counts
+        U_means = sums_u / counts
+    else:
+        N = stats.n_trajectories
+        if N <= 1:
+            return X_final.sum() * 0.0
+        
+        X_means = stats.X_means
+        U_means = stats.U_means
 
+    # Rest is IDENTICAL to original
     if X_means.shape != U_means.shape:
         raise ValueError(f"X_means and U_means must have the same shape. Got X_means: {X_means.shape}, U_means: {U_means.shape}")
     if X_means.dim() != 1:
@@ -1497,11 +1550,9 @@ def hsic_loss(
     batch_size = X_means.shape[0]
     min_batch = 4 if use_unbiased else 2
     
-    # FIX 1: Return zero loss with proper gradient connection instead of error
     if batch_size < min_batch:
-        # Create a zero tensor that maintains gradient flow
-        # Use X_means and U_means to ensure gradient connection
-        zero_loss = (X_means.sum() * 0.0 + U_means.sum() * 0.0)  # Gradient flows but equals 0
+        print("Number of trajectories lower than 4, so returning 0.0 at hsic loss")
+        zero_loss = (X_means.sum() * 0.0 + U_means.sum() * 0.0)
         return zero_loss
     
     X_means = X_means.view(-1, 1)
@@ -1511,37 +1562,27 @@ def hsic_loss(
     L = _compute_rbf_kernel(U_means, sigma_U_means, epsilon, use_unbiased, batch_size)
     
     if use_unbiased:
-        b = float(batch_size)  # Convert to float once for efficiency
-        
-        # Pre-compute for efficiency
+        b = float(batch_size)
         KL = K @ L
         K_sum = K.sum()
         L_sum = L.sum()
         KL_sum = KL.sum()
         KL_trace = KL.trace()
         
-        # Direct computation without intermediate variables (more efficient)
         hsic = (KL_trace + (K_sum * L_sum) / ((b - 1) * (b - 2)) - 
                 2.0 * KL_sum / (b - 2)) / (b * (b - 3))
     else:
         b = float(batch_size)
-        
-        # More efficient centering without repeated mean computations
         K_mean = K.mean()
         L_mean = L.mean()
         K_row_mean = K.mean(dim=1, keepdim=True)
         L_row_mean = L.mean(dim=1, keepdim=True)
         
-        # Direct computation of centered kernel product
         K_centered = K - K_row_mean - K_row_mean.t() + K_mean
         L_centered = L - L_row_mean - L_row_mean.t() + L_mean
         
         hsic = (K_centered * L_centered).sum() / (b * b)
     
-    # FIX 2: Replace clamp with torch.maximum (more explicit gradient behavior)
-    # Or use F.relu which is equivalent but clearer for non-negativity
-    # Actually, if computed correctly, HSIC should be non-negative
-    # But for numerical stability with float operations:
     zero = torch.tensor(0.0, device=hsic.device, dtype=hsic.dtype, requires_grad=False)
     hsic = torch.maximum(hsic, zero)
     
@@ -1904,74 +1945,53 @@ def prepare_prediction_inputs(
     U_final: torch.Tensor, 
     t_batch: torch.Tensor,
     trajectory_ids: torch.Tensor,
-    possible_t_values: List[float]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Prepare inputs for the prediction network with guaranteed gradient flow.
-    Functionality is EXACTLY identical to original.
+    possible_t_values: List[float],
+    stats = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare prediction inputs - uses precomputed stats"""
     
-    Args:
-        X_final: Final positions from mapping network, shape (batch_size,)
-        U_final: Final velocities from mapping network, shape (batch_size,)
-        t_batch: Time values from batch, shape (batch_size,)
-        trajectory_ids: Trajectory IDs for each sample, shape (batch_size,)
-        possible_t_values: List of all possible time values for any trajectory
-        
-    Returns:
-        X_final_mean: Each element replaced with its trajectory's mean X_final
-        U_final_mean: Each element replaced with its trajectory's mean U_final  
-        t_for_pred: New time values not in the original batch for each trajectory
-    """
     device = X_final.device
     batch_size = X_final.shape[0]
     
-    # Get unique trajectories
-    unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
-    n_trajectories = len(unique_ids)
+    # Use precomputed stats if available
+    if stats is None:
+        unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
+        n_trajectories = len(unique_ids)
+        
+        # EXACTLY as original - uses float counts
+        counts = torch.zeros(n_trajectories, device=device)
+        counts = counts.scatter_add_(
+            0, 
+            inverse_indices, 
+            torch.ones_like(inverse_indices, dtype=torch.float)
+        )
+        
+        X_sums = torch.zeros(n_trajectories, device=device, dtype=X_final.dtype)
+        U_sums = torch.zeros(n_trajectories, device=device, dtype=U_final.dtype)
+        X_sums = X_sums.scatter_add_(0, inverse_indices, X_final)
+        U_sums = U_sums.scatter_add_(0, inverse_indices, U_final)
+        
+        X_means = X_sums / counts
+        U_means = U_sums / counts
+    else:
+        unique_ids = stats.unique_ids
+        inverse_indices = stats.inverse_indices
+        # Use float counts (matches original)
+        X_means = stats.X_sums / stats.counts_float
+        U_means = stats.U_sums / stats.counts_float
     
-    # ===== Compute trajectory means (gradient-safe operations) =====
-    # Count samples per trajectory
-    counts = torch.zeros(n_trajectories, device=device)
-    counts = counts.scatter_add(
-        0, 
-        inverse_indices, 
-        torch.ones_like(inverse_indices, dtype=torch.float)
-    )
-    
-    # Sum X and U per trajectory (preserve input dtype)
-    X_sums = torch.zeros(n_trajectories, device=device, dtype=X_final.dtype)
-    U_sums = torch.zeros(n_trajectories, device=device, dtype=U_final.dtype)
-    X_sums = X_sums.scatter_add(0, inverse_indices, X_final)
-    U_sums = U_sums.scatter_add(0, inverse_indices, U_final)
-    
-    # Compute means - exactly as original
-    # Note: counts should never be 0 since each trajectory has at least one sample
-    # If worried about edge cases, can use: torch.clamp(counts, min=1e-8)
-    X_means = X_sums / counts
-    U_means = U_sums / counts
-    
-    # Broadcast means back to original shape
-    # This indexing operation maintains gradient flow
+    # Rest is IDENTICAL to original
     X_final_mean = X_means[inverse_indices]
     U_final_mean = U_means[inverse_indices]
     
-    # ===== Generate new time values =====
-    # Note: t_for_pred must remain part of computation graph for use in next network
-    # Even though gradients won't flow through it back to t_batch, it needs to be
-    # part of the graph for computing gradients w.r.t. the next network's parameters
     t_for_pred = torch.zeros_like(t_batch)
     possible_t_tensor = torch.tensor(possible_t_values, device=device, dtype=t_batch.dtype)
     
-    # Process each trajectory separately - exactly as original
     for traj_idx, traj_id in enumerate(unique_ids):
-        # Get mask for this trajectory
         mask = (trajectory_ids == traj_id)
         n_samples = mask.sum().item()
-        
-        # Get sampled times for this trajectory
         sampled_times = t_batch[mask]
         
-        # Find which times from possible_t_values are NOT in sampled_times
         is_sampled = torch.isclose(
             possible_t_tensor.unsqueeze(1),
             sampled_times.unsqueeze(0),
@@ -1981,24 +2001,18 @@ def prepare_prediction_inputs(
         available_times = possible_t_tensor[~is_sampled]
         
         if len(available_times) < n_samples:
-            # Not enough unsampled times - handle gracefully
             if len(available_times) > 0:
-                # Repeat available times to have enough samples
                 repeated_times = available_times.repeat((n_samples // len(available_times)) + 1)
                 selected_times = repeated_times[:n_samples]
-                # Shuffle to randomize
                 perm = torch.randperm(n_samples, device=device)
                 selected_times = selected_times[perm]
             else:
-                # No available times at all - use random times from possible_t_values
                 indices = torch.randint(0, len(possible_t_values), (n_samples,), device=device)
                 selected_times = possible_t_tensor[indices]
         else:
-            # Randomly select n_samples from available times without replacement
             perm = torch.randperm(len(available_times), device=device)[:n_samples]
             selected_times = available_times[perm]
         
-        # Assign to output
         t_for_pred[mask] = selected_times
 
     return X_final_mean, U_final_mean, t_for_pred
@@ -2115,47 +2129,45 @@ def trajectory_normalized_mse(
     X_labels: torch.Tensor,
     U_labels: torch.Tensor,
     trajectory_ids: torch.Tensor,
-    eps: float = 1e-8
+    eps: float = 1e-8,
+    stats = None
 ) -> torch.Tensor:
-    """
-    Compute prediction loss using trajectory-normalized MSE.
-    Each trajectory is weighted equally regardless of its amplitude/energy.
-    """
+    """Trajectory-normalized MSE - uses precomputed stats for grouping only"""
+    
     device = x_pred.device
     
-    # Get unique trajectories and inverse mapping
-    unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
-    n_trajectories = len(unique_ids)
+    # Use precomputed stats if available (only need grouping info)
+    if stats is None:
+        unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
+        n_trajectories = len(unique_ids)
+        
+        # EXACTLY as original - uses float counts
+        counts = torch.zeros(n_trajectories, device=device)
+        counts = counts.scatter_add_(
+            0, 
+            inverse_indices, 
+            torch.ones_like(inverse_indices, dtype=torch.float)
+        )
+    else:
+        inverse_indices = stats.inverse_indices
+        n_trajectories = stats.n_trajectories
+        counts = stats.counts_float
     
-    # ===== Compute per-trajectory RMS scales from ground truth labels =====
-    # Count samples per trajectory
-    counts = torch.zeros(n_trajectories, device=device)
-    counts = counts.scatter_add(
-        0, 
-        inverse_indices, 
-        torch.ones_like(inverse_indices, dtype=torch.float)
-    )
-    
-    # Sum of squared ground truth values per trajectory
+    # Rest is IDENTICAL to original
     X_sq_sums = torch.zeros(n_trajectories, device=device, dtype=X_labels.dtype)
     U_sq_sums = torch.zeros(n_trajectories, device=device, dtype=U_labels.dtype)
-    X_sq_sums = X_sq_sums.scatter_add(0, inverse_indices, X_labels**2)
-    U_sq_sums = U_sq_sums.scatter_add(0, inverse_indices, U_labels**2)
+    X_sq_sums = X_sq_sums.scatter_add_(0, inverse_indices, X_labels**2)
+    U_sq_sums = U_sq_sums.scatter_add_(0, inverse_indices, U_labels**2)
     
-    # CRITICAL FIX: Detach the scales to prevent gradient flow
-    # These are normalization constants, not learnable parameters
     scale_x_per_traj = (torch.sqrt(X_sq_sums / counts) + eps).detach()
     scale_u_per_traj = (torch.sqrt(U_sq_sums / counts) + eps).detach()
     
-    # Broadcast scales back to batch dimension
-    scale_x = scale_x_per_traj[inverse_indices]  # shape: (batch_size,)
-    scale_u = scale_u_per_traj[inverse_indices]  # shape: (batch_size,)
+    scale_x = scale_x_per_traj[inverse_indices]
+    scale_u = scale_u_per_traj[inverse_indices]
     
-    # ===== Compute normalized errors =====
     err_x_normalized = (x_pred - X_labels) / scale_x
     err_u_normalized = (u_pred - U_labels) / scale_u
     
-    # MSE of normalized errors
     loss = torch.mean(err_x_normalized**2 + err_u_normalized**2)
     
     return loss
@@ -2923,7 +2935,7 @@ def train_model(
             optimizer = AdamW([
                 {'params': mlp_params, 'weight_decay': weight_decay},
                 {'params': scale_params, 'weight_decay': 0.0},
-                {'params': transform_params, 'weight_decay': weight_decay},
+                {'params': transform_params, 'weight_decay': 0.0},
             ], lr=learning_rate)  
         else:
             raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")       
@@ -2957,10 +2969,13 @@ def train_model(
     # Define a function to run the forward pass
     def forward_pass(batch, hsic_loss_slope):
         X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
-        variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'])
+        stats = TrajectoryStats(X_final, U_final, batch['trajectory_ids'])
 
-        repulsion_loss_ = repulsion_loss_class(X_final, U_final, batch['trajectory_ids'])
-        hsic_loss_ = hsic_loss(X_final, U_final, batch['trajectory_ids'], sigma_X_means=-1, sigma_U_means=-1, use_unbiased=True)
+
+        variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'], stats=stats)
+
+        repulsion_loss_ = repulsion_loss_class(X_final, U_final, batch['trajectory_ids'], stats=stats)
+        hsic_loss_ = hsic_loss(X_final, U_final, batch['trajectory_ids'], sigma_X_means=-1, sigma_U_means=-1, use_unbiased=True, stats=stats)
 
 
         x_recon, u_recon, t_recon = inverse_net(X_final, U_final, t_final)
@@ -2974,7 +2989,8 @@ def train_model(
             X_final, U_final, 
             t_batch=batch['t'], 
             trajectory_ids=batch['trajectory_ids'], 
-            possible_t_values=possible_t_values)
+            possible_t_values=possible_t_values,
+            stats=stats)
 
         x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
 
@@ -2992,7 +3008,8 @@ def train_model(
                     u_pred=u_pred, 
                     X_labels=X_labels, 
                     U_labels=U_labels,
-                    trajectory_ids=batch['trajectory_ids']
+                    trajectory_ids=batch['trajectory_ids'],
+                    stats=stats
                 )           
         else:        
             prediction_loss_ = prediction_loss(
@@ -3138,7 +3155,7 @@ def train_model(
                 # Backward pass
                 total_loss_.backward()
                 
-
+                
                 for name, param in mapping_net.named_parameters():
                     if param.grad is not None:
                         # Replace NaN gradients with zeros
@@ -3150,18 +3167,19 @@ def train_model(
                             print(f"Inf gradients detected in {name}")
                             param.grad[torch.isinf(param.grad)] = 0.0
                         # Check for extreme gradients
-                        grad_norm_print = param.grad.norm().item()
-                        if grad_norm_print > 10.0:  # Threshold for reporting
-                            print(f"High gradient norm in {name}: {grad_norm_print}")
-                        if grad_norm_print < 0.00001:  
-                            print(f"Low gradient norm in {name}: {grad_norm_print}")
+                        if verbose>1:
+                            grad_norm_print = param.grad.norm().item()
+                            if grad_norm_print > 10.0:  # Threshold for reporting
+                                print(f"High gradient norm in {name}: {grad_norm_print}")
+                            if grad_norm_print < 0.00001:  
+                                print(f"Low gradient norm in {name}: {grad_norm_print}")
 
                 # Gradient clipping
                 if grad_clip_value is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(mlp_params+scale_params+transform_params, grad_clip_value)
                     if (grad_norm>grad_clip_value):
                         percentage_of_batches_clipped_in_epoch += 1.0
-                        if verbose>1:
+                        if verbose>0:
                             print(f"Grad clipping activated, grad_norm before clipping: {grad_norm}")
 
 
@@ -3181,10 +3199,10 @@ def train_model(
                 batch_count += 1
 
                 # Log progress
-                if verbose > 1 and batch_idx % log_freq_batches == 0:
-                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f}) - Prediction Loss: {prediction_loss_.item():.4f}\n")
+                if verbose > 0 and batch_idx % log_freq_batches == 0:
+                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f} - Prediction Loss: {prediction_loss_.item():.4f}")
                     if grad_clip_value is not None:
-                        print(f"Grad norm of batch: {grad_norm.item():.4f}")
+                        print(f"Grad norm of batch: {grad_norm.item():.4f}\n")
 
 
                         
@@ -3236,7 +3254,7 @@ def train_model(
                     val_variance_loss_ += variance_loss_
                     val_reconstruction_loss_ += reconstruction_loss_
                     val_prediction_loss_ += prediction_loss_
-                    if verbose > 1 and batch_idx % log_freq_batches == 0:
+                    if verbose > 0 and batch_idx % log_freq_batches == 0:
                         print(f"Batch {batch_idx}/{val_batches} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f}) - Prediction Loss: {prediction_loss_:.4f}")
                         
                     trajectory_data = {
@@ -3291,7 +3309,7 @@ def train_model(
                     val_variance_loss_high_energy += variance_loss_
                     val_reconstruction_loss_high_energy += reconstruction_loss_
                     val_prediction_loss_high_energy += prediction_loss_
-                    if verbose > 1 and batch_idx % log_freq_batches == 0:
+                    if verbose > 0 and batch_idx % log_freq_batches == 0:
                         print(f"Batch {batch_idx}/{val_batches_high_energy} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f}) - Prediction Loss: {prediction_loss_:.4f}")
                         
                     trajectory_data = {
@@ -3339,7 +3357,7 @@ def train_model(
                     val_variance_loss_training_set += variance_loss_
                     val_reconstruction_loss_training_set += reconstruction_loss_
                     val_prediction_loss_training_set += prediction_loss_
-                    if verbose > 1 and batch_idx % log_freq_batches == 0:
+                    if verbose > 0 and batch_idx % log_freq_batches == 0:
                         print(f"Batch {batch_idx}/{val_batches_training_set} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f} - Prediction Loss: {prediction_loss_:.4f}")
                     trajectory_data = {
                         'total_loss' : total_loss_,
