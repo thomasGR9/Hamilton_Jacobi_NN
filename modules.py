@@ -2108,6 +2108,58 @@ def prediction_loss(
     
     return total_loss
 
+
+def trajectory_normalized_mse(
+    x_pred: torch.Tensor,
+    u_pred: torch.Tensor,
+    X_labels: torch.Tensor,
+    U_labels: torch.Tensor,
+    trajectory_ids: torch.Tensor,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Compute prediction loss using trajectory-normalized MSE.
+    Each trajectory is weighted equally regardless of its amplitude/energy.
+    """
+    device = x_pred.device
+    
+    # Get unique trajectories and inverse mapping
+    unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
+    n_trajectories = len(unique_ids)
+    
+    # ===== Compute per-trajectory RMS scales from ground truth labels =====
+    # Count samples per trajectory
+    counts = torch.zeros(n_trajectories, device=device)
+    counts = counts.scatter_add(
+        0, 
+        inverse_indices, 
+        torch.ones_like(inverse_indices, dtype=torch.float)
+    )
+    
+    # Sum of squared ground truth values per trajectory
+    X_sq_sums = torch.zeros(n_trajectories, device=device, dtype=X_labels.dtype)
+    U_sq_sums = torch.zeros(n_trajectories, device=device, dtype=U_labels.dtype)
+    X_sq_sums = X_sq_sums.scatter_add(0, inverse_indices, X_labels**2)
+    U_sq_sums = U_sq_sums.scatter_add(0, inverse_indices, U_labels**2)
+    
+    # CRITICAL FIX: Detach the scales to prevent gradient flow
+    # These are normalization constants, not learnable parameters
+    scale_x_per_traj = (torch.sqrt(X_sq_sums / counts) + eps).detach()
+    scale_u_per_traj = (torch.sqrt(U_sq_sums / counts) + eps).detach()
+    
+    # Broadcast scales back to batch dimension
+    scale_x = scale_x_per_traj[inverse_indices]  # shape: (batch_size,)
+    scale_u = scale_u_per_traj[inverse_indices]  # shape: (batch_size,)
+    
+    # ===== Compute normalized errors =====
+    err_x_normalized = (x_pred - X_labels) / scale_x
+    err_u_normalized = (u_pred - U_labels) / scale_u
+    
+    # MSE of normalized errors
+    loss = torch.mean(err_x_normalized**2 + err_u_normalized**2)
+    
+    return loss
+
 def prediction_loss_euclidean(
     x_pred: torch.Tensor,
     u_pred: torch.Tensor,
@@ -2379,6 +2431,45 @@ def compute_single_trajectory_stats(X_final, U_final):
     # Return all as numpy values
     return total_variance,  X_mean.item(), U_mean.item(), X_var.item(), U_var.item(), X_std.item(), U_std.item()
 
+def single_trajectory_normalized_mse(
+    x_pred: torch.Tensor,
+    u_pred: torch.Tensor,
+    X_labels: torch.Tensor,
+    U_labels: torch.Tensor,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Compute normalized MSE for a single trajectory.
+    All inputs belong to the same trajectory - no grouping needed.
+    
+    Args:
+        x_pred: Predicted positions from single trajectory, shape (n_samples,)
+        u_pred: Predicted velocities from single trajectory, shape (n_samples,)
+        X_labels: Ground truth positions from single trajectory, shape (n_samples,)
+        U_labels: Ground truth velocities from single trajectory, shape (n_samples,)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        loss: Scalar normalized MSE loss
+    """
+    # Compute RMS scales directly (no grouping needed)
+    # RMS = sqrt(mean(values^2))
+    scale_x = torch.sqrt(torch.mean(X_labels**2)) + eps
+    scale_u = torch.sqrt(torch.mean(U_labels**2)) + eps
+    
+    # CRITICAL: Detach scales to prevent gradient flow
+    scale_x = scale_x.detach()
+    scale_u = scale_u.detach()
+    
+    # Compute normalized errors
+    err_x_normalized = (x_pred - X_labels) / scale_x
+    err_u_normalized = (u_pred - U_labels) / scale_u
+    
+    # MSE of normalized errors
+    loss = torch.mean(err_x_normalized**2 + err_u_normalized**2)
+    
+    return loss
+
 
 def generate_validation_labels_single_trajectory(
     val_df: pd.DataFrame,
@@ -2442,7 +2533,7 @@ def generate_validation_labels_single_trajectory(
     
     return X_val_labels, U_val_labels, t_val_labels
 
-def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
+def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
     mapping_net.to(device)
     mapping_net.eval()
 
@@ -2463,12 +2554,22 @@ def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, 
                 t_for_pred=t_for_pred, 
                 get_data_from_trajectory_id=get_data_from_trajectory_id
             )
-        prediction_loss_ = prediction_loss(
-                x_pred=x_pred, 
-                u_pred=u_pred, 
-                X_labels=X_labels, 
-                U_labels=U_labels
-            )
+        if normalized_mse:
+            prediction_loss_ = trajectory_normalized_mse(
+            x_pred=x_pred, 
+            u_pred=u_pred, 
+            X_labels=X_labels, 
+            U_labels=U_labels,
+            trajectory_ids=batch['trajectory_ids']
+            )           
+
+        else:
+            prediction_loss_ = prediction_loss(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels
+                )
 
         return variance_loss_.item(), prediction_loss_.item()
 
@@ -2540,6 +2641,7 @@ def train_model(
     #Loss calculation hyperparameters
     mapping_loss_scale,
     prediction_loss_scale,
+    normalized_mse,
     mapping_coefficient,
     repulsion_coefficient,
     prediction_coefficient,
@@ -2745,6 +2847,8 @@ def train_model(
             
                 run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
                 run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+                run_hyperparameters['normalized_mse'] = normalized_mse
+                
             
                 run_hyperparameters['mapping_coefficient'] = mapping_coefficient
                 run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
@@ -2882,12 +2986,21 @@ def train_model(
                 get_data_from_trajectory_id=get_data_from_trajectory_id
             )
 
-        prediction_loss_ = prediction_loss(
-                x_pred=x_pred, 
-                u_pred=u_pred, 
-                X_labels=X_labels, 
-                U_labels=U_labels
-            )
+        if normalized_mse:
+            prediction_loss_ = trajectory_normalized_mse(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels,
+                    trajectory_ids=batch['trajectory_ids']
+                )           
+        else:        
+            prediction_loss_ = prediction_loss(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels
+                )
 
         total_loss_ = compute_total_loss(
                 mapping_loss=variance_loss_, 
@@ -2932,12 +3045,22 @@ def train_model(
                 get_data_from_trajectory_id=get_data_from_trajectory_id
             )
 
-        prediction_loss_ = prediction_loss(
-                x_pred=x_pred, 
-                u_pred=u_pred, 
-                X_labels=X_val_labels, 
-                U_labels=U_val_labels
-            )
+
+        if normalized_mse:
+            prediction_loss_ = single_trajectory_normalized_mse(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_val_labels, 
+                    U_labels=U_val_labels,
+                )           
+        else:        
+            prediction_loss_ = prediction_loss(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_val_labels, 
+                    U_labels=U_val_labels
+                )
+
 
         repulsion_loss_= torch.zeros_like(variance_loss_)
         hsic_loss_= torch.zeros_like(variance_loss_)
@@ -3478,6 +3601,7 @@ def train_model(
 
         run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
         run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+        run_hyperparameters['normalized_mse'] = normalized_mse
 
         run_hyperparameters['mapping_coefficient'] = mapping_coefficient
         run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
@@ -3557,6 +3681,7 @@ def resume_training_from_checkpoint(
     # Loss calculation hyperparameters
     mapping_loss_scale,
     prediction_loss_scale,
+    normalized_mse,
     mapping_coefficient,
     repulsion_coefficient,
     prediction_coefficient,
@@ -3743,6 +3868,7 @@ def resume_training_from_checkpoint(
             # Loss calculation hyperparameters
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
+            normalized_mse=normalized_mse,
             mapping_coefficient=mapping_coefficient,
             repulsion_coefficient=repulsion_coefficient,
             prediction_coefficient=prediction_coefficient,
@@ -3814,6 +3940,7 @@ def resume_training_from_checkpoint(
             # Loss calculation hyperparameters
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
+            normalized_mse=normalized_mse,
             mapping_coefficient=mapping_coefficient,
             repulsion_coefficient=repulsion_coefficient,
             prediction_coefficient=prediction_coefficient,
@@ -5061,13 +5188,17 @@ def test_model_in_all_trajectories_in_df(
     result_df['prediction_loss'] = losses
     
     # Add loss per energy column
-    result_df['loss_per_energy'] = result_df['prediction_loss'] / result_df['energy']
+    result_df['loss_per_sqrt_energy'] = result_df['prediction_loss'] / np.sqrt(result_df['energy'])
     
     # Select only the required columns and sort by energy
-    result_df = result_df[['trajectory_id', 'energy', 'prediction_loss', 'loss_per_energy']].sort_values('energy')
+    result_df = result_df[['trajectory_id', 'energy', 'prediction_loss', 'loss_per_sqrt_energy']].sort_values('energy')
     
     # Print the dataframe
     print(result_df)
+
+    mean_prediction_loss = np.mean(result_df['prediction_loss'])
+
+    print(f"Mean prediction loss over full dataframe: {mean_prediction_loss:.4f}")
     
     # Create first plot
     plt.figure(figsize=(10, 6))
@@ -5080,14 +5211,14 @@ def test_model_in_all_trajectories_in_df(
     
     # Create second plot
     plt.figure(figsize=(10, 6))
-    plt.plot(result_df['energy'], result_df['loss_per_energy'], marker='o', linestyle='-')
+    plt.plot(result_df['energy'], result_df['loss_per_sqrt_energy'], marker='o', linestyle='-')
     plt.xlabel('Energy')
-    plt.ylabel('Loss per Energy')
-    plt.title('Loss per Energy vs Energy')
+    plt.ylabel('Loss per sqrt Energy')
+    plt.title('Loss per sqrt Energy vs Energy')
     plt.grid(True)
     plt.show()
     
-    return result_df
+    return result_df, mean_prediction_loss
 
 
 def plot_prediction_losses(result_dfs):
@@ -5133,3 +5264,243 @@ def plot_prediction_losses(result_dfs):
         plt.legend()
     
     plt.show()
+
+
+def test_model_with_varying_observed_points(
+    get_data_from_trajectory_id_function,
+    prediction_loss_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    inverse_net,
+    device
+):
+    """
+    Test model by gradually increasing the number of observed points and track mean loss.
+    Points are randomly sampled without replacement.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['num_observed_points', 'mean_loss'], sorted by num_observed_points
+    """
+
+    
+    # Get a sample trajectory to determine the number of available points
+    sample_trajectory_id = int(test_id_df.iloc[0]['trajectory_id'])
+    sample_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=sample_trajectory_id)
+    num_points_available = len(sample_data['x'])
+    
+    num_observed_points_list = []
+    mean_losses_list = []
+    
+    # Create a random permutation of all available indices
+    random_order = np.random.permutation(num_points_available)
+    
+    # Loop from 1 point to all points
+    for num_points in range(1, num_points_available + 1):
+        # Take the first num_points from the random permutation (sampling without replacement)
+        point_indexes_observed = random_order[:num_points].tolist()
+        
+        # Calculate losses for all trajectories with these observed points
+        losses = []
+        
+        for idx, row in test_id_df.iterrows():
+            trajectory_id = int(row['trajectory_id'])
+            
+            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+            
+            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+            X_final_mean = X_final.mean()
+            U_final_mean = U_final.mean()
+            X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+            U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+            x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+            pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+            losses.append(pred_loss_full_trajectory.item())
+        
+        # Calculate mean loss for this number of observed points
+        mean_losses_of_dataset = np.mean(losses)
+        
+        num_observed_points_list.append(num_points)
+        mean_losses_list.append(mean_losses_of_dataset)
+    
+    # Create dataframe
+    result_df = pd.DataFrame({
+        'num_observed_points': num_observed_points_list,
+        'mean_loss': mean_losses_list
+    }).sort_values('num_observed_points')
+    
+    # Create plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['num_observed_points'], result_df['mean_loss'], marker='o', linestyle='-')
+    plt.xlabel('Number of Observed Points')
+    plt.ylabel('Mean Loss over full df')
+    plt.title('Mean Loss over full df vs Number of Observed Points')
+    plt.grid(True)
+    plt.show()
+    
+    return result_df
+
+
+
+
+
+def compute_jacobian_functional(model, x, u, t):
+    """
+    Compute Jacobian using torch.autograd.functional.jacobian.
+    This can handle models with internal autograd operations better.
+    
+    Args:
+        model: Neural network that takes (x, u, t) and returns (X_final, U_final, t)
+        x: Input tensor of shape [batch_size]
+        u: Input tensor of shape [batch_size]
+        t: Input tensor of shape [batch_size]
+    
+    Returns:
+        jacobian: Tensor of shape [2, 2, batch_size]
+    """
+    from torch.autograd.functional import jacobian as torch_jacobian
+    
+    batch_size = x.shape[0]
+    jacobians = []
+    
+    for i in range(batch_size):
+        x_i = x[i:i+1]
+        u_i = u[i:i+1]
+        t_i = t[i:i+1]
+        
+        # Define a function that takes only x and u
+        def func(x_val, u_val):
+            X_final, U_final, _ = model(x_val, u_val, t_i)
+            return torch.stack([X_final, U_final])
+        
+        # Compute jacobian for this sample
+        jac = torch_jacobian(func, (x_i, u_i))
+        
+        # jac is a tuple: (grad_wrt_x, grad_wrt_u)
+        # Each element has shape [2, 1] (2 outputs, 1 input)
+        jac_x = jac[0].squeeze()  # [2]
+        jac_u = jac[1].squeeze()  # [2]
+        
+        # Stack to form [2, 2] matrix
+        jac_matrix = torch.stack([jac_x, jac_u], dim=1)  # [2, 2]
+        jacobians.append(jac_matrix)
+    
+    # Stack along batch dimension
+    jacobian = torch.stack(jacobians, dim=2)  # [2, 2, batch_size]
+    
+    return jacobian
+
+
+def compute_symplectic_product(jacobian):
+    """
+    Compute M^T * Ω * M for each 2x2 Jacobian matrix in the batch.
+    
+    Where Ω (omega) is the symplectic matrix:
+    Ω = [[0,  1],
+         [-1, 0]]
+    
+    Args:
+        jacobian: Tensor of shape [2, 2, batch_size]
+    
+    Returns:
+        result: Tensor of shape [2, 2, batch_size] where each 2x2 matrix
+                is M^T * Ω * M for the corresponding Jacobian M
+    """
+    batch_size = jacobian.shape[2]
+    device = jacobian.device
+    dtype = jacobian.dtype
+    
+    # Create the symplectic matrix Ω
+    Omega = torch.tensor([[0.0, 1.0],
+                          [-1.0, 0.0]], 
+                         device=device, 
+                         dtype=dtype)
+    
+    # Transpose jacobian to [batch_size, 2, 2] for batch operations
+    M = jacobian.permute(2, 0, 1)  # [batch_size, 2, 2]
+    
+    # Compute M^T
+    M_T = M.transpose(1, 2)  # [batch_size, 2, 2]
+    
+    # Expand Omega for batch multiplication: [1, 2, 2] -> [batch_size, 2, 2]
+    Omega_batch = Omega.unsqueeze(0).expand(batch_size, -1, -1)
+    
+    # Compute M^T * Ω * M
+    # First: Ω * M
+    Omega_M = torch.bmm(Omega_batch, M)  # [batch_size, 2, 2]
+    
+    # Second: M^T * (Ω * M)
+    result_batch = torch.bmm(M_T, Omega_M)  # [batch_size, 2, 2]
+    
+    # Transpose back to [2, 2, batch_size]
+    result = result_batch.permute(1, 2, 0)
+    
+    return result
+
+def check_canonical_transformation(symplectic_result, tolerance=1e-5):
+    """
+    Check if all transformations are canonical (i.e., M^T * Ω * M = Ω for all samples).
+    
+    A transformation is canonical if it preserves the symplectic structure,
+    meaning M^T * Ω * M = Ω.
+    
+    Args:
+        symplectic_result: Tensor of shape [2, 2, batch_size] from compute_symplectic_product
+        tolerance: Tolerance for floating point comparison (default: 1e-5)
+    """
+    batch_size = symplectic_result.shape[2]
+    device = symplectic_result.device
+    dtype = symplectic_result.dtype
+    
+    # Create the symplectic matrix Ω
+    Omega = torch.tensor([[0.0, 1.0],
+                          [-1.0, 0.0]], 
+                         device=device, 
+                         dtype=dtype)
+    
+    # Find which samples don't match
+    non_canonical_indices = []
+    max_error = 0.0
+    
+    for i in range(batch_size):
+        diff = torch.abs(symplectic_result[:, :, i] - Omega)
+        sample_max_error = diff.max().item()
+        max_error = max(max_error, sample_max_error)
+        
+        if sample_max_error > tolerance:
+            non_canonical_indices.append(i)
+    
+    if len(non_canonical_indices) == 0:
+        print(f"✓ All {batch_size} transformations are canonical (preserve symplectic structure)!")
+        print(f"  Maximum error across all samples: {max_error:.2e}")
+    else:
+        print(f"Samples {non_canonical_indices} failed the canonical test")
+        print(f"  Maximum error across all samples: {max_error:.2e}")
+
+
+def test_canonical_tranformation_on_trajectory(get_data_from_trajectory_id_function, compute_jacobian_functional_function, compute_symplectic_product_function, check_canonical_transformation_function, tolerance, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device):
+    test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+    jacobian = compute_jacobian_functional_function(mapping_net, x=x, u=u, t=t)
+    result= compute_symplectic_product_function(jacobian)
+
+    print("For the mapping network:")
+    check_canonical_transformation_function(result, tolerance=tolerance)
+
+    X_final, U_final, t_final = mapping_net(x, u, t)
+    X_final_mean = X_final.mean()
+    U_final_mean = U_final.mean()
+    X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+    U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+
+
+    inverse_jacobian = compute_jacobian_functional_function(inverse_net, x=X_final_full_shape, u=U_final_full_shape, t=t_final)
+    inverse_result= compute_symplectic_product_function(inverse_jacobian)
+    print("For the inverse network:")
+    check_canonical_transformation_function(inverse_result, tolerance=tolerance)
