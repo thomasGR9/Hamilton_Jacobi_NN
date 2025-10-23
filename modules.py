@@ -2093,34 +2093,40 @@ def generate_prediction_labels(
     return X_labels, U_labels, t_labels
 
 
+
+
 def prediction_loss(
     x_pred: torch.Tensor,
     u_pred: torch.Tensor,
     X_labels: torch.Tensor,
     U_labels: torch.Tensor,
-
+    loss_type: str = "mae"
 ) -> torch.Tensor:
     """
-    Compute prediction loss using Mean Square Error.
+    Compute prediction loss using either Mean Absolute Error (MAE) or Mean Squared Error (MSE).
     
     Args:
         x_pred: Predicted positions from inverse network, shape (batch_size,)
         u_pred: Predicted velocities from inverse network, shape (batch_size,)
-        X_labels: Ground truth positions at t_for_pred times, shape (batch_size,)
-        U_labels: Ground truth velocities at t_for_pred times, shape (batch_size,)
-
+        X_labels: Ground truth positions, shape (batch_size,)
+        U_labels: Ground truth velocities, shape (batch_size,)
+        loss_type: Type of loss to use, either 'mae' or 'mse'. Default is 'mae'.
         
     Returns:
-        loss: Scalar MSE loss
+        loss: Scalar MAE or MSE loss
     """
-    # Mean Square Error for each component
-    x_mse = torch.mean((x_pred - X_labels) ** 2)
-    u_mse = torch.mean((u_pred - U_labels) ** 2)
-    
-    # Combination
-    total_loss =  x_mse + u_mse
-    
+    if loss_type.lower() == "mae":
+        x_loss = torch.mean(torch.abs(x_pred - X_labels))
+        u_loss = torch.mean(torch.abs(u_pred - U_labels))
+    elif loss_type.lower() == "mse":
+        x_loss = torch.mean((x_pred - X_labels) ** 2)
+        u_loss = torch.mean((u_pred - U_labels) ** 2)
+    else:
+        raise ValueError(f"Invalid loss_type '{loss_type}'. Choose either 'mae' or 'mse'.")
+
+    total_loss = x_loss + u_loss
     return total_loss
+
 
 
 def trajectory_normalized_mse(
@@ -2193,7 +2199,7 @@ def prediction_loss_euclidean(
     euclidean_distances = torch.sqrt((x_pred - X_labels) ** 2 + (u_pred - U_labels) ** 2)
     return torch.mean(euclidean_distances)
 
-def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_loss, prediction_loss,
+def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_loss, prediction_loss, 
                       mapping_coefficient, repulsion_coefficient, prediction_coefficient,
                       mapping_loss_scale, prediction_loss_scale, hsic_loss_slope,
                       reconstruction_threshold, reconstruction_loss_multiplier):
@@ -2226,9 +2232,9 @@ def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_l
     hsic_loss_scaled = hsic_loss * hsic_loss_slope
     
     # ===== GRADIENT-SAFE SAFETY SWITCH =====
-    # Two options provided - choose based on your needs
+
     
-    # OPTION 1: Very sharp transition (almost like original but differentiable)
+    # Very sharp transition 
     # This creates an almost step-like function
     sharpness = 100.0  # Higher = sharper transition (closer to original if/else)
     
@@ -2545,7 +2551,7 @@ def generate_validation_labels_single_trajectory(
     
     return X_val_labels, U_val_labels, t_val_labels
 
-def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
+def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
     mapping_net.to(device)
     mapping_net.eval()
 
@@ -2580,7 +2586,8 @@ def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, 
                     x_pred=x_pred, 
                     u_pred=u_pred, 
                     X_labels=X_labels, 
-                    U_labels=U_labels
+                    U_labels=U_labels,
+                    loss_type=loss_type
                 )
 
         return variance_loss_.item(), prediction_loss_.item()
@@ -2653,6 +2660,7 @@ def train_model(
     #Loss calculation hyperparameters
     mapping_loss_scale,
     prediction_loss_scale,
+    loss_type,
     normalized_mse,
     mapping_coefficient,
     repulsion_coefficient,
@@ -2859,6 +2867,7 @@ def train_model(
             
                 run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
                 run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+                run_hyperparameters['loss_type'] = loss_type
                 run_hyperparameters['normalized_mse'] = normalized_mse
                 
             
@@ -3016,7 +3025,8 @@ def train_model(
                     x_pred=x_pred, 
                     u_pred=u_pred, 
                     X_labels=X_labels, 
-                    U_labels=U_labels
+                    U_labels=U_labels,
+                    loss_type=loss_type
                 )
 
         total_loss_ = compute_total_loss(
@@ -3075,7 +3085,8 @@ def train_model(
                     x_pred=x_pred, 
                     u_pred=u_pred, 
                     X_labels=X_val_labels, 
-                    U_labels=U_val_labels
+                    U_labels=U_val_labels,
+                    loss_type=loss_type
                 )
 
 
@@ -3097,6 +3108,8 @@ def train_model(
                 reconstruction_loss_multiplier=reconstruction_loss_multiplier
             )
         return total_loss_.item(), variance_loss_.item(), reconstruction_loss_.item(), prediction_loss_.item(), X_mean, U_mean, X_var, U_var, X_std, U_std
+    
+    hsic_loss_max_calculated_cache = {}
     # Training loop
     start_epoch=0
     if continue_from_epoch is not None:
@@ -3138,8 +3151,13 @@ def train_model(
                 
 
                 number_of_trajectories_in_batch =  torch.unique(batch['trajectory_ids']).shape[0]
-                linear_tensor = torch.arange(1, number_of_trajectories_in_batch+1, requires_grad=False)
-                hsic_loss_max_calculated = hsic_loss_statistics_only(x=torch.Tensor(linear_tensor), y=torch.Tensor(linear_tensor), sigma_x = -1, sigma_y = -1, use_unbiased = True, epsilon = 1e-10).item()
+                if number_of_trajectories_in_batch not in hsic_loss_max_calculated_cache:
+                    linear_tensor = torch.arange(1, number_of_trajectories_in_batch+1, requires_grad=False)
+                    hsic_loss_max_calculated = hsic_loss_statistics_only(x=torch.Tensor(linear_tensor), y=torch.Tensor(linear_tensor), sigma_x = -1, sigma_y = -1, use_unbiased = True, epsilon = 1e-10).item()
+                    hsic_loss_max_calculated_cache[number_of_trajectories_in_batch] = hsic_loss_max_calculated
+                else:
+                    hsic_loss_max_calculated = hsic_loss_max_calculated_cache[number_of_trajectories_in_batch]
+                
                 hsic_loss_slope = hsic_loss_max_want / hsic_loss_max_calculated
 
 
@@ -3620,6 +3638,7 @@ def train_model(
         run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
         run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
         run_hyperparameters['normalized_mse'] = normalized_mse
+        run_hyperparameters['loss_type'] = loss_type
 
         run_hyperparameters['mapping_coefficient'] = mapping_coefficient
         run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
@@ -3699,6 +3718,7 @@ def resume_training_from_checkpoint(
     # Loss calculation hyperparameters
     mapping_loss_scale,
     prediction_loss_scale,
+    loss_type,
     normalized_mse,
     mapping_coefficient,
     repulsion_coefficient,
@@ -3886,6 +3906,7 @@ def resume_training_from_checkpoint(
             # Loss calculation hyperparameters
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
+            loss_type=loss_type,
             normalized_mse=normalized_mse,
             mapping_coefficient=mapping_coefficient,
             repulsion_coefficient=repulsion_coefficient,
@@ -3958,6 +3979,7 @@ def resume_training_from_checkpoint(
             # Loss calculation hyperparameters
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
+            loss_type=loss_type,
             normalized_mse=normalized_mse,
             mapping_coefficient=mapping_coefficient,
             repulsion_coefficient=repulsion_coefficient,
@@ -4549,7 +4571,7 @@ def visualize_trajectory_movements_with_std_ellipses(
 
 
 
-def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=False, verbose=False):
+def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=False, verbose=False, specific_epochs=None):
     """
     Visualizes selected metrics from epoch directories.
 
@@ -4558,6 +4580,10 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
         metrics_to_plot (list of str): List of metric names to visualize.
         plot_on_same_graph (bool): If True, group related metrics (train/val variants) on the same plot.
         verbose (bool): If True, prints summary statistics for each metric.
+        specific_epochs (list or None): List with 2n values specifying epoch ranges to plot. 
+                                        E.g., [2, 10] plots epochs 2-10, [2, 10, 15, 20] plots 2-10 and 15-20.
+                                        Last item can be "last" to plot until the last epoch.
+                                        If None, plots all epochs.
     """
 
     # --- Collect all epoch directories ---
@@ -4602,6 +4628,36 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
                 f"with the value: {min_val:.6f}, "
                 f"the losses of the last 5 epochs are: {last_5}"
             )
+
+    # --- Filter epochs for plotting if specific_epochs is provided ---
+    if specific_epochs is not None:
+        # Create a mask for which epochs to include
+        plot_mask = [False] * len(epochs)
+        
+        # Process pairs of ranges
+        for i in range(0, len(specific_epochs), 2):
+            start = specific_epochs[i]
+            end = specific_epochs[i + 1]
+            
+            # Handle "last" keyword
+            if end == "last":
+                end = epochs[-1]
+            
+            # Mark epochs that fall within this range
+            for idx, epoch in enumerate(epochs):
+                if start <= epoch <= end:
+                    plot_mask[idx] = True
+        
+        # Filter epochs and metrics_data
+        epochs_to_plot = [e for e, mask in zip(epochs, plot_mask) if mask]
+        metrics_to_plot_data = {
+            metric: [v for v, mask in zip(values, plot_mask) if mask]
+            for metric, values in metrics_data.items()
+        }
+    else:
+        # Use all data
+        epochs_to_plot = epochs
+        metrics_to_plot_data = metrics_data
 
     # --- Color scheme for each data source ---
     data_colors = {
@@ -4652,8 +4708,8 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
             plt.figure(figsize=(8, 5))
             for prefix, metric in variants.items():
                 plt.plot(
-                    epochs,
-                    metrics_data[metric],
+                    epochs_to_plot,
+                    metrics_to_plot_data[metric],
                     marker='o',
                     label=metric,
                     color=data_colors.get(prefix, None)
@@ -4671,8 +4727,8 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
             prefix, _ = split_metric_name(metric)
             plt.figure(figsize=(8, 5))
             plt.plot(
-                epochs,
-                metrics_data[metric],
+                epochs_to_plot,
+                metrics_to_plot_data[metric],
                 marker='o',
                 label=metric,
                 color=data_colors.get(prefix, None)
@@ -4685,7 +4741,7 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
             plt.tight_layout()
             plt.show()
 
-    print("\n✅ Visualization complete.")
+
 
 
 
@@ -5238,6 +5294,94 @@ def test_model_in_all_trajectories_in_df(
     
     return result_df, mean_prediction_loss
 
+def test_model_variance_in_all_trajectories_in_df(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    device,
+    point_indexes_observed
+):
+    """
+    Test model on all trajectories in test_id_df and return dataframe with prediction losses.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['trajectory_id', 'energy', 'prediction_loss', 'loss_per_energy'], sorted by energy
+    """
+
+    
+    # Create a copy to avoid modifying the original
+    result_df = test_id_df.copy()
+    
+    # Initialize list to store losses
+    variances = []
+    
+    # Loop through each trajectory
+    for idx, row in test_id_df.iterrows():
+        trajectory_id = int(row['trajectory_id'])
+        
+        test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+        if point_indexes_observed:
+            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+        else:
+            X_final, U_final, t_final = mapping_net(x, u, t)
+        
+        if len(X_final) > 1:
+            X_var = X_final.var(unbiased=True)
+            U_var = U_final.var(unbiased=True)
+        else:
+            X_var = torch.tensor(0.0, device=X_final.device)
+            U_var = torch.tensor(0.0, device=U_final.device)
+        
+        total_variance = X_var + U_var
+
+        variances.append(total_variance.item())
+
+    
+    # Add the variances as a new column
+    result_df['variance_loss'] = variances
+    
+    # Add loss per energy column
+    result_df['variance_per_sqrt_energy'] = result_df['variance_loss'] / np.sqrt(result_df['energy'])
+    
+    # Select only the required columns and sort by energy
+    result_df = result_df[['trajectory_id', 'energy', 'variance_loss', 'variance_per_sqrt_energy']].sort_values('energy')
+    
+    # Print the dataframe
+    print(result_df)
+
+    mean_variance_loss = np.mean(result_df['variance_loss'])
+
+    print(f"Mean prediction loss over full dataframe: {mean_variance_loss:.4f}")
+    
+    # Create first plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['energy'], result_df['variance_loss'], marker='o', linestyle='-')
+    plt.xlabel('Energy')
+    plt.ylabel('Variance Loss')
+    plt.title('Variance Loss vs Energy')
+    plt.grid(True)
+    plt.show()
+    
+    # Create second plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['energy'], result_df['variance_per_sqrt_energy'], marker='o', linestyle='-')
+    plt.xlabel('Energy')
+    plt.ylabel('Loss per sqrt Energy')
+    plt.title('Variance per sqrt Energy vs Energy')
+    plt.grid(True)
+    plt.show()
+    
+    return result_df, mean_variance_loss
+
+
+
+    
+
 
 def plot_prediction_losses(result_dfs):
     """
@@ -5276,6 +5420,51 @@ def plot_prediction_losses(result_dfs):
     plt.xlabel('Energy')
     plt.ylabel('Prediction Loss')
     plt.title('Prediction Loss vs Energy')
+    plt.grid(True)
+    
+    if add_legend:
+        plt.legend()
+    
+    plt.show()
+
+
+def plot_variance_losses(result_dfs):
+    """
+    Plot Variance loss vs energy from multiple result dataframes.
+    
+    Args:
+        result_dfs: List of dataframes with 'energy' and 'Variance_loss' columns
+    """
+
+    
+    plt.figure(figsize=(10, 6))
+    
+    # Check if we should add legend for in/out of distribution
+    add_legend = False
+    labels = [None] * len(result_dfs)
+    
+    if len(result_dfs) == 2:
+        df1, df2 = result_dfs[0], result_dfs[1]
+        min1, max1 = df1['energy'].min(), df1['energy'].max()
+        min2, max2 = df2['energy'].min(), df2['energy'].max()
+        
+        if min1 > max2:
+            # df1 has higher energies (out of distribution)
+            labels = ['Out of distribution', 'In distribution']
+            add_legend = True
+        elif min2 > max1:
+            # df2 has higher energies (out of distribution)
+            labels = ['In distribution', 'Out of distribution']
+            add_legend = True
+    
+    for i, df in enumerate(result_dfs):
+        sorted_df = df.sort_values('energy')
+        plt.plot(sorted_df['energy'], sorted_df['variance_loss'], 
+                marker='o', linestyle='-', alpha=0.7, label=labels[i])
+    
+    plt.xlabel('Energy')
+    plt.ylabel('Variance Loss')
+    plt.title('Variance Loss vs Energy')
     plt.grid(True)
     
     if add_legend:
@@ -5349,6 +5538,8 @@ def test_model_with_varying_observed_points(
         'num_observed_points': num_observed_points_list,
         'mean_loss': mean_losses_list
     }).sort_values('num_observed_points')
+
+    print(result_df.head(10))
     
     # Create plot
     plt.figure(figsize=(10, 6))
@@ -5356,6 +5547,89 @@ def test_model_with_varying_observed_points(
     plt.xlabel('Number of Observed Points')
     plt.ylabel('Mean Loss over full df')
     plt.title('Mean Loss over full df vs Number of Observed Points')
+    plt.grid(True)
+    plt.show()
+    
+    return result_df
+
+
+
+
+def test_model_variance_with_varying_observed_points(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    device
+):
+    """
+    Test model by gradually increasing the number of observed points and track mean loss.
+    Points are randomly sampled without replacement.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['num_observed_points', 'mean_loss'], sorted by num_observed_points
+    """
+
+    
+    # Get a sample trajectory to determine the number of available points
+    sample_trajectory_id = int(test_id_df.iloc[0]['trajectory_id'])
+    sample_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=sample_trajectory_id)
+    num_points_available = len(sample_data['x'])
+    
+    num_observed_points_list = []
+    mean_variances_list = []
+    
+    # Create a random permutation of all available indices
+    random_order = np.random.permutation(num_points_available)
+    
+    # Loop from 1 point to all points
+    for num_points in range(1, num_points_available + 1):
+        # Take the first num_points from the random permutation (sampling without replacement)
+        point_indexes_observed = random_order[:num_points].tolist()
+        
+        # Calculate losses for all trajectories with these observed points
+        variances = []
+        
+        for idx, row in test_id_df.iterrows():
+            trajectory_id = int(row['trajectory_id'])
+            
+            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+            
+            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+            if len(X_final) > 1:
+                X_var = X_final.var(unbiased=True)
+                U_var = U_final.var(unbiased=True)
+            else:
+                X_var = torch.tensor(0.0, device=X_final.device)
+                U_var = torch.tensor(0.0, device=U_final.device)
+
+            total_variance = X_var + U_var
+
+            variances.append(total_variance.item())
+        
+        # Calculate mean loss for this number of observed points
+        mean_variances_of_dataset = np.mean(variances)
+        
+        num_observed_points_list.append(num_points)
+        mean_variances_list.append(mean_variances_of_dataset)
+    
+    # Create dataframe
+    result_df = pd.DataFrame({
+        'num_observed_points': num_observed_points_list,
+        'mean_variance': mean_variances_list
+    }).sort_values('num_observed_points')
+
+    print(result_df.head(10))
+    
+    # Create plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['num_observed_points'], result_df['mean_variance'], marker='o', linestyle='-')
+    plt.xlabel('Number of Observed Points')
+    plt.ylabel('Mean Variance over full df')
+    plt.title('Mean Variance over full df vs Number of Observed Points')
     plt.grid(True)
     plt.show()
     
