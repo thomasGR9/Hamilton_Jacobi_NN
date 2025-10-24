@@ -352,6 +352,35 @@ def create_simple_dataloader(train_df, train_id_df, ratio, batch_size, segment_l
     return dataloader
 
 
+
+def add_gaussian_noise(df: pd.DataFrame, variance: float) -> pd.DataFrame:
+    """
+    Adds Gaussian noise to the 'x' and 'u' columns of a DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe containing columns ['x', 'u', 't'].
+    variance : float
+        Variance of the Gaussian noise to be added (σ²).
+
+    Returns
+    -------
+    pd.DataFrame
+        New dataframe with noisy 'x' and 'u' columns.
+    """
+    # Compute standard deviation from variance
+    sigma = np.sqrt(variance)
+
+    # Copy to avoid modifying original data
+    noisy_df = df.copy()
+
+    # Add independent Gaussian noise to x and u
+    noisy_df['x'] = noisy_df['x'] + np.random.normal(0, sigma, size=len(df))
+    noisy_df['u'] = noisy_df['u'] + np.random.normal(0, sigma, size=len(df))
+
+    return noisy_df
+
 class Step_1(nn.Module):
     """
     A fully customizable layer that transforms position and velocity:
@@ -4234,8 +4263,170 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
     plt.tight_layout()
     plt.show()
 
+def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id, 
+                                     point_indexes_observed=None, show_zeroings=False,
+                                     show_period=False, period=None,
+                                     figsize=(12, 6)):
+    """
+    Plot the Euclidean distance between predicted and ground truth values over time.
+    
+    Args:
+        x: Ground truth positions, shape (n_points,)
+        u: Ground truth velocities, shape (n_points,)
+        x_pred: Predicted positions, shape (n_points,)
+        u_pred: Predicted velocities, shape (n_points,)
+        t: Time values (sorted), shape (n_points,)
+        trajectory_id: ID of the trajectory being plotted
+        point_indexes_observed: Optional indices of observed points to highlight
+        show_zeroings: If True, show vertical lines where x or u cross zero
+        show_period: If True, show vertical lines at periodic intervals
+        period: Period value for periodic markers (required if show_period=True)
+        figsize: Figure size tuple
+    """
 
-def test_model_in_single_trajectory(get_data_from_trajectory_id_function, prediction_loss_function, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device, point_indexes_observed, connect_points, portion_to_visualize=None):
+    
+    # Validate period argument
+    if show_period and period is None:
+        raise ValueError("period must be provided when show_period=True")
+    
+    # Compute Euclidean distance at each time point
+    euclidean_distances = torch.sqrt((x_pred - x) ** 2 + (u_pred - u) ** 2)
+    
+    # Convert to numpy for plotting
+    t_np = t.cpu().numpy()
+    distances_np = euclidean_distances.cpu().detach().numpy()
+    x_np = x.cpu().numpy()
+    u_np = u.cpu().numpy()
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(t_np, distances_np, linewidth=2, color='blue', label='Euclidean Distance')
+    
+    # Add a bit of padding to x-axis (5% on each side)
+    t_range = t_np.max() - t_np.min()
+    padding = t_range * 0.05
+    ax.set_xlim(t_np.min() - padding, t_np.max() + padding)
+    
+    # Show period markers if requested
+    if show_period and period is not None:
+        # Find the starting point (first multiple of period >= t_min)
+        t_min = t_np.min()
+        t_max = t_np.max()
+        
+        # Start from the first multiple of period that is >= t_min
+        start_multiple = int(np.ceil(t_min / period))
+        end_multiple = int(np.floor(t_max / period))
+        
+        # Generate all period markers
+        period_times = [i * period for i in range(start_multiple, end_multiple + 1)]
+        
+        # Plot period markers (skip t=0)
+        period_plotted = False
+        for period_time in period_times:
+            if t_min <= period_time <= t_max and abs(period_time) > 1e-9:  # Skip t=0
+                label = f'Period ({period})' if not period_plotted else None
+                ax.axvline(x=period_time, color='cyan', linestyle='-', linewidth=1.5, 
+                          alpha=0.6, label=label)
+                period_plotted = True
+    
+    # Show zero crossings if requested
+    if show_zeroings:
+        # Detect x zero crossings
+        x_crossings = []
+        for i in range(len(x_np) - 1):
+            # Check for sign change
+            if x_np[i] * x_np[i + 1] < 0:  # Different signs means zero crossing
+                # Find which point is closest to zero
+                if abs(x_np[i]) < abs(x_np[i + 1]):
+                    x_crossings.append(i)
+                else:
+                    x_crossings.append(i + 1)
+            # Also check if exactly zero
+            elif x_np[i] == 0 and (i == 0 or x_np[i-1] * x_np[i+1] <= 0):
+                x_crossings.append(i)
+        
+        # Detect u zero crossings
+        u_crossings = []
+        for i in range(len(u_np) - 1):
+            # Check for sign change
+            if u_np[i] * u_np[i + 1] < 0:  # Different signs means zero crossing
+                # Find which point is closest to zero
+                if abs(u_np[i]) < abs(u_np[i + 1]):
+                    u_crossings.append(i)
+                else:
+                    u_crossings.append(i + 1)
+            # Also check if exactly zero
+            elif u_np[i] == 0 and (i == 0 or u_np[i-1] * u_np[i+1] <= 0):
+                u_crossings.append(i)
+        
+        # Plot x zero crossings
+        x_crossing_plotted = False
+        for idx in x_crossings:
+            label = 'x ≈ 0' if not x_crossing_plotted else None
+            ax.axvline(x=t_np[idx], color='purple', linestyle=':', linewidth=1.5, 
+                      alpha=0.5, label=label)
+            x_crossing_plotted = True
+        
+        # Plot u zero crossings
+        u_crossing_plotted = False
+        for idx in u_crossings:
+            label = 'u ≈ 0' if not u_crossing_plotted else None
+            ax.axvline(x=t_np[idx], color='magenta', linestyle=':', linewidth=1.5, 
+                      alpha=0.6, label=label)
+            u_crossing_plotted = True
+    
+    # Highlight observed points if provided
+    if point_indexes_observed is not None:
+        t_observed = t[point_indexes_observed].cpu().numpy()
+        distances_observed = euclidean_distances[point_indexes_observed].cpu().detach().numpy()
+        ax.scatter(t_observed, distances_observed, color='red', s=100, zorder=5, 
+                   label='Observed Points', marker='o', edgecolors='black', linewidth=1.5)
+        
+        # Get current ticks and add observed times
+        current_xticks = list(ax.get_xticks())
+        # Add observed times to ticks
+        for t_obs in t_observed:
+            current_xticks.append(t_obs)
+        # Sort and remove duplicates
+        current_xticks = sorted(set(current_xticks))
+        # Only keep ticks within the padded data range
+        current_xticks = [tick for tick in current_xticks 
+                         if (t_np.min() - padding) <= tick <= (t_np.max() + padding)]
+        
+        ax.set_xticks(current_xticks)
+        
+        # Force matplotlib to draw and update labels
+        fig.canvas.draw()
+        
+        # Color the observed time labels in red
+        labels = ax.get_xticklabels()
+        for label in labels:
+            try:
+                # Get the actual position of the tick, not the text
+                tick_value = label.get_position()[0]
+                # Check if this tick is close to any observed time
+                if np.any(np.abs(tick_value - t_observed) < 1e-6):
+                    label.set_color('red')
+                    label.set_fontweight('bold')
+            except (ValueError, AttributeError, IndexError):
+                pass
+    
+    ax.set_xlabel('Time (t)', fontsize=12)
+    ax.set_ylabel('Euclidean Distance in Phase Space', fontsize=12)
+    ax.set_title(f'Prediction Error Over Time - Trajectory {trajectory_id}', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    # Add mean distance as a horizontal line
+    mean_distance = distances_np.mean()
+    ax.axhline(y=mean_distance, color='green', linestyle='--', linewidth=1.5, 
+               label=f'Mean Distance: {mean_distance:.4f}')
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+def test_model_in_single_trajectory(get_data_from_trajectory_id_function, prediction_loss_function, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device, point_indexes_observed, show_zeroings, show_period=False, period=None, connect_points=False, portion_to_visualize=None):
     test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
     x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
     u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
@@ -4250,7 +4441,7 @@ def test_model_in_single_trajectory(get_data_from_trajectory_id_function, predic
         x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
         pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
         plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points, portion_to_visualize=portion_to_visualize)
-
+        plot_euclidean_distance_over_time(x=x, u=u, x_pred=x_pred, u_pred=u_pred, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, show_zeroings=show_zeroings, show_period=show_period, period=period)
 
 
 def analyze_means_with_constants(
@@ -4625,8 +4816,8 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
             last_5 = values[-5:] if len(values) >= 5 else values
             print(
                 f"  Lowest loss of metric '{metric}' recorded in epoch {min_epoch} "
-                f"with the value: {min_val:.6f}, "
-                f"the losses of the last 5 epochs are: {last_5}"
+                f"with the value: {min_val:.4f}, "
+                f"the losses of the last 5 epochs are: {[f'{v:.4f}' for v in last_5]}"
             )
 
     # --- Filter epochs for plotting if specific_epochs is provided ---
@@ -5094,6 +5285,10 @@ def analyze_mapping_net(mapping_net, return_lists=False):
     for layer in mapping_net.layers:
         step_1_a_values.append(layer.step_1.a.item())
         step_2_a_values.append(layer.step_2.a.item())
+
+
+    print(f"Step 1 gamma values mean: {np.array(step_1_gamma_values).mean():.3f}±{np.array(step_1_gamma_values).std():.3f}\n")
+    print(f"Step 2 gamma values mean: {np.array(step_2_gamma_values).mean():.3f}±{np.array(step_2_gamma_values).std():.3f}\n")
 
     # --- Step 2: Plot mapping parameters (c1, c2, gamma, a) ---
     num_layers = len(step_1_c1_values)
