@@ -4200,7 +4200,9 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
     t_np = t.detach().cpu().numpy().flatten()
     loss_value = pred_loss_full_trajectory.item()
 
-    # Handle visualization portion
+    # Handle visualization portion and adjust observed indices
+    observed_indices_to_plot = point_indexes_observed.copy() if isinstance(point_indexes_observed, list) else list(point_indexes_observed)
+    
     if portion_to_visualize is not None:
         start_idx, end_idx = portion_to_visualize
         x_np = x_np[start_idx:end_idx]
@@ -4208,6 +4210,10 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
         x_pred_np = x_pred_np[start_idx:end_idx]
         u_pred_np = u_pred_np[start_idx:end_idx]
         t_np = t_np[start_idx:end_idx]
+        
+        # Adjust observed indices to be relative to the visualized portion
+        observed_indices_to_plot = [idx - start_idx for idx in point_indexes_observed 
+                                     if start_idx <= idx < end_idx]
 
     # Print observed times (not shown in plot)
     t_observed = t[point_indexes_observed].detach().cpu().numpy()
@@ -4235,6 +4241,17 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
                edgecolors='black', linewidths=2.5, label='Start (Ground Truth)', zorder=5)
     ax.scatter(x_pred_np[0], u_pred_np[0], c='red', marker='*', s=400,
                edgecolors='black', linewidths=2.5, label='Start (Prediction)', zorder=5)
+
+    # Mark observed points with squares (same for ground truth and prediction)
+    if len(observed_indices_to_plot) > 0:
+        x_observed = x_np[observed_indices_to_plot]
+        u_observed = u_np[observed_indices_to_plot]
+        t_observed_plot = t_np[observed_indices_to_plot]
+        
+        # Plot observed points with square markers
+        ax.scatter(x_observed, u_observed, c=t_observed_plot, cmap='Greens',
+                   marker='s', s=120, edgecolors='darkgreen', linewidths=2, 
+                   label='Observed Points', zorder=6)
 
     # Add colorbars for time (side by side)
     cbar_gt = plt.colorbar(scatter_gt, ax=ax, pad=0.02, fraction=0.046)
@@ -4324,7 +4341,7 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
         period_plotted = False
         for period_time in period_times:
             if t_min <= period_time <= t_max and abs(period_time) > 1e-9:  # Skip t=0
-                label = f'Period ({period})' if not period_plotted else None
+                label = f'Period ({period:.3f})' if not period_plotted else None
                 ax.axvline(x=period_time, color='cyan', linestyle='-', linewidth=1.5, 
                           alpha=0.6, label=label)
                 period_plotted = True
@@ -4438,6 +4455,9 @@ def test_model_in_single_trajectory(get_data_from_trajectory_id_function, predic
         U_final_mean = U_final.mean()
         X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
         U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+        # Replace values at observed indices with actual mapped values
+        X_final_full_shape[point_indexes_observed] = X_final
+        U_final_full_shape[point_indexes_observed] = U_final
         x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
         pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
         plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points, portion_to_visualize=portion_to_visualize)
@@ -5416,13 +5436,25 @@ def test_model_in_all_trajectories_in_df(
     mapping_net,
     inverse_net,
     device,
-    point_indexes_observed
+    point_indexes_observed,
+    recreate_and_plot_phase_space=False,
+    plot_specific_portion=None,
+    connect_points=False,
+    plot_trajectories_subsample=None
 ):
     """
     Test model on all trajectories in test_id_df and return dataframe with prediction losses.
     
+    Args:
+        recreate_and_plot_phase_space: If True, creates pred_test_df with model predictions and plots phase space comparison
+        plot_specific_portion: If not None, can be:
+            - A float (0.0-1.0): plots from 0.0 to this portion
+            - A list [start, end]: plots from start to end portion (both 0.0-1.0)
+        connect_points: If True, connect points within each trajectory with lines
+        plot_trajectories_subsample: If not None, plots only this portion (0.0-1.0) of trajectories, selected from lowest to highest loss_per_sqrt_energy
+    
     Returns:
-        pd.DataFrame: DataFrame with columns ['trajectory_id', 'energy', 'prediction_loss', 'loss_per_energy'], sorted by energy
+        tuple: (result_df, mean_prediction_loss) or (result_df, mean_prediction_loss, pred_test_df) if recreate_and_plot_phase_space=True
     """
 
     
@@ -5432,9 +5464,15 @@ def test_model_in_all_trajectories_in_df(
     # Initialize list to store losses
     losses = []
     
+    # Initialize pred_test_df if needed
+    if recreate_and_plot_phase_space:
+        pred_test_df = pd.DataFrame(index=test_df.index, columns=['x', 'u', 't'])
+    
     # Loop through each trajectory
     for idx, row in test_id_df.iterrows():
         trajectory_id = int(row['trajectory_id'])
+        start_index = int(row['start_index'])
+        end_index = int(row['end_index'])
         
         test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
         x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
@@ -5447,9 +5485,23 @@ def test_model_in_all_trajectories_in_df(
             U_final_mean = U_final.mean()
             X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
             U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+            # Replace values at observed indices with actual mapped values
+            X_final_full_shape[point_indexes_observed] = X_final
+            U_final_full_shape[point_indexes_observed] = U_final
             x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
             pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
             losses.append(pred_loss_full_trajectory.item())
+            
+            # Store predictions if needed
+            if recreate_and_plot_phase_space:
+                # Convert predictions to numpy and store at the correct indexes
+                x_pred_numpy = x_pred.detach().cpu().numpy()
+                u_pred_numpy = u_pred.detach().cpu().numpy()
+                t_numpy = t.detach().cpu().numpy()
+                
+                pred_test_df.loc[start_index:end_index-1, 'x'] = x_pred_numpy
+                pred_test_df.loc[start_index:end_index-1, 'u'] = u_pred_numpy
+                pred_test_df.loc[start_index:end_index-1, 't'] = t_numpy
         else:
             losses.append(np.nan)
     
@@ -5487,7 +5539,86 @@ def test_model_in_all_trajectories_in_df(
     plt.grid(True)
     plt.show()
     
-    return result_df, mean_prediction_loss
+    # Create phase space comparison plots if requested
+    if recreate_and_plot_phase_space:
+        # Determine which trajectories to plot
+        if plot_trajectories_subsample is not None:
+            # Sort by loss_per_sqrt_energy and select top portion
+            result_df_sorted_by_loss = result_df.sort_values('loss_per_sqrt_energy')
+            num_trajectories_to_plot = int(np.ceil(len(result_df) * plot_trajectories_subsample))
+            selected_trajectory_ids = set(result_df_sorted_by_loss.head(num_trajectories_to_plot)['trajectory_id'].values)
+            trajectories_to_plot = test_id_df[test_id_df['trajectory_id'].isin(selected_trajectory_ids)]
+        else:
+            trajectories_to_plot = test_id_df
+        
+        # Create a colormap for trajectories
+        num_trajectories = len(trajectories_to_plot)
+        cmap = plt.cm.get_cmap('tab20')  # Use tab20 for distinct colors, or 'hsv' for more colors
+        if num_trajectories > 20:
+            cmap = plt.cm.get_cmap('hsv')  # Use hsv for many trajectories
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Plot each trajectory separately with its own color
+        for traj_idx, (idx, row) in enumerate(trajectories_to_plot.iterrows()):
+            start_index = int(row['start_index'])
+            end_index = int(row['end_index'])
+            trajectory_length = end_index - start_index
+            
+            # Determine which indices to plot for this trajectory
+            if plot_specific_portion is not None:
+                # Check if it's a list or a single float
+                if isinstance(plot_specific_portion, list):
+                    # List: [start_portion, end_portion]
+                    start_portion, end_portion = plot_specific_portion
+                    start_point = int(trajectory_length * start_portion)
+                    end_point = int(trajectory_length * end_portion)
+                    trajectory_indices = list(range(start_index + start_point, start_index + end_point))
+                else:
+                    # Float: from 0.0 to the specified portion
+                    num_points_to_plot = int(trajectory_length * plot_specific_portion)
+                    trajectory_indices = list(range(start_index, start_index + num_points_to_plot))
+            else:
+                trajectory_indices = list(range(start_index, end_index))
+            
+            # Get color for this trajectory
+            color = cmap(traj_idx / num_trajectories)
+            
+            # Extract data for this trajectory
+            x_true = test_df.loc[trajectory_indices, 'x'].values
+            u_true = test_df.loc[trajectory_indices, 'u'].values
+            x_pred = pred_test_df.loc[trajectory_indices, 'x'].values
+            u_pred = pred_test_df.loc[trajectory_indices, 'u'].values
+            
+            # Left plot: True phase space
+            if connect_points:
+                ax1.plot(x_true, u_true, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
+            else:
+                ax1.scatter(x_true, u_true, color=color, alpha=0.6, s=10)
+            
+            # Right plot: Predicted phase space
+            if connect_points:
+                ax2.plot(x_pred, u_pred, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
+            else:
+                ax2.scatter(x_pred, u_pred, color=color, alpha=0.6, s=10)
+        
+        ax1.set_xlabel('x')
+        ax1.set_ylabel('u')
+        ax1.set_title('True Phase Space (Labels)')
+        ax1.grid(True)
+        
+        ax2.set_xlabel('x')
+        ax2.set_ylabel('u')
+        ax2.set_title('Predicted Phase Space (Model)')
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    if recreate_and_plot_phase_space:
+        return result_df, mean_prediction_loss, pred_test_df
+    else:
+        return result_df, mean_prediction_loss
 
 def test_model_variance_in_all_trajectories_in_df(
     get_data_from_trajectory_id_function,
@@ -5718,6 +5849,10 @@ def test_model_with_varying_observed_points(
             U_final_mean = U_final.mean()
             X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
             U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+            # Replace values at observed indices with actual mapped values
+            X_final_full_shape[point_indexes_observed] = X_final
+            U_final_full_shape[point_indexes_observed] = U_final
+
             x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
             pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
             losses.append(pred_loss_full_trajectory.item())
