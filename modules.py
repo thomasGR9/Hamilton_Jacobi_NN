@@ -1641,6 +1641,7 @@ def hsic_loss_statistics_only(
         # Create a zero tensor that maintains gradient flow
         # Use x and y to ensure gradient connection
         zero_loss = (x.sum() * 0.0 + y.sum() * 0.0)  # Gradient flows but equals 0
+        print("Number of trajectories lower than 4, so returning 0.0 at hsic loss")
         return zero_loss
     
     x = x.view(-1, 1)
@@ -3183,6 +3184,7 @@ def train_model(
                 if number_of_trajectories_in_batch not in hsic_loss_max_calculated_cache:
                     linear_tensor = torch.arange(1, number_of_trajectories_in_batch+1, requires_grad=False)
                     hsic_loss_max_calculated = hsic_loss_statistics_only(x=torch.Tensor(linear_tensor), y=torch.Tensor(linear_tensor), sigma_x = -1, sigma_y = -1, use_unbiased = True, epsilon = 1e-10).item()
+                    hsic_loss_max_calculated = max(hsic_loss_max_calculated, 0.05)
                     hsic_loss_max_calculated_cache[number_of_trajectories_in_batch] = hsic_loss_max_calculated
                 else:
                     hsic_loss_max_calculated = hsic_loss_max_calculated_cache[number_of_trajectories_in_batch]
@@ -4142,37 +4144,52 @@ def add_phi_A_columns(df):
     return df[cols]
 
 
-def plot_differencies(df):
+def plot_differencies(df, pendulum=False):
+    """
+    Plot relationships between means and constants.
+    
+    Args:
+        df: DataFrame with columns ['trajectory_id', 'X_mean', 'U_mean'] and constants
+        pendulum: If True, use columns 'phi0' and 'energy' instead of 'phi' and 'A'
+    """
+    # Define column names based on pendulum mode
+    if pendulum:
+        col_x = "phi0"
+        col_y = "energy"
+    else:
+        col_x = "phi"
+        col_y = "A"
+    
     fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     axes = axes.flatten()
     
-    # Row 1: X_mean vs A and phi
-    axes[0].scatter(df['X_mean'], df['A'], s=20)
+    # Row 1: X_mean vs col_y and col_x
+    axes[0].scatter(df['X_mean'], df[col_y], s=20)
     axes[0].set_xlabel('X_mean')
-    axes[0].set_ylabel('A')
-    axes[0].set_title('A vs X_mean')
+    axes[0].set_ylabel(col_y)
+    axes[0].set_title(f'{col_y} vs X_mean')
     
-    axes[1].scatter(df['X_mean'], df['phi'], s=20)
+    axes[1].scatter(df['X_mean'], df[col_x], s=20)
     axes[1].set_xlabel('X_mean')
-    axes[1].set_ylabel('phi')
-    axes[1].set_title('phi vs X_mean')
+    axes[1].set_ylabel(col_x)
+    axes[1].set_title(f'{col_x} vs X_mean')
     
-    # Row 2: U_mean vs A and phi
-    axes[2].scatter(df['U_mean'], df['A'], s=20)
+    # Row 2: U_mean vs col_y and col_x
+    axes[2].scatter(df['U_mean'], df[col_y], s=20)
     axes[2].set_xlabel('U_mean')
-    axes[2].set_ylabel('A')
-    axes[2].set_title('A vs U_mean')
+    axes[2].set_ylabel(col_y)
+    axes[2].set_title(f'{col_y} vs U_mean')
     
-    axes[3].scatter(df['U_mean'], df['phi'], s=20)
+    axes[3].scatter(df['U_mean'], df[col_x], s=20)
     axes[3].set_xlabel('U_mean')
-    axes[3].set_ylabel('phi')
-    axes[3].set_title('phi vs U_mean')
+    axes[3].set_ylabel(col_x)
+    axes[3].set_title(f'{col_x} vs U_mean')
     
-    # Row 3: A vs phi and X_mean vs U_mean
-    axes[4].scatter(df['A'], df['phi'], s=20)
-    axes[4].set_xlabel('A')
-    axes[4].set_ylabel('phi')
-    axes[4].set_title('phi vs A')
+    # Row 3: col_y vs col_x and X_mean vs U_mean
+    axes[4].scatter(df[col_y], df[col_x], s=20)
+    axes[4].set_xlabel(col_y)
+    axes[4].set_ylabel(col_x)
+    axes[4].set_title(f'{col_x} vs {col_y}')
     
     axes[5].scatter(df['X_mean'], df['U_mean'], s=20)
     axes[5].set_xlabel('X_mean')
@@ -4469,31 +4486,41 @@ def analyze_means_with_constants(
     specific_epoch='last',
     train_id_df_added=None,
     val_id_df_added=None,
-    val_id_df_high_energy_added=None
+    val_id_df_high_energy_added=None,
+    pendulum=False
 ):
     """
     Extracts X_mean and U_mean for all trajectories at a specific epoch from
-    each of the 3 directories, and combines them with (A, phi) constants
+    each of the 3 directories, and combines them with constants
     from the provided DataFrames.
 
     Args:
         save_dir_path (str): Path to the directory containing epoch_* folders.
         specific_epoch (int or str): Epoch number (e.g., 5) or 'last' for the last epoch.
-        train_id_df_added (pd.DataFrame): DataFrame with columns ['trajectory_id', 'A', 'phi'] for train set.
-        val_id_df_added (pd.DataFrame): DataFrame with columns ['trajectory_id', 'A', 'phi'] for validation set.
-        val_id_df_high_energy_added (pd.DataFrame): DataFrame with columns ['trajectory_id', 'A', 'phi'] for high energy validation set.
+        train_id_df_added (pd.DataFrame): DataFrame with constants for train set.
+        val_id_df_added (pd.DataFrame): DataFrame with constants for validation set.
+        val_id_df_high_energy_added (pd.DataFrame): DataFrame with constants for high energy validation set.
+        pendulum (bool): If True, use columns 'phi0' and 'energy' instead of 'phi' and 'A'.
 
     Returns:
         tuple: (val_df, val_train_set_df, val_high_energy_df)
-               Each is a DataFrame with columns ['trajectory_id', 'X_mean', 'U_mean', 'A', 'phi'].
+               Each is a DataFrame with columns ['trajectory_id', 'X_mean', 'U_mean', <col_y>, <col_x>].
     """
+
+    # Define column names based on pendulum mode
+    if pendulum:
+        col_x = "phi0"
+        col_y = "energy"
+    else:
+        col_x = "phi"
+        col_y = "A"
 
     # --- Helper function to load data for a specific subdirectory ---
     def extract_means_for_dir(epoch_path, subdir_name, constants_df):
         subdir_path = os.path.join(epoch_path, subdir_name)
         if not os.path.exists(subdir_path):
             print(f"⚠️ Warning: {subdir_path} not found.")
-            return pd.DataFrame(columns=['trajectory_id', 'X_mean', 'U_mean', 'A', 'phi'])
+            return pd.DataFrame(columns=['trajectory_id', 'X_mean', 'U_mean', col_y, col_x])
 
         data = []
         for file in os.listdir(subdir_path):
@@ -4509,16 +4536,16 @@ def analyze_means_with_constants(
 
                 if constants_df is not None and traj_id in constants_df["trajectory_id"].values:
                     row = constants_df[constants_df["trajectory_id"] == traj_id].iloc[0]
-                    A, phi = row["A"], row["phi"]
+                    val_y, val_x = row[col_y], row[col_x]
                 else:
-                    A, phi = None, None
+                    val_y, val_x = None, None
 
                 data.append({
                     "trajectory_id": traj_id,
                     "X_mean": X_mean,
                     "U_mean": U_mean,
-                    "A": A,
-                    "phi": phi
+                    col_y: val_y,
+                    col_x: val_x
                 })
             except Exception as e:
                 print(f"⚠️ Error reading {file}: {e}")
@@ -4562,7 +4589,8 @@ def visualize_trajectory_movements_with_std_ellipses(
     visualize_true_constants=False,
     train_id_df_added=None,
     val_id_df_added=None,
-    val_id_df_high_energy_added=None
+    val_id_df_high_energy_added=None,
+    pendulum=False
 ):
     """
     Visualizes how X_mean/U_mean evolve (left plot) and how X_std/U_std change (right plot)
@@ -4574,8 +4602,9 @@ def visualize_trajectory_movements_with_std_ellipses(
         right_plot_alpha: Transparency level for ellipses in right plots (0.0 to 1.0)
         verbose: If True, print trajectory values for a specific epoch
         specific_epoch: Either an integer epoch number or 'last' for the last epoch
-        visualize_true_constants: If True, plot (A, phi) of selected trajectories on left plots
+        visualize_true_constants: If True, plot constants of selected trajectories on left plots
         *_id_df_added: DataFrames containing true constants for each dataset
+        pendulum: If True, use columns 'phi0' and 'energy' instead of 'phi' and 'A'
     """
 
     traj_dirs = [
@@ -4590,6 +4619,16 @@ def visualize_trajectory_movements_with_std_ellipses(
         "val_train_set_trajectories_data": train_id_df_added,
         "val_high_energy_trajectories_data": val_id_df_high_energy_added
     }
+
+    # Define column names based on pendulum mode
+    if pendulum:
+        col_x = "phi0"
+        col_y = "energy"
+        label_text = "True (energy, φ₀)"
+    else:
+        col_x = "phi"
+        col_y = "A"
+        label_text = "True (A, φ)"
 
     epoch_dirs = sorted(
         [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
@@ -4698,11 +4737,11 @@ def visualize_trajectory_movements_with_std_ellipses(
                 tid = row["trajectory_id"]
                 color = traj_colors.get(tid, "orange")
                 ax_mean.scatter(
-                    row["phi"], row["A"],
+                    row[col_x], row[col_y],
                     color=color, s=120, marker="D",
                     edgecolor="black", linewidth=1.5, zorder=15
                 )
-        ax_mean.legend(["Trajectory evolution", "Start", "End", "Specific epoch / True (A, φ)"], fontsize=8)
+        ax_mean.legend(["Trajectory evolution", "Start", "End", f"Specific epoch / {label_text}"], fontsize=8)
 
         # --- Right plot: Std Ellipses ---
         ax_std = axes[row_idx, 1]
@@ -4762,15 +4801,20 @@ def visualize_trajectory_movements_with_std_ellipses(
                     U_mean = traj_data[tid]["U_mean"][epoch_idx]
                     U_std = traj_data[tid]["U_std"][epoch_idx]
 
-                    # Get A, phi from dataframe if available
-                    A, phi = None, None
+                    # Get constants from dataframe if available
+                    val_x, val_y = None, None
                     if df is not None and tid in df["trajectory_id"].values:
                         row = df[df["trajectory_id"] == tid].iloc[0]
-                        A, phi = row["A"], row["phi"]
+                        val_x, val_y = row[col_x], row[col_y]
 
-                    print(f"{tid}: X_mean = {X_mean:.4f} ± {X_std:.4f}, "
-                          f"U_mean = {U_mean:.4f} ± {U_std:.4f} "
-                          f"and A={A}, phi={phi}")
+                    if pendulum:
+                        print(f"{tid}: X_mean = {X_mean:.4f} ± {X_std:.4f}, "
+                              f"U_mean = {U_mean:.4f} ± {U_std:.4f} "
+                              f"and energy={val_y}, phi0={val_x}")
+                    else:
+                        print(f"{tid}: X_mean = {X_mean:.4f} ± {X_std:.4f}, "
+                              f"U_mean = {U_mean:.4f} ± {U_std:.4f} "
+                              f"and A={val_y}, phi={val_x}")
                 else:
                     print(f"{tid}: No data available")
 
@@ -4926,7 +4970,7 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
                     color=data_colors.get(prefix, None)
                 )
 
-            plt.title(f"{core_metric.replace('_', ' ').title()} across datasets")
+            plt.title(f"{core_metric.replace('_', ' ').title()}")
             plt.xlabel("Epoch")
             plt.ylabel(core_metric)
             plt.grid(True, linestyle="--", alpha=0.6)
@@ -6126,3 +6170,75 @@ def test_canonical_tranformation_on_trajectory(get_data_from_trajectory_id_funct
     inverse_result= compute_symplectic_product_function(inverse_jacobian)
     print("For the inverse network:")
     check_canonical_transformation_function(inverse_result, tolerance=tolerance)
+
+
+def test_model_in_all_trajectories_with_different_single_observation_in_df(
+    get_data_from_trajectory_id_function,
+    prediction_loss_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    inverse_net,
+    device,
+    range_max
+
+
+):
+    """
+    Test model on all trajectories in test_id_df with a different single observation and return plot and dictionary
+    """
+
+    
+
+    mean_losses = {}
+    for observed_point in range(0,range_max,1):
+        losses = []
+        # Loop through each trajectory
+        for idx, row in test_id_df.iterrows():
+            trajectory_id = int(row['trajectory_id'])
+
+
+            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+            if observed_point:
+                X_final, U_final, t_final = mapping_net(x[observed_point], u[observed_point], t[observed_point])
+                X_final_mean = X_final.mean()
+                U_final_mean = U_final.mean()
+                X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+                U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+                # Replace values at observed indices with actual mapped values
+                X_final_full_shape[observed_point] = X_final
+                U_final_full_shape[observed_point] = U_final
+                x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+                pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+                losses.append(pred_loss_full_trajectory.item())
+
+            else:
+                losses.append(np.nan)
+        mean_losses_val = np.array(losses).mean()
+        print(f"For observed point: {observed_point}, we have mean test loss: {mean_losses_val}")
+        mean_losses[observed_point]=mean_losses_val
+
+    # Get top 5 keys with lowest values
+    top_5 = sorted(mean_losses.items(), key=lambda x: x[1])[:5]
+    
+    print("Top 5 keys with lowest values:")
+    for key, value in top_5:
+        print(f"  Key {key}: {value}")
+
+
+    keys = sorted(mean_losses.keys())
+    values = [mean_losses[k] for k in keys]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(keys, values, marker='o', linestyle='-', linewidth=2, markersize=6)
+    plt.xlabel('Key')
+    plt.ylabel('Loss')
+    plt.title('Mean Losses')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    return mean_losses
