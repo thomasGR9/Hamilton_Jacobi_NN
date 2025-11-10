@@ -40,12 +40,14 @@ from modules import (
     prepare_prediction_inputs,
     generate_prediction_labels,
     prediction_loss,
+    trajectory_normalized_mse,
     compute_total_loss,
     TrajectoryDataset,
     trajectory_collate_fn,
     create_val_dataloader_full_trajectory,
     prepare_validation_inputs,
     compute_single_trajectory_stats,
+    single_trajectory_normalized_mse,
     generate_validation_labels_single_trajectory,
     calculate_losses_scale_on_untrained,
     train_model,
@@ -76,6 +78,7 @@ with open("df_high_energy_revised.pkl", "rb") as f:
 val_df_high_energy = df_high_energy_revised['val_df_high_energy_revised']
 val_id_df_high_energy = df_high_energy_revised['val_id_df_high_energy_revised']
 
+add_noise = True
 
 
 def main():
@@ -86,15 +89,15 @@ def main():
     if resume_training == False:
         training_seed = 42
     else:
-        resume_training_counter = 1
+        resume_training_counter = 0
         training_seed = 42 + resume_training_counter
     
     train_dataloader = create_simple_dataloader(
     train_df=train_df,
     train_id_df=train_id_df,
-    ratio=1.375000,
-    batch_size=352,
-    segment_length=2,
+    ratio=2.75000,
+    batch_size=176,
+    segment_length=1,
     get_data_func=get_data_from_trajectory_id,
     device=device,
     seed=training_seed
@@ -130,7 +133,7 @@ def main():
         #Hpw many Step_1 + Step_2 layers to stack
         n_layers=10,
         # MLP Architecture parameters
-        hidden_dims= [10, 20, 10],
+        hidden_dims= [10,20,10],
         n_hidden_layers = None,   #Leave None if you provide list on hidden_dims
         
         # Activation parameters
@@ -142,14 +145,14 @@ def main():
         
         # Initialization parameters
         weight_init = 'orthogonal',
-        weight_init_params = {'gain': 1},
+        weight_init_params = None,
         bias_init = 'zeros',
         bias_init_value = 0.0,
         
         
         # Architectural choices
         use_bias = True,
-        use_layer_norm = True,
+        use_layer_norm = False,
         
         # Input/Output parameters
         input_dim = 2,  # x or u and t
@@ -158,21 +161,21 @@ def main():
         a_eps_max= 2,  # Maximum value for a  
         a_k= 0.1,
 
-        step_1_a_mean_innit= 1.0,
-        step_2_a_mean_innit= 1.0,
-        std_to_mean_ratio_a_mean_init= 0.3,
+        step_1_a_mean_innit= 1.6,
+        step_2_a_mean_innit= 1.6,
+        std_to_mean_ratio_a_mean_init= 0.0,
 
-        step_1_gamma_mean_innit= 0.5,
-        step_2_gamma_mean_innit= 0.5,
-        std_to_mean_ratio_gamma_mean_init= 0.01,
+        step_1_gamma_mean_innit= 0.2,
+        step_2_gamma_mean_innit= 0.2,
+        std_to_mean_ratio_gamma_mean_init= 0.0,
 
         step_1_c1_mean_innit= 0.0,
         step_2_c1_mean_innit= 0.0,
-        std_to_mean_ratio_c1_mean_init= 0.0,
+        std_to_mean_ratio_c1_mean_init= 1.0,
 
         step_1_c2_mean_innit= 0.0,
         step_2_c2_mean_innit= 0.0,
-        std_to_mean_ratio_c2_mean_init= 0.0,
+        std_to_mean_ratio_c2_mean_init= 1.0,
 
         bound_innit=0.0,
     ).to(device)
@@ -183,7 +186,9 @@ def main():
     var_loss_class = IntraTrajectoryVarianceLossEfficient()
     repulsion_loss_class = AdaptiveSoftRepulsionLoss(epsilon=0.01, k=0.5)
     possible_t_values = get_data_from_trajectory_id(ids_df=train_id_df, data_df=train_df, trajectory_ids=1)['t'].values.tolist() #Same possible t values for every trajectory
-
+    normalized_mse = False
+    loss_type = "mae" #Either 'mae' or 'mse'
+    predict_full_trajectory = True
 
     save_dir = "./save_directory" 
     save_dir_2 = "./save_directory_2" 
@@ -191,6 +196,8 @@ def main():
     save_dir_4 = "./save_directory_4" 
     save_dir_5 = "./save_directory_5" 
 
+    save_dir_6 = "./save_directory_6" 
+    save_dir_7 = "./save_directory_7" 
 
 
 
@@ -200,11 +207,12 @@ def main():
 
         inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
 
-        derived_mapping_loss_scale, derived_prediction_loss_scale = calculate_losses_scale_on_untrained(train_loader=train_dataloader, mapping_net=mapping_net, inverse_net=inverse_net, var_loss_class=var_loss_class, get_data_from_trajectory_id=get_data_from_trajectory_id, possible_t_values=possible_t_values, train_df=train_df, train_id_df=train_id_df, save_returned_values=True, save_dir=save_dir, noise_threshold_mean_divided_by_std = 2, device=device)
+        derived_mapping_loss_scale, derived_prediction_loss_scale = calculate_losses_scale_on_untrained(train_loader=train_dataloader, mapping_net=mapping_net, inverse_net=inverse_net, var_loss_class=var_loss_class, get_data_from_trajectory_id=get_data_from_trajectory_id, possible_t_values=possible_t_values, train_df=train_df, train_id_df=train_id_df, loss_type=loss_type, predict_full_trajectory=predict_full_trajectory, add_noise=add_noise, normalized_mse=normalized_mse, save_returned_values=True, save_dir=save_dir_7, noise_threshold_mean_divided_by_std = 2, device=device)
 
         train_model(
             # Dataloaders
             train_loader=train_dataloader,
+            randomize_each_epoch_plan=False,
             val_loader=val_dataloader, 
             val_loader_high_energy=val_dataloader_high_energy,
             val_loader_training_set=val_dataloader_training_set,
@@ -229,15 +237,20 @@ def main():
             val_df_high_energy=val_df_high_energy,
             val_id_df_high_energy=val_id_df_high_energy,
 
+            add_noise = add_noise,
+
 
             #Loss calculation hyperparameters
             mapping_loss_scale=derived_mapping_loss_scale,
             prediction_loss_scale=derived_prediction_loss_scale,
+            normalized_mse=normalized_mse,
+            loss_type=loss_type,
+            predict_full_trajectory=predict_full_trajectory,
 
-            mapping_coefficient=1,
-            repulsion_coefficient=1,
-            prediction_coefficient=1.5,
-            hsic_loss_max_want=0.25,
+            mapping_coefficient=1.0,
+            repulsion_coefficient=1.0,
+            prediction_coefficient=2.0,
+            hsic_loss_max_want=0.02,
 
             reconstruction_threshold=10**-6,
             reconstruction_loss_multiplier=5,
@@ -248,25 +261,25 @@ def main():
             # Optimizer parameters
             optimizer_type = 'AdamW',
 
-            learning_rate=1e-3,
+            learning_rate=3e-3,
             weight_decay=1e-4,
 
             scheduler_type='plateau', 
-            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 300, 'verbose': True},    # Dict of params specific to the scheduler. Set if it is a fresh training session.
+            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 600, 'verbose': True},    # Dict of params specific to the scheduler. Set if it is a fresh training session.
 
 
             # Training parameters
-            num_epochs=300,
+            num_epochs=600,
             grad_clip_value=60.0,
 
 
             # Early stopping parameters
             early_stopping=True,
-            patience=300,
+            patience=600,
             min_delta=0.001,
 
             # Checkpointing
-            save_dir=save_dir,
+            save_dir=save_dir_7,
             save_best_only=False,
             save_freq_epochs=10,
             auto_rescue=True,
@@ -287,9 +300,9 @@ def main():
     
     else:
 
-        checkpoint_path = os.path.join(save_dir, "checkpoint_epoch_480.pt")
+        checkpoint_path = os.path.join(save_dir_7, "checkpoint_epoch_850.pt")
 
-        loss_scales_save_path = os.path.join(save_dir, "loss_scales.pkl")
+        loss_scales_save_path = os.path.join(save_dir_7, "loss_scales.pkl")
 
         with open(loss_scales_save_path, "rb") as f:
             loss_scales = pickle.load(f)
@@ -304,6 +317,7 @@ def main():
             
             # Dataloaders
             train_loader=train_dataloader,
+            randomize_each_epoch_plan=False,
             val_loader=val_dataloader,
             val_loader_high_energy=val_dataloader_high_energy,
             val_loader_training_set=val_dataloader_training_set,
@@ -326,15 +340,20 @@ def main():
 
             val_df_high_energy=val_df_high_energy,
             val_id_df_high_energy=val_id_df_high_energy,
+
+            add_noise = add_noise,
             
             # Loss calculation hyperparameters
             mapping_loss_scale=saved_mapping_loss_scale,
             prediction_loss_scale=saved_prediction_loss_scale,
+            normalized_mse=normalized_mse,
+            loss_type=loss_type,
+            predict_full_trajectory=predict_full_trajectory,
 
             mapping_coefficient=1,
             repulsion_coefficient=1,
-            prediction_coefficient=1.5,
-            hsic_loss_max_want=0.25,
+            prediction_coefficient=2.0,
+            hsic_loss_max_want=0.2,
 
             reconstruction_threshold=10**-6,
             reconstruction_loss_multiplier=5,
@@ -358,17 +377,17 @@ def main():
             load_scheduler_and_optimizer=True,
             
             # Optimizer parameters
-            learning_rate=2.5e-4,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
+            learning_rate=1e-4,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
             weight_decay=1e-4,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
             optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
             
             # Scheduler parameters  
             scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
-            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 80, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+            scheduler_params={'mode': 'min', 'factor': 0.5, 'patience': 40, 'verbose': True},  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
             reset_scheduler_patience = True, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
             
             # Training parameters
-            num_epochs=300,  # Number of ADDITIONAL epochs to train 
+            num_epochs=160,  # Number of ADDITIONAL epochs to train 
             grad_clip_value=60.0, #Use None if you dont want gradient clipping, specify to use torch.nn.utils.clip_grad_norm_ in MLP parameters
             
             # Early stopping parameters
@@ -377,14 +396,14 @@ def main():
             min_delta=0.001,
             
             # Checkpointing
-            save_dir=save_dir,  # Should typically match the directory where checkpoint_path is located
+            save_dir=save_dir_7,  # Should typically match the directory where checkpoint_path is located
             save_best_only=False,
             save_freq_epochs=10,
             auto_rescue=True,
             
             # Logging
             log_freq_batches=10,
-            verbose=2,
+            verbose=1,
             
             # Device
             device=device

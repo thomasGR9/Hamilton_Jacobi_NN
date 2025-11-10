@@ -353,33 +353,42 @@ def create_simple_dataloader(train_df, train_id_df, ratio, batch_size, segment_l
 
 
 
-def add_gaussian_noise(df: pd.DataFrame, variance: float) -> pd.DataFrame:
+
+def add_gaussian_noise(
+    x: torch.Tensor, 
+    u: torch.Tensor, 
+    variance: float
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Adds Gaussian noise to the 'x' and 'u' columns of a DataFrame.
+    Adds Gaussian noise to two 1D tensors.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        Input dataframe containing columns ['x', 'u', 't'].
+    x : torch.Tensor
+        Input tensor with shape [batch_size].
+    u : torch.Tensor
+        Input tensor with shape [batch_size].
     variance : float
         Variance of the Gaussian noise to be added (σ²).
 
     Returns
     -------
-    pd.DataFrame
-        New dataframe with noisy 'x' and 'u' columns.
+    tuple[torch.Tensor, torch.Tensor]
+        Two tensors with added Gaussian noise, preserving original 
+        shape, dtype, and device.
     """
     # Compute standard deviation from variance
-    sigma = np.sqrt(variance)
-
-    # Copy to avoid modifying original data
-    noisy_df = df.copy()
-
+    sigma = torch.sqrt(torch.tensor(variance))
+    
+    # Generate Gaussian noise with same shape, dtype, and device as inputs
+    noise_x = torch.randn_like(x) * sigma
+    noise_u = torch.randn_like(u) * sigma
+    
     # Add independent Gaussian noise to x and u
-    noisy_df['x'] = noisy_df['x'] + np.random.normal(0, sigma, size=len(df))
-    noisy_df['u'] = noisy_df['u'] + np.random.normal(0, sigma, size=len(df))
-
-    return noisy_df
+    noisy_x = x + noise_x
+    noisy_u = u + noise_u
+    
+    return noisy_x, noisy_u
 
 class Step_1(nn.Module):
     """
@@ -1976,7 +1985,8 @@ def prepare_prediction_inputs(
     t_batch: torch.Tensor,
     trajectory_ids: torch.Tensor,
     possible_t_values: List[float],
-    stats = None
+    stats = None,
+    predict_full_trajectory: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare prediction inputs - uses precomputed stats"""
     
@@ -2010,7 +2020,24 @@ def prepare_prediction_inputs(
         X_means = stats.X_sums / stats.counts_float
         U_means = stats.U_sums / stats.counts_float
     
-    # Rest is IDENTICAL to original
+    # NEW BEHAVIOR: Predict at all possible_t_values for each unique trajectory
+    if predict_full_trajectory:
+        n_trajectories = len(unique_ids)
+        n_times = len(possible_t_values)
+        
+        # Each trajectory mean repeated n_times times
+        # Shape: [n_trajectories * n_times]
+        X_final_mean = X_means.repeat_interleave(n_times)  # Gradient safe
+        U_final_mean = U_means.repeat_interleave(n_times)  # Gradient safe
+        
+        # All possible_t_values repeated for each trajectory
+        # Shape: [n_trajectories * n_times]
+        possible_t_tensor = torch.tensor(possible_t_values, device=device, dtype=t_batch.dtype)
+        t_for_pred = possible_t_tensor.repeat(n_trajectories)  # Gradient safe
+        
+        return X_final_mean, U_final_mean, t_for_pred
+    
+    # ORIGINAL BEHAVIOR: Rest is IDENTICAL to original
     X_final_mean = X_means[inverse_indices]
     U_final_mean = U_means[inverse_indices]
     
@@ -2053,7 +2080,9 @@ def generate_prediction_labels(
     train_id_df: pd.DataFrame,
     trajectory_ids: torch.Tensor,
     t_for_pred: torch.Tensor,
-    get_data_from_trajectory_id: callable
+    get_data_from_trajectory_id: callable,
+    predict_full_trajectory: bool = False,
+    possible_t_values: List[float] = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate ground truth labels for prediction task.
@@ -2061,22 +2090,64 @@ def generate_prediction_labels(
     Args:
         train_df: DataFrame with columns ['x', 'u', 't']
         train_id_df: DataFrame with trajectory metadata
-        trajectory_ids: Trajectory IDs for each sample in batch, shape (batch_size,)
-        t_for_pred: New time values to predict at, shape (batch_size,)
+        trajectory_ids: Trajectory IDs for each sample in batch
+        t_for_pred: Time values to predict at
         get_data_from_trajectory_id: Function to get trajectory data
+        predict_full_trajectory: If True, predict at all possible_t_values for each unique trajectory
+        possible_t_values: List of all possible time values (required if predict_full_trajectory=True)
         
     Returns:
-        X_labels: Ground truth x values at t_for_pred times, shape (batch_size,)
-        U_labels: Ground truth u values at t_for_pred times, shape (batch_size,)
-        t_labels: Same as t_for_pred (for consistency), shape (batch_size,)
+        X_labels: Ground truth x values at t_for_pred times
+        U_labels: Ground truth u values at t_for_pred times
+        t_labels: Same as t_for_pred (for consistency)
     """
-    batch_size = trajectory_ids.shape[0]
     device = trajectory_ids.device
+    
+    # NEW BEHAVIOR: Predict full trajectory at all possible_t_values
+    if predict_full_trajectory:
+        if possible_t_values is None:
+            raise ValueError("possible_t_values must be provided when predict_full_trajectory=True")
+        
+        # Get unique trajectories from the batch (maintains order)
+        unique_ids = torch.unique(trajectory_ids).cpu().numpy()
+        n_times = len(possible_t_values)
+        
+        # Initialize output tensors with same shape and device as t_for_pred
+        X_labels = torch.zeros_like(t_for_pred)
+        U_labels = torch.zeros_like(t_for_pred)
+        
+        # Fill in labels for each unique trajectory
+        for traj_idx, traj_id in enumerate(unique_ids):
+            # Get full trajectory data
+            traj_df = get_data_from_trajectory_id(
+                ids_df=train_id_df,
+                data_df=train_df,
+                trajectory_ids=int(traj_id)
+            )
+            
+            if traj_df is None or len(traj_df) == 0:
+                print(f"Error: No data found for trajectory_id {traj_id}")
+                return []
+            
+            # Extract x and u values directly
+            x_values = torch.tensor(traj_df['x'].values, device=device)
+            u_values = torch.tensor(traj_df['u'].values, device=device)
+            
+            # Fill the corresponding block
+            start_idx = traj_idx * n_times
+            end_idx = start_idx + n_times
+            X_labels[start_idx:end_idx] = x_values
+            U_labels[start_idx:end_idx] = u_values
+        
+        t_labels = t_for_pred.clone()
+        return X_labels, U_labels, t_labels
+    
+    # ORIGINAL BEHAVIOR: Unchanged
+    batch_size = trajectory_ids.shape[0]
     
     # Initialize output tensors
     X_labels = torch.zeros(batch_size, device=device)
     U_labels = torch.zeros(batch_size, device=device)
-
 
     # Convert tensors to numpy for easier indexing with pandas
     traj_ids_np = trajectory_ids.cpu().numpy()
@@ -2581,11 +2652,18 @@ def generate_validation_labels_single_trajectory(
     
     return X_val_labels, U_val_labels, t_val_labels
 
-def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
+def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, predict_full_trajectory, add_noise, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
     mapping_net.to(device)
     mapping_net.eval()
 
-    def forward_pass_for_rescaling(batch):
+    def forward_pass_for_rescaling(batch,predict_full_trajectory, add_noise):
+        if add_noise:
+            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
+            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
+        
+        else:
+            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
         X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
         variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'])
 
@@ -2593,14 +2671,20 @@ def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, 
             X_final, U_final, 
             t_batch=batch['t'], 
             trajectory_ids=batch['trajectory_ids'], 
-            possible_t_values=possible_t_values)
+            possible_t_values=possible_t_values,
+            stats=None,
+            predict_full_trajectory=predict_full_trajectory)
+        
         x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
+
         X_labels, U_labels, _ = generate_prediction_labels(
                 train_df=train_df, 
                 train_id_df=train_id_df, 
                 trajectory_ids=batch['trajectory_ids'], 
                 t_for_pred=t_for_pred, 
-                get_data_from_trajectory_id=get_data_from_trajectory_id
+                get_data_from_trajectory_id=get_data_from_trajectory_id,
+                predict_full_trajectory=predict_full_trajectory,
+                possible_t_values=possible_t_values,
             )
         if normalized_mse:
             prediction_loss_ = trajectory_normalized_mse(
@@ -2625,7 +2709,7 @@ def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, 
     variance_losses_list = []
     prediction_losses_list = []
     for batch_idx, batch in enumerate(train_loader):
-        variance_loss_, prediction_loss_ = forward_pass_for_rescaling(batch)
+        variance_loss_, prediction_loss_ = forward_pass_for_rescaling(batch,predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
         variance_losses_list.append(variance_loss_)
         prediction_losses_list.append(prediction_loss_)
     variance_loss_epoch_mean = np.mean(variance_losses_list)
@@ -2685,12 +2769,14 @@ def train_model(
     val_id_df,
     val_df_high_energy,
     val_id_df_high_energy,
+    add_noise,
     
 
     #Loss calculation hyperparameters
     mapping_loss_scale,
     prediction_loss_scale,
     loss_type,
+    predict_full_trajectory,
     normalized_mse,
     mapping_coefficient,
     repulsion_coefficient,
@@ -2795,6 +2881,8 @@ def train_model(
                 run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
                 run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
                 run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
+                run_hyperparameters['add_noise'] = add_noise
+                
                 
             
                 n_parameters = count_parameters(mapping_net)
@@ -2898,6 +2986,7 @@ def train_model(
                 run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
                 run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
                 run_hyperparameters['loss_type'] = loss_type
+                run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
                 run_hyperparameters['normalized_mse'] = normalized_mse
                 
             
@@ -3006,8 +3095,14 @@ def train_model(
 
     
     # Define a function to run the forward pass
-    def forward_pass(batch, hsic_loss_slope):
-        X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+    def forward_pass(batch, hsic_loss_slope, predict_full_trajectory, add_noise):
+        if add_noise:
+            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
+            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
+        
+        else:
+            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
         stats = TrajectoryStats(X_final, U_final, batch['trajectory_ids'])
 
 
@@ -3018,18 +3113,27 @@ def train_model(
 
 
         x_recon, u_recon, t_recon = inverse_net(X_final, U_final, t_final)
-        reconstruction_loss_ = reconstruction_loss(
-                x_recon=x_recon, u_recon=u_recon, t_recon=t_recon,
-                x_orig=batch['x'], u_orig=batch['u'], t_orig=batch['t'],
-                loss_type='mse'
-            )
+        if add_noise:
+            reconstruction_loss_ = reconstruction_loss(
+                    x_recon=x_recon, u_recon=u_recon, t_recon=t_recon,
+                    x_orig=noisy_x, u_orig=noisy_u, t_orig=batch['t'],
+                    loss_type='mse'
+                )
+        else:
+            reconstruction_loss_ = reconstruction_loss(
+                    x_recon=x_recon, u_recon=u_recon, t_recon=t_recon,
+                    x_orig=batch['x'], u_orig=batch['u'], t_orig=batch['t'],
+                    loss_type='mse'
+                )  
+
 
         X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs(
             X_final, U_final, 
             t_batch=batch['t'], 
             trajectory_ids=batch['trajectory_ids'], 
             possible_t_values=possible_t_values,
-            stats=stats)
+            stats=stats,
+            predict_full_trajectory=predict_full_trajectory)
 
         x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
 
@@ -3038,7 +3142,9 @@ def train_model(
                 train_id_df=train_id_df, 
                 trajectory_ids=batch['trajectory_ids'], 
                 t_for_pred=t_for_pred, 
-                get_data_from_trajectory_id=get_data_from_trajectory_id
+                get_data_from_trajectory_id=get_data_from_trajectory_id,
+                predict_full_trajectory=predict_full_trajectory,  
+                possible_t_values=possible_t_values 
             )
 
         if normalized_mse:
@@ -3195,7 +3301,7 @@ def train_model(
                 optimizer.zero_grad()
 
                 # Run forward pass
-                total_loss_, variance_loss_, repulsion_loss_, hsic_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch, hsic_loss_slope)
+                total_loss_, variance_loss_, repulsion_loss_, hsic_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch, hsic_loss_slope, predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
 
 
                 if torch.isnan(total_loss_) or torch.isinf(total_loss_):
@@ -3565,7 +3671,8 @@ def train_model(
         run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
         run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
         run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
-
+        run_hyperparameters['add_noise'] = add_noise 
+        
         n_parameters = count_parameters(mapping_net)
         run_hyperparameters['model_trainable_parameter_count'] = n_parameters
 
@@ -3670,6 +3777,8 @@ def train_model(
         run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
         run_hyperparameters['normalized_mse'] = normalized_mse
         run_hyperparameters['loss_type'] = loss_type
+        run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
+
 
         run_hyperparameters['mapping_coefficient'] = mapping_coefficient
         run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
@@ -3745,10 +3854,12 @@ def resume_training_from_checkpoint(
     val_id_df,
     val_df_high_energy,
     val_id_df_high_energy,
+    add_noise,
     
     # Loss calculation hyperparameters
     mapping_loss_scale,
     prediction_loss_scale,
+    predict_full_trajectory,
     loss_type,
     normalized_mse,
     mapping_coefficient,
@@ -3933,10 +4044,12 @@ def resume_training_from_checkpoint(
             val_id_df=val_id_df,
             val_df_high_energy=val_df_high_energy,
             val_id_df_high_energy=val_id_df_high_energy,
+            add_noise=add_noise,
             
             # Loss calculation hyperparameters
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
+            predict_full_trajectory=predict_full_trajectory,
             loss_type=loss_type,
             normalized_mse=normalized_mse,
             mapping_coefficient=mapping_coefficient,
@@ -4006,10 +4119,12 @@ def resume_training_from_checkpoint(
             val_id_df=val_id_df,
             val_df_high_energy=val_df_high_energy,
             val_id_df_high_energy=val_id_df_high_energy,
+            add_noise=add_noise,
             
             # Loss calculation hyperparameters
             mapping_loss_scale=mapping_loss_scale,
             prediction_loss_scale=prediction_loss_scale,
+            predict_full_trajectory=predict_full_trajectory,
             loss_type=loss_type,
             normalized_mse=normalized_mse,
             mapping_coefficient=mapping_coefficient,
