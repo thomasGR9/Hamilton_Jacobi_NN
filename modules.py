@@ -25,6 +25,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
 import torch.nn.functional as F
 import re
+from scipy.spatial.distance import mahalanobis
 
 
 def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
@@ -4575,26 +4576,538 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
     plt.tight_layout()
     plt.show()
 
-def test_model_in_single_trajectory(get_data_from_trajectory_id_function, prediction_loss_function, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device, point_indexes_observed, show_zeroings, show_period=False, period=None, connect_points=False, portion_to_visualize=None):
+
+def ensemble_autoregressive_prediction(
+    x, 
+    u, 
+    t, 
+    point_indexes_observed,
+    mapping_net,
+    inverse_net,
+    device,
+    max_t_training,
+    threshold=1.0,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    verbose=False
+):
+    """
+    Make predictions using ensemble method with autoregressive extension for long trajectories.
+    
+    Args:
+        x: Ground truth x values (torch tensor)
+        u: Ground truth u values (torch tensor)
+        t: Time values (torch tensor)
+        point_indexes_observed: List with single index of observed point
+        mapping_net: Neural network for forward mapping
+        inverse_net: Neural network for inverse mapping
+        device: Device for computation (cuda/cpu)
+        max_t_training: Maximum time value the model was trained on
+        threshold: Mahalanobis distance threshold for outlier filtering
+        search_range_lower_pct: Lower bound of search range as fraction of tmax (closer to current)
+        search_range_upper_pct: Upper bound of search range as fraction of tmax (farther from current)
+        verbose: If True, print progress and count forward passes
+    
+    Returns:
+        x_pred_filtered: Filtered x predictions (torch tensor)
+        u_pred_filtered: Filtered u predictions (torch tensor)
+        stats: Dictionary with statistics (num_forward_passes, coverage, etc.)
+    """
+    
+    # Forward pass counter
+    forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+    
+    def apply_ensemble_prediction(x_obs_val, u_obs_val, t_obs_val, t, t_max, x_pred_more_t, u_pred_more_t, 
+                                   mapping_net, inverse_net, device, n_points, t_np, indices_array, exclude_indices):
+        """
+        Apply full ensemble method from a single observation point.
+        Adds predictions to the existing x_pred_more_t and u_pred_more_t lists.
+        """
+        # Create all latent representations (pretending observation is at each time t[i])
+        X_observed_full_shape = torch.full_like(t, fill_value=x_obs_val)
+        U_observed_full_shape = torch.full_like(t, fill_value=u_obs_val)
+        X_final_more_t, U_final_more_t, _ = mapping_net(X_observed_full_shape, U_observed_full_shape, t)
+        forward_pass_count['mapping_net'] += 1
+        
+        # Define prediction window around this observation
+        abs_time_lower = max(0, t_obs_val - t_max)
+        abs_time_upper = min(t_np[-1], t_obs_val + t_max)
+        in_prediction_window = (t_np >= abs_time_lower) & (t_np <= abs_time_upper)
+        
+        # Create exclusion mask for all indices to exclude
+        exclude_mask = np.ones(n_points, dtype=bool)
+        for idx in exclude_indices:
+            exclude_mask[idx] = False
+        
+        # For each perspective i
+        for i in range(n_points):
+            # From perspective i, calculate relative times for all points
+            t_rel_all = t_np - t_obs_val + t_np[i]
+            
+            # Find valid points within the prediction window (excluding specified indices)
+            valid_mask = (t_rel_all >= 0) & (t_rel_all <= t_max) & in_prediction_window & exclude_mask
+            valid_indices = np.where(valid_mask)[0]
+            
+            if len(valid_indices) > 0:
+                # Get relative times for valid points
+                t_rel_valid = torch.tensor(t_rel_all[valid_indices], device=device, dtype=torch.float32)
+                
+                # Create full-shape tensors filled with the latent values from perspective i
+                X_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=X_final_more_t[i].item())
+                U_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=U_final_more_t[i].item())
+                
+                # Batch predict for all valid points from this perspective
+                x_pred_batch, u_pred_batch, _ = inverse_net(X_final_i_full_shape, U_final_i_full_shape, t_rel_valid)
+                forward_pass_count['inverse_net'] += 1
+                
+                # Convert predictions to CPU once for the entire batch
+                x_pred_batch_cpu = x_pred_batch.detach().cpu()
+                u_pred_batch_cpu = u_pred_batch.detach().cpu()
+                
+                # Store predictions (ADD to existing lists)
+                for idx, j in enumerate(valid_indices):
+                    x_pred_more_t[j].append(x_pred_batch_cpu[idx].item())
+                    u_pred_more_t[j].append(u_pred_batch_cpu[idx].item())
+    
+    # ==================== MAIN ALGORITHM ====================
+    
+    # Validate inputs
+    assert len(point_indexes_observed) == 1, "This function only works with exactly one observation"
+    
+    obs_idx = point_indexes_observed[0]
+    t_max = max_t_training
+    t_np = t.detach().cpu().numpy()
+    t_obs = t_np[obs_idx]
+    t_pred_max = t_np[-1]
+    n_points = len(t)
+    
+    if verbose:
+        print(f"=== Ensemble Autoregressive Prediction ===")
+        print(f"Observation at index {obs_idx}, absolute time {t_obs:.3f}")
+        print(f"Full trajectory time range: [0, {t_pred_max:.3f}]")
+        print(f"Training time max: {t_max:.3f}")
+        print(f"Search range: [{search_range_lower_pct*100}%, {search_range_upper_pct*100}%] of tmax")
+    
+    # Initialize prediction lists for each time point
+    x_pred_more_t = [[] for _ in range(n_points)]
+    u_pred_more_t = [[] for _ in range(n_points)]
+    
+    # The observed point gets its true value (and ONLY this value)
+    x_pred_more_t[obs_idx].append(x[obs_idx].item())
+    u_pred_more_t[obs_idx].append(u[obs_idx].item())
+    
+    # Get observed values
+    x_obs = x[obs_idx].item()
+    u_obs = u[obs_idx].item()
+    
+    # Pre-compute index array
+    indices_array = np.arange(n_points)
+    
+    # ==================== STEP 1: Initial Ensemble from True Observation ====================
+    if verbose:
+        print(f"\n=== Step 1: Initial ensemble from true observation ===")
+    
+    apply_ensemble_prediction(x_obs, u_obs, t_obs, t, t_max, x_pred_more_t, u_pred_more_t,
+                              mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                              exclude_indices=[obs_idx])
+    
+    if verbose:
+        print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+    
+    # ==================== STEP 2: Fill Left Side (toward t=0) ====================
+    if verbose:
+        print(f"\n=== Step 2: Filling left side ===")
+    
+    left_cutoff = (1 - search_range_upper_pct) * t_max
+    
+    if verbose:
+        print(f"Left cutoff: {left_cutoff:.3f} (will continue while t_current >= {left_cutoff:.3f})")
+    
+    if t_obs < left_cutoff:
+        if verbose:
+            print(f"Left side already covered (t_obs={t_obs:.3f} < cutoff={left_cutoff:.3f})")
+    else:
+        t_current = t_obs
+        iteration = 0
+        while t_current >= left_cutoff:
+            iteration += 1
+            if verbose:
+                print(f"\n--- Left iteration {iteration}, current position: {t_current:.3f} ---")
+            
+            # Define search range
+            range_lower = t_current - search_range_upper_pct * t_max
+            range_upper = t_current - search_range_lower_pct * t_max
+            
+            # Find indices in this range that have predictions
+            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
+            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
+            
+            if len(candidate_indices) == 0:
+                if verbose:
+                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
+                break
+            
+            # Find the most trusted index (lowest std of mahalanobis distances)
+            best_idx = None
+            best_std = float('inf')
+            
+            for idx in candidate_indices:
+                _, _, std_dist = filter_outliers_mahalanobis(
+                    x_pred_more_t[idx], u_pred_more_t[idx], threshold=threshold, return_std=True
+                )
+                if std_dist < best_std:
+                    best_std = std_dist
+                    best_idx = idx
+            
+            if verbose:
+                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (std={best_std:.4f})")
+            
+            # Get final prediction for this trusted point
+            x_trusted, u_trusted = filter_outliers_mahalanobis(
+                x_pred_more_t[best_idx], u_pred_more_t[best_idx], threshold=threshold
+            )
+            t_trusted = t_np[best_idx]
+            
+            # Apply ensemble from this trusted point
+            if verbose:
+                print(f"Applying ensemble from trusted point...")
+            
+            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
+                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                                      exclude_indices=[obs_idx, best_idx])
+            
+            if verbose:
+                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+            
+            # Update current position
+            t_current = t_trusted
+            
+            # Check termination condition
+            if t_current < left_cutoff:
+                if verbose:
+                    print(f"Left side complete (t_current={t_current:.3f} < cutoff={left_cutoff:.3f})")
+                break
+    
+    # ==================== STEP 3: Fill Right Side (toward t_pred_max) ====================
+    if verbose:
+        print(f"\n=== Step 3: Filling right side ===")
+    
+    right_cutoff = (1 - search_range_upper_pct) * t_max
+    
+    if verbose:
+        print(f"Right cutoff: {right_cutoff:.3f} (will continue while (t_pred_max - t_current) >= {right_cutoff:.3f})")
+    
+    if (t_pred_max - t_obs) < right_cutoff:
+        if verbose:
+            print(f"Right side already covered ((t_pred_max - t_obs)={t_pred_max - t_obs:.3f} < cutoff={right_cutoff:.3f})")
+    else:
+        t_current = t_obs
+        iteration = 0
+        while (t_pred_max - t_current) >= right_cutoff:
+            iteration += 1
+            if verbose:
+                print(f"\n--- Right iteration {iteration}, current position: {t_current:.3f} ---")
+            
+            # Define search range
+            range_lower = t_current + search_range_lower_pct * t_max
+            range_upper = t_current + search_range_upper_pct * t_max
+            
+            # Find indices in this range that have predictions
+            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
+            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
+            
+            if len(candidate_indices) == 0:
+                if verbose:
+                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
+                break
+            
+            # Find the most trusted index (lowest std of mahalanobis distances)
+            best_idx = None
+            best_std = float('inf')
+            
+            for idx in candidate_indices:
+                _, _, std_dist = filter_outliers_mahalanobis(
+                    x_pred_more_t[idx], u_pred_more_t[idx], threshold=threshold, return_std=True
+                )
+                if std_dist < best_std:
+                    best_std = std_dist
+                    best_idx = idx
+            
+            if verbose:
+                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (std={best_std:.4f})")
+            
+            # Get final prediction for this trusted point
+            x_trusted, u_trusted = filter_outliers_mahalanobis(
+                x_pred_more_t[best_idx], u_pred_more_t[best_idx], threshold=threshold
+            )
+            t_trusted = t_np[best_idx]
+            
+            # Apply ensemble from this trusted point
+            if verbose:
+                print(f"Applying ensemble from trusted point...")
+            
+            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
+                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                                      exclude_indices=[obs_idx, best_idx])
+            
+            if verbose:
+                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+            
+            # Update current position
+            t_current = t_trusted
+            
+            # Check termination condition
+            if (t_pred_max - t_current) < right_cutoff:
+                if verbose:
+                    print(f"Right side complete ((t_pred_max - t_current)={t_pred_max - t_current:.3f} < cutoff={right_cutoff:.3f})")
+                break
+    
+    # ==================== STEP 4: Final Aggregation ====================
+    if verbose:
+        print(f"\n=== Step 4: Final aggregation ===")
+    
+    x_pred_filtered = torch.full_like(t, fill_value=0.0)
+    u_pred_filtered = torch.full_like(t, fill_value=0.0)
+    
+    for i in range(n_points):
+        if len(x_pred_more_t[i]) > 0:
+            inside_list_x_mean_np, inside_list_u_mean_np = filter_outliers_mahalanobis(
+                x_pred_more_t[i], u_pred_more_t[i], threshold=threshold
+            )
+            x_pred_filtered[i] = inside_list_x_mean_np
+            u_pred_filtered[i] = inside_list_u_mean_np
+    
+    # Verify obs_idx still has only 1 prediction
+    assert len(x_pred_more_t[obs_idx]) == 1, f"Observed point should have only 1 value, but has {len(x_pred_more_t[obs_idx])}"
+    
+    # Calculate statistics
+    coverage = sum(1 for i in range(n_points) if len(x_pred_more_t[i]) > 0)
+    total_forward_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+    
+    stats = {
+        'coverage': coverage,
+        'coverage_pct': 100 * coverage / n_points,
+        'mapping_net_calls': forward_pass_count['mapping_net'],
+        'inverse_net_calls': forward_pass_count['inverse_net'],
+        'total_forward_passes': total_forward_passes,
+        'obs_idx': obs_idx,
+        'prediction_counts_per_point': [len(x_pred_more_t[i]) for i in range(n_points)]
+    }
+    
+    if verbose:
+        print(f"\n=== Summary ===")
+        print(f"✓ Observed point {obs_idx} correctly has only 1 value")
+        print(f"Coverage: {coverage}/{n_points} points ({stats['coverage_pct']:.1f}%)")
+        print(f"Total forward passes: {total_forward_passes}")
+        print(f"  - mapping_net calls: {forward_pass_count['mapping_net']}")
+        print(f"  - inverse_net calls: {forward_pass_count['inverse_net']}")
+        print(f"\nSample prediction counts:")
+        for i in [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]:
+            print(f"  Point {i} (t={t_np[i]:.3f}): {len(x_pred_more_t[i])} predictions")
+    
+    return x_pred_filtered, u_pred_filtered, stats
+
+def test_model_in_single_trajectory(
+    get_data_from_trajectory_id_function, 
+    prediction_loss_function, 
+    test_id_df, 
+    test_df, 
+    trajectory_id, 
+    mapping_net, 
+    inverse_net, 
+    device, 
+    point_indexes_observed, 
+    show_zeroings, 
+    show_period=False, 
+    period=None, 
+    connect_points=False, 
+    portion_to_visualize=None, 
+    max_t_training=None,
+    efficiently=True,
+    threshold=1.0,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    verbose=False
+):
+    """
+    Test model on a single trajectory.
+    
+    Args:
+        efficiently: If True, use standard prediction method. If False, use ensemble method.
+        max_t_training: If not None, use autoregressive prediction for trajectories exceeding this time value
+        threshold: Mahalanobis distance threshold (only used when efficiently=False)
+        search_range_lower_pct: Search range lower bound (only used when efficiently=False)
+        search_range_upper_pct: Search range upper bound (only used when efficiently=False)
+        verbose: If True, print forward pass counts
+    """
     test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
     x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
     u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
     t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
 
-    if point_indexes_observed: #Test prediction ability on full trajectory given points on the trajectory
-        X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-        X_final_mean = X_final.mean()
-        U_final_mean = U_final.mean()
-        X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-        U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-        # Replace values at observed indices with actual mapped values
-        X_final_full_shape[point_indexes_observed] = X_final
-        U_final_full_shape[point_indexes_observed] = U_final
-        x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+    if point_indexes_observed:
+        if efficiently:
+            # ==================== EFFICIENT METHOD ====================
+            forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+            
+            # Check if we need segmented prediction
+            if max_t_training is not None and t[-1].item() > max_t_training:
+                # Autoregressive prediction for long trajectories
+                t_np = t.detach().cpu().numpy()
+                t_max = t_np[-1]
+                
+                x_pred_segments = []
+                u_pred_segments = []
+                
+                # Determine number of segments
+                num_segments = int(np.ceil(t_max / max_t_training))
+                
+                for seg_idx in range(num_segments):
+                    # Determine time range for this segment
+                    t_start = seg_idx * max_t_training
+                    t_end = min((seg_idx + 1) * max_t_training, t_max)
+                    
+                    # Find indices in this time range
+                    # Avoid overlap: use > for subsequent segments, >= for first segment
+                    if seg_idx == 0:
+                        seg_mask = (t_np >= t_start) & (t_np <= t_end)
+                    else:
+                        seg_mask = (t_np > t_start) & (t_np <= t_end)
+                    
+                    seg_indices = np.where(seg_mask)[0]
+                    
+                    if len(seg_indices) == 0:
+                        continue
+                    
+                    # Get data for this segment
+                    t_seg = t[seg_indices]
+                    t_seg_relative = t_seg - t_start
+                    
+                    if seg_idx == 0:
+                        # First segment: use actual observed points
+                        # Filter observed indices to only those in this segment
+                        obs_in_seg = [i for i in point_indexes_observed if i in seg_indices]
+                        
+                        if len(obs_in_seg) > 0:
+                            # Get relative positions within the segment
+                            obs_indices_relative = [np.where(seg_indices == i)[0][0] for i in obs_in_seg]
+                            
+                            X_final, U_final, t_final = mapping_net(
+                                x[obs_in_seg], 
+                                u[obs_in_seg], 
+                                t_seg_relative[obs_indices_relative]
+                            )
+                            forward_pass_count['mapping_net'] += 1
+                            
+                            X_final_mean = X_final.mean()
+                            U_final_mean = U_final.mean()
+                            
+                            # Create full shape tensors for this segment
+                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                            
+                            # Place observed values at their relative positions
+                            for i, rel_idx in enumerate(obs_indices_relative):
+                                X_final_full_shape_seg[rel_idx] = X_final[i]
+                                U_final_full_shape_seg[rel_idx] = U_final[i]
+                        else:
+                            # No observations in first segment - use original observations with t=0
+                            X_final, U_final, t_final = mapping_net(
+                                x[point_indexes_observed], 
+                                u[point_indexes_observed], 
+                                torch.zeros(len(point_indexes_observed), device=device, dtype=torch.float32)
+                            )
+                            forward_pass_count['mapping_net'] += 1
+                            
+                            X_final_mean = X_final.mean()
+                            U_final_mean = U_final.mean()
+                            
+                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                            X_final_full_shape_seg[0] = X_final[0]
+                            U_final_full_shape_seg[0] = U_final[0]
+                    else:
+                        # Subsequent segments: use last prediction from previous segment as observation at t=0
+                        x_obs = x_pred_segments[-1][-1].unsqueeze(0)
+                        u_obs = u_pred_segments[-1][-1].unsqueeze(0)
+                        t_obs = torch.tensor([0.0], device=device, dtype=torch.float32)
+                        
+                        X_final, U_final, t_final = mapping_net(x_obs, u_obs, t_obs)
+                        forward_pass_count['mapping_net'] += 1
+                        
+                        X_final_mean = X_final.mean()
+                        U_final_mean = U_final.mean()
+                        
+                        # Create full shape tensors for this segment
+                        X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                        U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                        
+                        # Place the observation at index 0 (t=0 in relative time)
+                        X_final_full_shape_seg[0] = X_final[0]
+                        U_final_full_shape_seg[0] = U_final[0]
+                    
+                    # Predict for this segment using relative times
+                    x_pred_seg, u_pred_seg, _ = inverse_net(X_final_full_shape_seg, U_final_full_shape_seg, t_seg_relative)
+                    forward_pass_count['inverse_net'] += 1
+                    
+                    x_pred_segments.append(x_pred_seg)
+                    u_pred_segments.append(u_pred_seg)
+                
+                # Concatenate all segments
+                x_pred = torch.cat(x_pred_segments, dim=0)
+                u_pred = torch.cat(u_pred_segments, dim=0)
+            else:
+                # Original logic for trajectories within max_t_training
+                X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+                forward_pass_count['mapping_net'] += 1
+                
+                X_final_mean = X_final.mean()
+                U_final_mean = U_final.mean()
+                X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+                U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+                # Replace values at observed indices with actual mapped values
+                X_final_full_shape[point_indexes_observed] = X_final
+                U_final_full_shape[point_indexes_observed] = U_final
+                x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+                forward_pass_count['inverse_net'] += 1
+            
+            if verbose:
+                total_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+                print(f"\n=== Efficient Method - Forward Pass Count ===")
+                print(f"mapping_net calls: {forward_pass_count['mapping_net']}")
+                print(f"inverse_net calls: {forward_pass_count['inverse_net']}")
+                print(f"Total forward passes: {total_passes}")
+        
+        else:
+            # ==================== ENSEMBLE METHOD ====================
+            if max_t_training is None:
+                raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
+            
+            x_pred, u_pred, stats = ensemble_autoregressive_prediction(
+                x=x,
+                u=u,
+                t=t,
+                point_indexes_observed=point_indexes_observed,
+                mapping_net=mapping_net,
+                inverse_net=inverse_net,
+                device=device,
+                max_t_training=max_t_training,
+                threshold=threshold,
+                search_range_lower_pct=search_range_lower_pct,
+                search_range_upper_pct=search_range_upper_pct,
+                verbose=False  # Don't print ensemble internal details
+            )
+            
+            if verbose:
+                print(f"\n=== Ensemble Method - Forward Pass Count ===")
+                print(f"mapping_net calls: {stats['mapping_net_calls']}")
+                print(f"inverse_net calls: {stats['inverse_net_calls']}")
+                print(f"Total forward passes: {stats['total_forward_passes']}")
+                print(f"Coverage: {stats['coverage_pct']:.1f}%")
+        
         pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
         plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points, portion_to_visualize=portion_to_visualize)
         plot_euclidean_distance_over_time(x=x, u=u, x_pred=x_pred, u_pred=u_pred, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, show_zeroings=show_zeroings, show_period=show_period, period=period)
-
 
 def analyze_means_with_constants(
     save_dir_path,
@@ -4936,6 +5449,61 @@ def visualize_trajectory_movements_with_std_ellipses(
     plt.tight_layout()
     plt.show()
     print("\n✅ Mean + Std (ellipse) visualization complete.")
+
+
+
+
+def filter_outliers_mahalanobis(x_list, u_list, threshold=3, return_std=False):
+    """
+    Use Mahalanobis distance - accounts for correlation between x and u.
+    threshold: typically 2-3 (distance in standard deviations)
+    return_std: If True, return (mean_x, mean_y, std_distances)
+    """
+    x_array = np.array(x_list)
+    u_array = np.array(u_list)
+    
+    # Handle edge cases
+    if len(x_array) <= 2:
+        mean_x = np.mean(x_array)
+        mean_u = np.mean(u_array)
+        if return_std:
+            return mean_x, mean_u, 0.0
+        return mean_x, mean_u
+    
+    # Stack into 2D array
+    data = np.column_stack([x_array, u_array])
+    
+    # Calculate mean and covariance
+    mean = np.mean(data, axis=0)
+    cov = np.cov(data.T)
+    
+    # Calculate Mahalanobis distance for each point
+    try:
+        cov_inv = np.linalg.inv(cov)
+        distances = np.array([mahalanobis(point, mean, cov_inv) for point in data])
+        mask = distances < threshold
+        
+        # Make sure we keep at least one point
+        if not np.any(mask):
+            mask = np.ones(len(data), dtype=bool)
+        
+        std_distances = np.std(distances)
+            
+    except np.linalg.LinAlgError:
+        # Fallback if covariance is singular
+        mask = np.ones(len(data), dtype=bool)
+        std_distances = 0.0
+    
+    mean_x = np.mean(x_array[mask])
+    mean_u = np.mean(u_array[mask])
+    
+    if return_std:
+        return mean_x, mean_u, std_distances
+    return mean_x, mean_u
+
+
+
+
 
 
 
@@ -5599,7 +6167,13 @@ def test_model_in_all_trajectories_in_df(
     recreate_and_plot_phase_space=False,
     plot_specific_portion=None,
     connect_points=False,
-    plot_trajectories_subsample=None
+    plot_trajectories_subsample=None,
+    max_t_training=None,
+    efficiently=True,
+    threshold=1.0,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    verbose=True
 ):
     """
     Test model on all trajectories in test_id_df and return dataframe with prediction losses.
@@ -5611,6 +6185,11 @@ def test_model_in_all_trajectories_in_df(
             - A list [start, end]: plots from start to end portion (both 0.0-1.0)
         connect_points: If True, connect points within each trajectory with lines
         plot_trajectories_subsample: If not None, plots only this portion (0.0-1.0) of trajectories, selected from lowest to highest loss_per_sqrt_energy
+        max_t_training: If not None, use autoregressive prediction for trajectories exceeding this time value
+        efficiently: If True, use standard prediction method. If False, use ensemble method.
+        threshold: Mahalanobis distance threshold (only used when efficiently=False)
+        search_range_lower_pct: Search range lower bound (only used when efficiently=False)
+        search_range_upper_pct: Search range upper bound (only used when efficiently=False)
     
     Returns:
         tuple: (result_df, mean_prediction_loss) or (result_df, mean_prediction_loss, pred_test_df) if recreate_and_plot_phase_space=True
@@ -5639,15 +6218,139 @@ def test_model_in_all_trajectories_in_df(
         t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
 
         if point_indexes_observed:
-            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-            X_final_mean = X_final.mean()
-            U_final_mean = U_final.mean()
-            X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-            U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-            # Replace values at observed indices with actual mapped values
-            X_final_full_shape[point_indexes_observed] = X_final
-            U_final_full_shape[point_indexes_observed] = U_final
-            x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+            if efficiently:
+                # ==================== EFFICIENT METHOD ====================
+                # Check if we need segmented prediction
+                if max_t_training is not None and t[-1].item() > max_t_training:
+                    # Autoregressive prediction for long trajectories
+                    t_np = t.detach().cpu().numpy()
+                    t_max = t_np[-1]
+                    
+                    x_pred_segments = []
+                    u_pred_segments = []
+                    
+                    # Determine number of segments
+                    num_segments = int(np.ceil(t_max / max_t_training))
+                    
+                    for seg_idx in range(num_segments):
+                        # Determine time range for this segment
+                        t_start = seg_idx * max_t_training
+                        t_end = min((seg_idx + 1) * max_t_training, t_max)
+                        
+                        # Find indices in this time range
+                        # Avoid overlap: use > for subsequent segments, >= for first segment
+                        if seg_idx == 0:
+                            seg_mask = (t_np >= t_start) & (t_np <= t_end)
+                        else:
+                            seg_mask = (t_np > t_start) & (t_np <= t_end)
+                        
+                        seg_indices = np.where(seg_mask)[0]
+                        
+                        if len(seg_indices) == 0:
+                            continue
+                        
+                        # Get data for this segment
+                        t_seg = t[seg_indices]
+                        t_seg_relative = t_seg - t_start
+                        
+                        if seg_idx == 0:
+                            # First segment: use actual observed points
+                            # Filter observed indices to only those in this segment
+                            obs_in_seg = [i for i in point_indexes_observed if i in seg_indices]
+                            
+                            if len(obs_in_seg) > 0:
+                                # Get relative positions within the segment
+                                obs_indices_relative = [np.where(seg_indices == i)[0][0] for i in obs_in_seg]
+                                
+                                X_final, U_final, t_final = mapping_net(
+                                    x[obs_in_seg], 
+                                    u[obs_in_seg], 
+                                    t_seg_relative[obs_indices_relative]
+                                )
+                                X_final_mean = X_final.mean()
+                                U_final_mean = U_final.mean()
+                                
+                                # Create full shape tensors for this segment
+                                X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                                U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                                
+                                # Place observed values at their relative positions
+                                for i, rel_idx in enumerate(obs_indices_relative):
+                                    X_final_full_shape_seg[rel_idx] = X_final[i]
+                                    U_final_full_shape_seg[rel_idx] = U_final[i]
+                            else:
+                                # No observations in first segment - use original observations with t=0
+                                X_final, U_final, t_final = mapping_net(
+                                    x[point_indexes_observed], 
+                                    u[point_indexes_observed], 
+                                    torch.zeros(len(point_indexes_observed), device=device, dtype=torch.float32)
+                                )
+                                X_final_mean = X_final.mean()
+                                U_final_mean = U_final.mean()
+                                
+                                X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                                U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                                X_final_full_shape_seg[0] = X_final[0]
+                                U_final_full_shape_seg[0] = U_final[0]
+                        else:
+                            # Subsequent segments: use last prediction from previous segment as observation at t=0
+                            x_obs = x_pred_segments[-1][-1].unsqueeze(0)
+                            u_obs = u_pred_segments[-1][-1].unsqueeze(0)
+                            t_obs = torch.tensor([0.0], device=device, dtype=torch.float32)
+                            
+                            X_final, U_final, t_final = mapping_net(x_obs, u_obs, t_obs)
+                            X_final_mean = X_final.mean()
+                            U_final_mean = U_final.mean()
+                            
+                            # Create full shape tensors for this segment
+                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                            
+                            # Place the observation at index 0 (t=0 in relative time)
+                            X_final_full_shape_seg[0] = X_final[0]
+                            U_final_full_shape_seg[0] = U_final[0]
+                        
+                        # Predict for this segment using relative times
+                        x_pred_seg, u_pred_seg, _ = inverse_net(X_final_full_shape_seg, U_final_full_shape_seg, t_seg_relative)
+                        
+                        x_pred_segments.append(x_pred_seg)
+                        u_pred_segments.append(u_pred_seg)
+                    
+                    # Concatenate all segments
+                    x_pred = torch.cat(x_pred_segments, dim=0)
+                    u_pred = torch.cat(u_pred_segments, dim=0)
+                else:
+                    # Original logic for trajectories within max_t_training
+                    X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+                    X_final_mean = X_final.mean()
+                    U_final_mean = U_final.mean()
+                    X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+                    U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+                    # Replace values at observed indices with actual mapped values
+                    X_final_full_shape[point_indexes_observed] = X_final
+                    U_final_full_shape[point_indexes_observed] = U_final
+                    x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+            
+            else:
+                # ==================== ENSEMBLE METHOD ====================
+                if max_t_training is None:
+                    raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
+                
+                x_pred, u_pred, stats = ensemble_autoregressive_prediction(
+                    x=x,
+                    u=u,
+                    t=t,
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    threshold=threshold,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False
+                )
+            
             pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
             losses.append(pred_loss_full_trajectory.item())
             
@@ -5673,30 +6376,33 @@ def test_model_in_all_trajectories_in_df(
     # Select only the required columns and sort by energy
     result_df = result_df[['trajectory_id', 'energy', 'prediction_loss', 'loss_per_sqrt_energy']].sort_values('energy')
     
-    # Print the dataframe
-    print(result_df)
+    # Print the dataframe if needed
+    if verbose==True:
+        print(result_df)
 
     mean_prediction_loss = np.mean(result_df['prediction_loss'])
 
-    print(f"Mean prediction loss over full dataframe: {mean_prediction_loss:.4f}")
+    if verbose==True:
+        print(f"Mean prediction loss over full dataframe: {mean_prediction_loss:.4f}")
     
     # Create first plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['energy'], result_df['prediction_loss'], marker='o', linestyle='-')
-    plt.xlabel('Energy')
-    plt.ylabel('Prediction Loss')
-    plt.title('Prediction Loss vs Energy')
-    plt.grid(True)
-    plt.show()
-    
-    # Create second plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['energy'], result_df['loss_per_sqrt_energy'], marker='o', linestyle='-')
-    plt.xlabel('Energy')
-    plt.ylabel('Loss per sqrt Energy')
-    plt.title('Loss per sqrt Energy vs Energy')
-    plt.grid(True)
-    plt.show()
+    if verbose==True:
+        plt.figure(figsize=(10, 6))
+        plt.plot(result_df['energy'], result_df['prediction_loss'], marker='o', linestyle='-')
+        plt.xlabel('Energy')
+        plt.ylabel('Prediction Loss')
+        plt.title('Prediction Loss vs Energy')
+        plt.grid(True)
+        plt.show()
+
+        # Create second plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(result_df['energy'], result_df['loss_per_sqrt_energy'], marker='o', linestyle='-')
+        plt.xlabel('Energy')
+        plt.ylabel('Loss per sqrt Energy')
+        plt.title('Loss per sqrt Energy vs Energy')
+        plt.grid(True)
+        plt.show()
     
     # Create phase space comparison plots if requested
     if recreate_and_plot_phase_space:
@@ -5712,67 +6418,71 @@ def test_model_in_all_trajectories_in_df(
         
         # Create a colormap for trajectories
         num_trajectories = len(trajectories_to_plot)
-        cmap = plt.cm.get_cmap('tab20')  # Use tab20 for distinct colors, or 'hsv' for more colors
-        if num_trajectories > 20:
-            cmap = plt.cm.get_cmap('hsv')  # Use hsv for many trajectories
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        if verbose==True:
+            cmap = plt.cm.get_cmap('tab20')  # Use tab20 for distinct colors, or 'hsv' for more colors
+            if num_trajectories > 20:
+                cmap = plt.cm.get_cmap('hsv')  # Use hsv for many trajectories
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
         # Plot each trajectory separately with its own color
-        for traj_idx, (idx, row) in enumerate(trajectories_to_plot.iterrows()):
-            start_index = int(row['start_index'])
-            end_index = int(row['end_index'])
-            trajectory_length = end_index - start_index
-            
-            # Determine which indices to plot for this trajectory
-            if plot_specific_portion is not None:
-                # Check if it's a list or a single float
-                if isinstance(plot_specific_portion, list):
-                    # List: [start_portion, end_portion]
-                    start_portion, end_portion = plot_specific_portion
-                    start_point = int(trajectory_length * start_portion)
-                    end_point = int(trajectory_length * end_portion)
-                    trajectory_indices = list(range(start_index + start_point, start_index + end_point))
+        if verbose==True:
+            for traj_idx, (idx, row) in enumerate(trajectories_to_plot.iterrows()):
+                start_index = int(row['start_index'])
+                end_index = int(row['end_index'])
+                trajectory_length = end_index - start_index
+
+                # Determine which indices to plot for this trajectory
+                if plot_specific_portion is not None:
+                    # Check if it's a list or a single float
+                    if isinstance(plot_specific_portion, list):
+                        # List: [start_portion, end_portion]
+                        start_portion, end_portion = plot_specific_portion
+                        start_point = int(trajectory_length * start_portion)
+                        end_point = int(trajectory_length * end_portion)
+                        trajectory_indices = list(range(start_index + start_point, start_index + end_point))
+                    else:
+                        # Float: from 0.0 to the specified portion
+                        num_points_to_plot = int(trajectory_length * plot_specific_portion)
+                        trajectory_indices = list(range(start_index, start_index + num_points_to_plot))
                 else:
-                    # Float: from 0.0 to the specified portion
-                    num_points_to_plot = int(trajectory_length * plot_specific_portion)
-                    trajectory_indices = list(range(start_index, start_index + num_points_to_plot))
-            else:
-                trajectory_indices = list(range(start_index, end_index))
+                    trajectory_indices = list(range(start_index, end_index))
+
+                # Get color for this trajectory
+                if verbose==True:
+                    color = cmap(traj_idx / num_trajectories)
+
+                # Extract data for this trajectory
+                x_true = test_df.loc[trajectory_indices, 'x'].values
+                u_true = test_df.loc[trajectory_indices, 'u'].values
+                x_pred = pred_test_df.loc[trajectory_indices, 'x'].values
+                u_pred = pred_test_df.loc[trajectory_indices, 'u'].values
+
+                # Left plot: True phase space
+                if verbose==True:
+                    if connect_points:
+                        ax1.plot(x_true, u_true, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
+                    else:
+                        ax1.scatter(x_true, u_true, color=color, alpha=0.6, s=10)
+
+                    # Right plot: Predicted phase space
+                    if connect_points:
+                        ax2.plot(x_pred, u_pred, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
+                    else:
+                        ax2.scatter(x_pred, u_pred, color=color, alpha=0.6, s=10)
+        if verbose==True:
+            ax1.set_xlabel('x')
+            ax1.set_ylabel('u')
+            ax1.set_title('True Phase Space (Labels)')
+            ax1.grid(True)
             
-            # Get color for this trajectory
-            color = cmap(traj_idx / num_trajectories)
+            ax2.set_xlabel('x')
+            ax2.set_ylabel('u')
+            ax2.set_title('Predicted Phase Space (Model)')
+            ax2.grid(True)
             
-            # Extract data for this trajectory
-            x_true = test_df.loc[trajectory_indices, 'x'].values
-            u_true = test_df.loc[trajectory_indices, 'u'].values
-            x_pred = pred_test_df.loc[trajectory_indices, 'x'].values
-            u_pred = pred_test_df.loc[trajectory_indices, 'u'].values
-            
-            # Left plot: True phase space
-            if connect_points:
-                ax1.plot(x_true, u_true, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
-            else:
-                ax1.scatter(x_true, u_true, color=color, alpha=0.6, s=10)
-            
-            # Right plot: Predicted phase space
-            if connect_points:
-                ax2.plot(x_pred, u_pred, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
-            else:
-                ax2.scatter(x_pred, u_pred, color=color, alpha=0.6, s=10)
-        
-        ax1.set_xlabel('x')
-        ax1.set_ylabel('u')
-        ax1.set_title('True Phase Space (Labels)')
-        ax1.grid(True)
-        
-        ax2.set_xlabel('x')
-        ax2.set_ylabel('u')
-        ax2.set_title('Predicted Phase Space (Model)')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plt.show()
+            plt.tight_layout()
+            plt.show()
     
     if recreate_and_plot_phase_space:
         return result_df, mean_prediction_loss, pred_test_df
