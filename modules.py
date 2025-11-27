@@ -26,6 +26,7 @@ import time
 import torch.nn.functional as F
 import re
 from scipy.spatial.distance import mahalanobis
+from sklearn.mixture import BayesianGaussianMixture
 
 
 def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
@@ -4577,7 +4578,7 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
     plt.show()
 
 
-def ensemble_autoregressive_prediction(
+def ensemble_autoregressive_prediction_mahalanobis(
     x, 
     u, 
     t, 
@@ -4907,6 +4908,1143 @@ def ensemble_autoregressive_prediction(
     
     return x_pred_filtered, u_pred_filtered, stats
 
+
+
+
+def aggregate_ensemble_predictions(x_pred_more_t, u_pred_more_t, dt, 
+                                  alpha=1.0, gamma=1.0, 
+                                  cluster_weight_threshold=0.1, 
+                                  max_n_components=4):
+    """
+    Aggregate ensemble predictions using Bayesian Gaussian Mixture Model clustering
+    and temporal consistency weighting.
+    
+    Returns:
+        x_aggregated: 1D numpy array of aggregated x predictions for each id
+        u_aggregated: 1D numpy array of aggregated u predictions for each id
+    """
+    n_ids = len(x_pred_more_t)
+    x_aggregated = np.zeros(n_ids)
+    u_aggregated = np.zeros(n_ids)
+    
+    for id_idx in range(n_ids):
+        x_preds = np.array(x_pred_more_t[id_idx])
+        u_preds = np.array(u_pred_more_t[id_idx])
+        n_preds = len(x_preds)
+        
+        # Case 1: Only one prediction
+        if n_preds == 1:
+            x_aggregated[id_idx] = x_preds[0]
+            u_aggregated[id_idx] = u_preds[0]
+            continue
+        
+        # Case 2: Few predictions (< max_n_components)
+        if n_preds < max_n_components:
+            # Calculate temporal consistency weights only
+            weights = np.ones(n_preds)
+            if id_idx > 0:  # Can calculate temporal consistency
+                for i in range(n_preds):
+                    if i < len(x_pred_more_t[id_idx-1]):  # Has previous prediction
+                        dx_dt = (x_preds[i] - x_pred_more_t[id_idx-1][i]) / dt
+                        u_mean = np.mean(u_preds)  # Use mean of current predictions as scale
+                        if u_mean != 0:
+                            weights[i] = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(u_mean))
+            
+            # Normalize weights and aggregate
+            weights = weights / np.sum(weights)
+            x_aggregated[id_idx] = np.sum(weights * x_preds)
+            u_aggregated[id_idx] = np.sum(weights * u_preds)
+            continue
+        
+        # Case 3: Enough predictions for clustering
+        # Prepare data for GMM
+        X = np.column_stack([x_preds, u_preds])
+        
+        # Fit Bayesian GMM
+        gmm = BayesianGaussianMixture(
+            n_components=max_n_components,
+            init_params="k-means++",
+            random_state=42,
+            n_init=10,
+            tol=1e-3,
+            max_iter = 500
+        )
+        gmm.fit(X)
+        
+        # Get cluster weights and filter
+        cluster_weights = gmm.weights_
+        valid_clusters = cluster_weights >= cluster_weight_threshold
+        
+        # If no clusters pass threshold, keep the highest weight one
+        if not np.any(valid_clusters):
+            valid_clusters = cluster_weights == np.max(cluster_weights)
+        
+        valid_cluster_indices = np.where(valid_clusters)[0]
+        
+        # Get cluster assignments and probabilities
+        cluster_assignments = gmm.predict(X)
+        probs = gmm.predict_proba(X)
+        
+        # If only one valid cluster, calculate its weights and use directly
+        if len(valid_cluster_indices) == 1:
+            best_cluster_idx = valid_cluster_indices[0]
+            best_cluster_mask = cluster_assignments == best_cluster_idx
+            best_cluster_indices = np.where(best_cluster_mask)[0]
+            
+            # Calculate weights for this cluster's points
+            cluster_u_mean = gmm.means_[best_cluster_idx, 1]
+            final_weights = []
+            for i in best_cluster_indices:
+                prob_weight = probs[i, best_cluster_idx] ** gamma
+                temporal_weight = 1.0
+                if id_idx > 0 and i < len(x_pred_more_t[id_idx-1]):
+                    dx_dt = (x_preds[i] - x_pred_more_t[id_idx-1][i]) / dt
+                    if cluster_u_mean != 0:
+                        temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
+                final_weights.append(temporal_weight * prob_weight)
+            final_weights = np.array(final_weights)
+        else:
+            # Calculate and store weights for each valid cluster
+            cluster_mean_weights = []
+            cluster_weights_dict = {}  # Store weights for each cluster
+            
+            for cluster_idx in valid_cluster_indices:
+                # Get points assigned to this cluster
+                cluster_mask = cluster_assignments == cluster_idx
+                cluster_point_indices = np.where(cluster_mask)[0]
+                
+                if len(cluster_point_indices) == 0:
+                    cluster_mean_weights.append(0)
+                    cluster_weights_dict[cluster_idx] = ([], [])
+                    continue
+                
+                cluster_u_mean = gmm.means_[cluster_idx, 1]
+                
+                # Calculate and store weights for points in this cluster
+                point_weights = []
+                for i in cluster_point_indices:
+                    prob_weight = probs[i, cluster_idx] ** gamma
+                    temporal_weight = 1.0
+                    if id_idx > 0 and i < len(x_pred_more_t[id_idx-1]):
+                        dx_dt = (x_preds[i] - x_pred_more_t[id_idx-1][i]) / dt
+                        if cluster_u_mean != 0:
+                            temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
+                    point_weights.append(temporal_weight * prob_weight)
+                
+                # Store weights and indices for this cluster
+                cluster_weights_dict[cluster_idx] = (cluster_point_indices, np.array(point_weights))
+                cluster_mean_weights.append(np.mean(point_weights))
+            
+            # Select cluster with highest mean weight and use its stored weights
+            best_cluster_idx = valid_cluster_indices[np.argmax(cluster_mean_weights)]
+            best_cluster_indices, final_weights = cluster_weights_dict[best_cluster_idx]
+        
+        # Normalize and aggregate using the stored weights
+        if np.sum(final_weights) > 0:
+            final_weights = final_weights / np.sum(final_weights)
+            x_aggregated[id_idx] = np.sum(final_weights * x_preds[best_cluster_indices])
+            u_aggregated[id_idx] = np.sum(final_weights * u_preds[best_cluster_indices])
+        else:
+            # Fallback to mean of cluster points if all weights are zero
+            x_aggregated[id_idx] = np.mean(x_preds[best_cluster_indices])
+            u_aggregated[id_idx] = np.mean(u_preds[best_cluster_indices])
+    
+    return x_aggregated, u_aggregated
+
+def calculate_trust_score(x_pred_more_t, u_pred_more_t, idx, dt,
+                         alpha=1.0, gamma=1.0,
+                         cluster_weight_threshold=0.1,
+                         max_n_components=4):
+    """
+    Calculate trust score for a single idx as the mean weight of the best cluster.
+    
+    Returns:
+        trust_score: float, mean weight of the best cluster (higher is better)
+    """
+    x_preds = np.array(x_pred_more_t[idx])
+    u_preds = np.array(u_pred_more_t[idx])
+    n_preds = len(x_preds)
+    
+    # Single prediction - return neutral score
+    if n_preds == 1:
+        return 1.0
+    
+    # Few predictions - use mean temporal consistency only
+    if n_preds < max_n_components:
+        weights = np.ones(n_preds)
+        if idx > 0:
+            for i in range(n_preds):
+                if i < len(x_pred_more_t[idx-1]):
+                    dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
+                    u_mean = np.mean(u_preds)
+                    if u_mean != 0:
+                        weights[i] = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(u_mean))
+        return np.mean(weights)
+    
+    # Clustering case
+    X = np.column_stack([x_preds, u_preds])
+    
+    gmm = BayesianGaussianMixture(
+        n_components=max_n_components,
+        init_params="k-means++",
+        random_state=42,
+        n_init=10,
+        tol=1e-3,
+        max_iter = 500
+    )
+    gmm.fit(X)
+    
+    cluster_weights = gmm.weights_
+    valid_clusters = cluster_weights >= cluster_weight_threshold
+    
+    if not np.any(valid_clusters):
+        valid_clusters = cluster_weights == np.max(cluster_weights)
+    
+    valid_cluster_indices = np.where(valid_clusters)[0]
+    cluster_assignments = gmm.predict(X)
+    probs = gmm.predict_proba(X)
+    
+    best_mean_weight = 0.0
+    
+    for cluster_idx in valid_cluster_indices:
+        cluster_mask = cluster_assignments == cluster_idx
+        cluster_point_indices = np.where(cluster_mask)[0]
+        
+        if len(cluster_point_indices) == 0:
+            continue
+        
+        cluster_u_mean = gmm.means_[cluster_idx, 1]
+        
+        point_weights = []
+        for i in cluster_point_indices:
+            prob_weight = probs[i, cluster_idx] ** gamma
+            temporal_weight = 1.0
+            if idx > 0 and i < len(x_pred_more_t[idx-1]):
+                dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
+                if cluster_u_mean != 0:
+                    temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
+            point_weights.append(temporal_weight * prob_weight)
+        
+        mean_weight = np.mean(point_weights)
+        best_mean_weight = max(best_mean_weight, mean_weight)
+    
+    return best_mean_weight
+
+
+
+def aggregate_single_id(x_pred_more_t, u_pred_more_t, idx, dt,
+                       alpha=1.0, gamma=1.0,
+                       cluster_weight_threshold=0.1,
+                       max_n_components=4):
+    """
+    Aggregate predictions for a single id only.
+    
+    Args:
+        x_pred_more_t: Full list of lists
+        u_pred_more_t: Full list of lists
+        idx: The specific index to aggregate
+        
+    Returns:
+        x_aggregated, u_aggregated: Single aggregated values for the specified idx
+    """
+    x_preds = np.array(x_pred_more_t[idx])
+    u_preds = np.array(u_pred_more_t[idx])
+    n_preds = len(x_preds)
+    
+    # Case 1: Only one prediction
+    if n_preds == 1:
+        return x_preds[0], u_preds[0]
+    
+    # Case 2: Few predictions
+    if n_preds < max_n_components:
+        weights = np.ones(n_preds)
+        if idx > 0:  # Need access to previous idx for temporal consistency
+            for i in range(n_preds):
+                if i < len(x_pred_more_t[idx-1]):
+                    dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
+                    u_mean = np.mean(u_preds)
+                    if u_mean != 0:
+                        weights[i] = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(u_mean))
+        
+        weights = weights / np.sum(weights)
+        return np.sum(weights * x_preds), np.sum(weights * u_preds)
+    
+    # Case 3: Clustering
+    X = np.column_stack([x_preds, u_preds])
+    
+    gmm = BayesianGaussianMixture(
+        n_components=max_n_components,
+        init_params="k-means++",
+        random_state=42,
+        n_init=10,
+        tol=1e-3,
+        max_iter = 500
+    )
+    gmm.fit(X)
+    
+    cluster_weights = gmm.weights_
+    valid_clusters = cluster_weights >= cluster_weight_threshold
+    
+    if not np.any(valid_clusters):
+        valid_clusters = cluster_weights == np.max(cluster_weights)
+    
+    valid_cluster_indices = np.where(valid_clusters)[0]
+    cluster_assignments = gmm.predict(X)
+    probs = gmm.predict_proba(X)
+    
+    # Process clusters
+    if len(valid_cluster_indices) == 1:
+        best_cluster_idx = valid_cluster_indices[0]
+        best_cluster_mask = cluster_assignments == best_cluster_idx
+        best_cluster_indices = np.where(best_cluster_mask)[0]
+        
+        cluster_u_mean = gmm.means_[best_cluster_idx, 1]
+        final_weights = []
+        for i in best_cluster_indices:
+            prob_weight = probs[i, best_cluster_idx] ** gamma
+            temporal_weight = 1.0
+            if idx > 0 and i < len(x_pred_more_t[idx-1]):
+                dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
+                if cluster_u_mean != 0:
+                    temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
+            final_weights.append(temporal_weight * prob_weight)
+        final_weights = np.array(final_weights)
+    else:
+        cluster_mean_weights = []
+        cluster_weights_dict = {}
+        
+        for cluster_idx in valid_cluster_indices:
+            cluster_mask = cluster_assignments == cluster_idx
+            cluster_point_indices = np.where(cluster_mask)[0]
+            
+            if len(cluster_point_indices) == 0:
+                cluster_mean_weights.append(0)
+                cluster_weights_dict[cluster_idx] = ([], [])
+                continue
+            
+            cluster_u_mean = gmm.means_[cluster_idx, 1]
+            
+            point_weights = []
+            for i in cluster_point_indices:
+                prob_weight = probs[i, cluster_idx] ** gamma
+                temporal_weight = 1.0
+                if idx > 0 and i < len(x_pred_more_t[idx-1]):
+                    dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
+                    if cluster_u_mean != 0:
+                        temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
+                point_weights.append(temporal_weight * prob_weight)
+            
+            cluster_weights_dict[cluster_idx] = (cluster_point_indices, np.array(point_weights))
+            cluster_mean_weights.append(np.mean(point_weights))
+        
+        best_cluster_idx = valid_cluster_indices[np.argmax(cluster_mean_weights)]
+        best_cluster_indices, final_weights = cluster_weights_dict[best_cluster_idx]
+    
+    # Aggregate
+    if np.sum(final_weights) > 0:
+        final_weights = final_weights / np.sum(final_weights)
+        x_aggregated = np.sum(final_weights * x_preds[best_cluster_indices])
+        u_aggregated = np.sum(final_weights * u_preds[best_cluster_indices])
+    else:
+        x_aggregated = np.mean(x_preds[best_cluster_indices])
+        u_aggregated = np.mean(u_preds[best_cluster_indices])
+    
+    return x_aggregated, u_aggregated
+
+
+
+def ensemble_autoregressive_prediction_gaussian_mixture(
+    x, 
+    u, 
+    t, 
+    point_indexes_observed,
+    mapping_net,
+    inverse_net,
+    device,
+    max_t_training,
+    dt,
+    alpha=1.0, 
+    gamma=1.0,
+    cluster_weight_threshold=0.1,
+    max_n_components=4,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    verbose=False
+):
+    """
+    Make predictions using ensemble method with autoregressive extension for long trajectories.
+    
+    Args:
+        x: Ground truth x values (torch tensor)
+        u: Ground truth u values (torch tensor)
+        t: Time values (torch tensor)
+        point_indexes_observed: List with single index of observed point
+        mapping_net: Neural network for forward mapping
+        inverse_net: Neural network for inverse mapping
+        device: Device for computation (cuda/cpu)
+        max_t_training: Maximum time value the model was trained on
+        threshold: Mahalanobis distance threshold for outlier filtering
+        search_range_lower_pct: Lower bound of search range as fraction of tmax (closer to current)
+        search_range_upper_pct: Upper bound of search range as fraction of tmax (farther from current)
+        verbose: If True, print progress and count forward passes
+    
+    Returns:
+        x_pred_filtered: Filtered x predictions (torch tensor)
+        u_pred_filtered: Filtered u predictions (torch tensor)
+        stats: Dictionary with statistics (num_forward_passes, coverage, etc.)
+    """
+    
+    # Forward pass counter
+    forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+    
+    def apply_ensemble_prediction(x_obs_val, u_obs_val, t_obs_val, t, t_max, x_pred_more_t, u_pred_more_t, 
+                                   mapping_net, inverse_net, device, n_points, t_np, indices_array, exclude_indices):
+        """
+        Apply full ensemble method from a single observation point.
+        Adds predictions to the existing x_pred_more_t and u_pred_more_t lists.
+        """
+        # Create all latent representations (pretending observation is at each time t[i])
+        X_observed_full_shape = torch.full_like(t, fill_value=x_obs_val)
+        U_observed_full_shape = torch.full_like(t, fill_value=u_obs_val)
+        X_final_more_t, U_final_more_t, _ = mapping_net(X_observed_full_shape, U_observed_full_shape, t)
+        forward_pass_count['mapping_net'] += 1
+        
+        # Define prediction window around this observation
+        abs_time_lower = max(0, t_obs_val - t_max)
+        abs_time_upper = min(t_np[-1], t_obs_val + t_max)
+        in_prediction_window = (t_np >= abs_time_lower) & (t_np <= abs_time_upper)
+        
+        # Create exclusion mask for all indices to exclude
+        exclude_mask = np.ones(n_points, dtype=bool)
+        for idx in exclude_indices:
+            exclude_mask[idx] = False
+        
+        # For each perspective i
+        for i in range(n_points):
+            # From perspective i, calculate relative times for all points
+            t_rel_all = t_np - t_obs_val + t_np[i]
+            
+            # Find valid points within the prediction window (excluding specified indices)
+            valid_mask = (t_rel_all >= 0) & (t_rel_all <= t_max) & in_prediction_window & exclude_mask
+            valid_indices = np.where(valid_mask)[0]
+            
+            if len(valid_indices) > 0:
+                # Get relative times for valid points
+                t_rel_valid = torch.tensor(t_rel_all[valid_indices], device=device, dtype=torch.float32)
+                
+                # Create full-shape tensors filled with the latent values from perspective i
+                X_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=X_final_more_t[i].item())
+                U_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=U_final_more_t[i].item())
+                
+                # Batch predict for all valid points from this perspective
+                x_pred_batch, u_pred_batch, _ = inverse_net(X_final_i_full_shape, U_final_i_full_shape, t_rel_valid)
+                forward_pass_count['inverse_net'] += 1
+                
+                # Convert predictions to CPU once for the entire batch
+                x_pred_batch_cpu = x_pred_batch.detach().cpu()
+                u_pred_batch_cpu = u_pred_batch.detach().cpu()
+                
+                # Store predictions (ADD to existing lists)
+                for idx, j in enumerate(valid_indices):
+                    x_pred_more_t[j].append(x_pred_batch_cpu[idx].item())
+                    u_pred_more_t[j].append(u_pred_batch_cpu[idx].item())
+    
+    # ==================== MAIN ALGORITHM ====================
+    
+    # Validate inputs
+    assert len(point_indexes_observed) == 1, "This function only works with exactly one observation"
+    
+    obs_idx = point_indexes_observed[0]
+    t_max = max_t_training
+    t_np = t.detach().cpu().numpy()
+    t_obs = t_np[obs_idx]
+    t_pred_max = t_np[-1]
+    n_points = len(t)
+    
+    if verbose:
+        print(f"=== Ensemble Autoregressive Prediction ===")
+        print(f"Observation at index {obs_idx}, absolute time {t_obs:.3f}")
+        print(f"Full trajectory time range: [0, {t_pred_max:.3f}]")
+        print(f"Training time max: {t_max:.3f}")
+        print(f"Search range: [{search_range_lower_pct*100}%, {search_range_upper_pct*100}%] of tmax")
+    
+    # Initialize prediction lists for each time point
+    x_pred_more_t = [[] for _ in range(n_points)]
+    u_pred_more_t = [[] for _ in range(n_points)]
+    
+    # The observed point gets its true value (and ONLY this value)
+    x_pred_more_t[obs_idx].append(x[obs_idx].item())
+    u_pred_more_t[obs_idx].append(u[obs_idx].item())
+    
+    # Get observed values
+    x_obs = x[obs_idx].item()
+    u_obs = u[obs_idx].item()
+    
+    # Pre-compute index array
+    indices_array = np.arange(n_points)
+    
+    # ==================== STEP 1: Initial Ensemble from True Observation ====================
+    if verbose:
+        print(f"\n=== Step 1: Initial ensemble from true observation ===")
+    
+    apply_ensemble_prediction(x_obs, u_obs, t_obs, t, t_max, x_pred_more_t, u_pred_more_t,
+                              mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                              exclude_indices=[obs_idx])
+    
+    if verbose:
+        print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+    
+    # ==================== STEP 2: Fill Left Side (toward t=0) ====================
+    if verbose:
+        print(f"\n=== Step 2: Filling left side ===")
+    
+    left_cutoff = (1 - search_range_upper_pct) * t_max
+    
+    if verbose:
+        print(f"Left cutoff: {left_cutoff:.3f} (will continue while t_current >= {left_cutoff:.3f})")
+    
+    if t_obs < left_cutoff:
+        if verbose:
+            print(f"Left side already covered (t_obs={t_obs:.3f} < cutoff={left_cutoff:.3f})")
+    else:
+        t_current = t_obs
+        iteration = 0
+        while t_current >= left_cutoff:
+            iteration += 1
+            if verbose:
+                print(f"\n--- Left iteration {iteration}, current position: {t_current:.3f} ---")
+            
+            # Define search range
+            range_lower = t_current - search_range_upper_pct * t_max
+            range_upper = t_current - search_range_lower_pct * t_max
+            
+            # Find indices in this range that have predictions
+            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
+            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
+            
+            if len(candidate_indices) == 0:
+                if verbose:
+                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
+                break
+            
+            # Find the most trusted index (lowest std of mahalanobis distances)
+            best_idx = None
+            best_mean_weight = 0.0
+            
+            for idx in candidate_indices:
+                mean_weight = calculate_trust_score(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, dt=dt,
+                                        alpha=alpha, gamma=gamma,
+                                        cluster_weight_threshold=cluster_weight_threshold,
+                                        max_n_components=max_n_components)
+                if mean_weight > best_mean_weight:
+                    best_mean_weight = mean_weight
+                    best_idx = idx
+            
+            if verbose:
+                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
+            
+            # Get final prediction for this trusted point
+            x_trusted, u_trusted = aggregate_single_id(
+                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx, dt=dt,
+                alpha=alpha, gamma=gamma, cluster_weight_threshold=cluster_weight_threshold, max_n_components=max_n_components
+            )
+            t_trusted = t_np[best_idx]
+            
+            # Apply ensemble from this trusted point
+            if verbose:
+                print(f"Applying ensemble from trusted point...")
+            
+            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
+                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                                      exclude_indices=[obs_idx, best_idx])
+            
+            if verbose:
+                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+            
+            # Update current position
+            t_current = t_trusted
+            
+            # Check termination condition
+            if t_current < left_cutoff:
+                if verbose:
+                    print(f"Left side complete (t_current={t_current:.3f} < cutoff={left_cutoff:.3f})")
+                break
+    
+    # ==================== STEP 3: Fill Right Side (toward t_pred_max) ====================
+    if verbose:
+        print(f"\n=== Step 3: Filling right side ===")
+    
+    right_cutoff = (1 - search_range_upper_pct) * t_max
+    
+    if verbose:
+        print(f"Right cutoff: {right_cutoff:.3f} (will continue while (t_pred_max - t_current) >= {right_cutoff:.3f})")
+    
+    if (t_pred_max - t_obs) < right_cutoff:
+        if verbose:
+            print(f"Right side already covered ((t_pred_max - t_obs)={t_pred_max - t_obs:.3f} < cutoff={right_cutoff:.3f})")
+    else:
+        t_current = t_obs
+        iteration = 0
+        while (t_pred_max - t_current) >= right_cutoff:
+            iteration += 1
+            if verbose:
+                print(f"\n--- Right iteration {iteration}, current position: {t_current:.3f} ---")
+            
+            # Define search range
+            range_lower = t_current + search_range_lower_pct * t_max
+            range_upper = t_current + search_range_upper_pct * t_max
+            
+            # Find indices in this range that have predictions
+            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
+            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
+            
+            if len(candidate_indices) == 0:
+                if verbose:
+                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
+                break
+            
+            # Find the most trusted index (lowest std of mahalanobis distances)
+            best_idx = None
+            best_mean_weight = 0.0
+            
+            for idx in candidate_indices:
+                mean_weight = calculate_trust_score(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, dt=dt,
+                                        alpha=alpha, gamma=gamma,
+                                        cluster_weight_threshold=cluster_weight_threshold,
+                                        max_n_components=max_n_components)
+                if mean_weight > best_mean_weight:
+                    best_mean_weight = mean_weight
+                    best_idx = idx
+            
+            if verbose:
+                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
+            
+            # Get final prediction for this trusted point
+            x_trusted, u_trusted = aggregate_single_id(
+                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx, dt=dt,
+                alpha=alpha, gamma=gamma, cluster_weight_threshold=cluster_weight_threshold, max_n_components=max_n_components
+            )
+            t_trusted = t_np[best_idx]
+            
+            # Apply ensemble from this trusted point
+            if verbose:
+                print(f"Applying ensemble from trusted point...")
+            
+            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
+                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                                      exclude_indices=[obs_idx, best_idx])
+            
+            if verbose:
+                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+            
+            # Update current position
+            t_current = t_trusted
+            
+            # Check termination condition
+            if (t_pred_max - t_current) < right_cutoff:
+                if verbose:
+                    print(f"Right side complete ((t_pred_max - t_current)={t_pred_max - t_current:.3f} < cutoff={right_cutoff:.3f})")
+                break
+    
+    # ==================== STEP 4: Final Aggregation ====================
+    if verbose:
+        print(f"\n=== Step 4: Final aggregation ===")
+    
+
+    
+    x_aggregated, u_aggregated = aggregate_ensemble_predictions(x_pred_more_t, u_pred_more_t, dt, 
+                                    alpha=alpha, gamma=gamma, 
+                                    cluster_weight_threshold=cluster_weight_threshold, 
+                                    max_n_components=max_n_components)
+    
+    x_pred_filtered =  torch.as_tensor(x_aggregated, device=x.device, dtype=x.dtype)
+    u_pred_filtered =  torch.as_tensor(u_aggregated, device=u.device, dtype=u.dtype)
+    
+    # Verify obs_idx still has only 1 prediction
+    assert len(x_pred_more_t[obs_idx]) == 1, f"Observed point should have only 1 value, but has {len(x_pred_more_t[obs_idx])}"
+    
+    # Calculate statistics
+    coverage = sum(1 for i in range(n_points) if len(x_pred_more_t[i]) > 0)
+    total_forward_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+    
+    stats = {
+        'coverage': coverage,
+        'coverage_pct': 100 * coverage / n_points,
+        'mapping_net_calls': forward_pass_count['mapping_net'],
+        'inverse_net_calls': forward_pass_count['inverse_net'],
+        'total_forward_passes': total_forward_passes,
+        'obs_idx': obs_idx,
+        'prediction_counts_per_point': [len(x_pred_more_t[i]) for i in range(n_points)]
+    }
+    
+    if verbose:
+        print(f"\n=== Summary ===")
+        print(f"✓ Observed point {obs_idx} correctly has only 1 value")
+        print(f"Coverage: {coverage}/{n_points} points ({stats['coverage_pct']:.1f}%)")
+        print(f"Total forward passes: {total_forward_passes}")
+        print(f"  - mapping_net calls: {forward_pass_count['mapping_net']}")
+        print(f"  - inverse_net calls: {forward_pass_count['inverse_net']}")
+        print(f"\nSample prediction counts:")
+        for i in [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]:
+            print(f"  Point {i} (t={t_np[i]:.3f}): {len(x_pred_more_t[i])} predictions")
+    
+    return x_pred_filtered, u_pred_filtered, stats
+
+
+
+
+
+
+
+def aggregate_ensemble_predictions_simple(x_pred_more_t, u_pred_more_t,  max_n_components=4):
+    """
+    Simplified aggregation using only cluster weights - returns cluster mean directly.
+    
+    Returns:
+        x_aggregated: 1D numpy array of aggregated x predictions for each id
+        u_aggregated: 1D numpy array of aggregated u predictions for each id
+    """
+    n_ids = len(x_pred_more_t)
+    x_aggregated = np.zeros(n_ids)
+    u_aggregated = np.zeros(n_ids)
+    
+    for id_idx in range(n_ids):
+        x_preds = np.array(x_pred_more_t[id_idx])
+        u_preds = np.array(u_pred_more_t[id_idx])
+        n_preds = len(x_preds)
+        
+        # Case 1: Only one prediction
+        if n_preds == 1:
+            x_aggregated[id_idx] = x_preds[0]
+            u_aggregated[id_idx] = u_preds[0]
+            continue
+        
+        # Case 2: Few predictions - simple mean
+        if n_preds < max_n_components:
+            x_aggregated[id_idx] = np.mean(x_preds)
+            u_aggregated[id_idx] = np.mean(u_preds)
+            continue
+        
+        # Case 3: Clustering
+        X = np.column_stack([x_preds, u_preds])
+        
+        gmm = BayesianGaussianMixture(
+            n_components=max_n_components,
+            init_params="k-means++",
+            random_state=42,
+            n_init=10,
+            tol=1e-3,
+            max_iter=500
+        )
+        gmm.fit(X)
+        
+        # Find cluster with highest weight
+        cluster_weights = gmm.weights_
+        best_cluster_idx = np.argmax(cluster_weights)
+        
+        # Use the cluster mean directly
+        x_aggregated[id_idx] = gmm.means_[best_cluster_idx, 0]  # x component
+        u_aggregated[id_idx] = gmm.means_[best_cluster_idx, 1]  # u component
+    
+    return x_aggregated, u_aggregated
+
+
+def calculate_trust_score_simple(x_pred_more_t, u_pred_more_t, idx, max_n_components=4):
+    """
+    Calculate trust score as the weight of the highest weight cluster.
+    
+    Returns:
+        trust_score: float, weight of the highest weight cluster
+    """
+    x_preds = np.array(x_pred_more_t[idx])
+    u_preds = np.array(u_pred_more_t[idx])
+    n_preds = len(x_preds)
+    
+    # Single prediction - return neutral score
+    if n_preds == 1:
+        return 1.0
+    
+    # Few predictions - return 1/n_preds as proxy for uncertainty
+    if n_preds < max_n_components:
+        return 1.0 / n_preds  # More predictions = lower individual weight
+    
+    # Clustering case
+    X = np.column_stack([x_preds, u_preds])
+    
+    gmm = BayesianGaussianMixture(
+        n_components=max_n_components,
+        init_params="k-means++",
+        random_state=42,
+        n_init=10,
+        tol=1e-3,
+        max_iter=500
+    )
+    gmm.fit(X)
+    
+    # Return the highest cluster weight
+    return np.max(gmm.weights_)
+
+
+def aggregate_single_id_simple(x_pred_more_t, u_pred_more_t, idx, max_n_components=4):
+    """
+    Aggregate predictions for a single id using cluster mean directly.
+    
+    Returns:
+        x_aggregated, u_aggregated: Single aggregated values for the specified idx
+    """
+    x_preds = np.array(x_pred_more_t[idx])
+    u_preds = np.array(u_pred_more_t[idx])
+    n_preds = len(x_preds)
+    
+    # Case 1: Only one prediction
+    if n_preds == 1:
+        return x_preds[0], u_preds[0]
+    
+    # Case 2: Few predictions - simple mean
+    if n_preds < max_n_components:
+        return np.mean(x_preds), np.mean(u_preds)
+    
+    # Case 3: Clustering
+    X = np.column_stack([x_preds, u_preds])
+    
+    gmm = BayesianGaussianMixture(
+        n_components=max_n_components,
+        init_params="k-means++",
+        random_state=42,
+        n_init=10,
+        tol=1e-3,
+        max_iter=500
+    )
+    gmm.fit(X)
+    
+    # Find cluster with highest weight
+    cluster_weights = gmm.weights_
+    best_cluster_idx = np.argmax(cluster_weights)
+    
+    # Return the cluster mean directly
+    return gmm.means_[best_cluster_idx, 0], gmm.means_[best_cluster_idx, 1]
+
+def ensemble_autoregressive_prediction_gaussian_mixture_simple(
+    x, 
+    u, 
+    t, 
+    point_indexes_observed,
+    mapping_net,
+    inverse_net,
+    device,
+    max_t_training,
+    max_n_components=4,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    verbose=False
+):
+    """
+    Make predictions using ensemble method with autoregressive extension for long trajectories.
+    
+    Args:
+        x: Ground truth x values (torch tensor)
+        u: Ground truth u values (torch tensor)
+        t: Time values (torch tensor)
+        point_indexes_observed: List with single index of observed point
+        mapping_net: Neural network for forward mapping
+        inverse_net: Neural network for inverse mapping
+        device: Device for computation (cuda/cpu)
+        max_t_training: Maximum time value the model was trained on
+        threshold: Mahalanobis distance threshold for outlier filtering
+        search_range_lower_pct: Lower bound of search range as fraction of tmax (closer to current)
+        search_range_upper_pct: Upper bound of search range as fraction of tmax (farther from current)
+        verbose: If True, print progress and count forward passes
+    
+    Returns:
+        x_pred_filtered: Filtered x predictions (torch tensor)
+        u_pred_filtered: Filtered u predictions (torch tensor)
+        stats: Dictionary with statistics (num_forward_passes, coverage, etc.)
+    """
+    
+    # Forward pass counter
+    forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+    
+    def apply_ensemble_prediction(x_obs_val, u_obs_val, t_obs_val, t, t_max, x_pred_more_t, u_pred_more_t, 
+                                   mapping_net, inverse_net, device, n_points, t_np, indices_array, exclude_indices):
+        """
+        Apply full ensemble method from a single observation point.
+        Adds predictions to the existing x_pred_more_t and u_pred_more_t lists.
+        """
+        # Create all latent representations (pretending observation is at each time t[i])
+        X_observed_full_shape = torch.full_like(t, fill_value=x_obs_val)
+        U_observed_full_shape = torch.full_like(t, fill_value=u_obs_val)
+        X_final_more_t, U_final_more_t, _ = mapping_net(X_observed_full_shape, U_observed_full_shape, t)
+        forward_pass_count['mapping_net'] += 1
+        
+        # Define prediction window around this observation
+        abs_time_lower = max(0, t_obs_val - t_max)
+        abs_time_upper = min(t_np[-1], t_obs_val + t_max)
+        in_prediction_window = (t_np >= abs_time_lower) & (t_np <= abs_time_upper)
+        
+        # Create exclusion mask for all indices to exclude
+        exclude_mask = np.ones(n_points, dtype=bool)
+        for idx in exclude_indices:
+            exclude_mask[idx] = False
+        
+        # For each perspective i
+        for i in range(n_points):
+            # From perspective i, calculate relative times for all points
+            t_rel_all = t_np - t_obs_val + t_np[i]
+            
+            # Find valid points within the prediction window (excluding specified indices)
+            valid_mask = (t_rel_all >= 0) & (t_rel_all <= t_max) & in_prediction_window & exclude_mask
+            valid_indices = np.where(valid_mask)[0]
+            
+            if len(valid_indices) > 0:
+                # Get relative times for valid points
+                t_rel_valid = torch.tensor(t_rel_all[valid_indices], device=device, dtype=torch.float32)
+                
+                # Create full-shape tensors filled with the latent values from perspective i
+                X_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=X_final_more_t[i].item())
+                U_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=U_final_more_t[i].item())
+                
+                # Batch predict for all valid points from this perspective
+                x_pred_batch, u_pred_batch, _ = inverse_net(X_final_i_full_shape, U_final_i_full_shape, t_rel_valid)
+                forward_pass_count['inverse_net'] += 1
+                
+                # Convert predictions to CPU once for the entire batch
+                x_pred_batch_cpu = x_pred_batch.detach().cpu()
+                u_pred_batch_cpu = u_pred_batch.detach().cpu()
+                
+                # Store predictions (ADD to existing lists)
+                for idx, j in enumerate(valid_indices):
+                    x_pred_more_t[j].append(x_pred_batch_cpu[idx].item())
+                    u_pred_more_t[j].append(u_pred_batch_cpu[idx].item())
+    
+    # ==================== MAIN ALGORITHM ====================
+    
+    # Validate inputs
+    assert len(point_indexes_observed) == 1, "This function only works with exactly one observation"
+    
+    obs_idx = point_indexes_observed[0]
+    t_max = max_t_training
+    t_np = t.detach().cpu().numpy()
+    t_obs = t_np[obs_idx]
+    t_pred_max = t_np[-1]
+    n_points = len(t)
+    
+    if verbose:
+        print(f"=== Ensemble Autoregressive Prediction ===")
+        print(f"Observation at index {obs_idx}, absolute time {t_obs:.3f}")
+        print(f"Full trajectory time range: [0, {t_pred_max:.3f}]")
+        print(f"Training time max: {t_max:.3f}")
+        print(f"Search range: [{search_range_lower_pct*100}%, {search_range_upper_pct*100}%] of tmax")
+    
+    # Initialize prediction lists for each time point
+    x_pred_more_t = [[] for _ in range(n_points)]
+    u_pred_more_t = [[] for _ in range(n_points)]
+    
+    # The observed point gets its true value (and ONLY this value)
+    x_pred_more_t[obs_idx].append(x[obs_idx].item())
+    u_pred_more_t[obs_idx].append(u[obs_idx].item())
+    
+    # Get observed values
+    x_obs = x[obs_idx].item()
+    u_obs = u[obs_idx].item()
+    
+    # Pre-compute index array
+    indices_array = np.arange(n_points)
+    
+    # ==================== STEP 1: Initial Ensemble from True Observation ====================
+    if verbose:
+        print(f"\n=== Step 1: Initial ensemble from true observation ===")
+    
+    apply_ensemble_prediction(x_obs, u_obs, t_obs, t, t_max, x_pred_more_t, u_pred_more_t,
+                              mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                              exclude_indices=[obs_idx])
+    
+    if verbose:
+        print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+    
+    # ==================== STEP 2: Fill Left Side (toward t=0) ====================
+    if verbose:
+        print(f"\n=== Step 2: Filling left side ===")
+    
+    left_cutoff = (1 - search_range_upper_pct) * t_max
+    
+    if verbose:
+        print(f"Left cutoff: {left_cutoff:.3f} (will continue while t_current >= {left_cutoff:.3f})")
+    
+    if t_obs < left_cutoff:
+        if verbose:
+            print(f"Left side already covered (t_obs={t_obs:.3f} < cutoff={left_cutoff:.3f})")
+    else:
+        t_current = t_obs
+        iteration = 0
+        while t_current >= left_cutoff:
+            iteration += 1
+            if verbose:
+                print(f"\n--- Left iteration {iteration}, current position: {t_current:.3f} ---")
+            
+            # Define search range
+            range_lower = t_current - search_range_upper_pct * t_max
+            range_upper = t_current - search_range_lower_pct * t_max
+            
+            # Find indices in this range that have predictions
+            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
+            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
+            
+            if len(candidate_indices) == 0:
+                if verbose:
+                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
+                break
+            
+            # Find the most trusted index (lowest std of mahalanobis distances)
+            best_idx = None
+            best_mean_weight = 0.0
+            
+            for idx in candidate_indices:
+                mean_weight = calculate_trust_score_simple(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, max_n_components=max_n_components)
+                if mean_weight > best_mean_weight:
+                    best_mean_weight = mean_weight
+                    best_idx = idx
+            
+            if verbose:
+                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
+            
+            # Get final prediction for this trusted point
+            x_trusted, u_trusted = aggregate_single_id_simple(
+                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx, max_n_components=max_n_components)
+            t_trusted = t_np[best_idx]
+            
+            # Apply ensemble from this trusted point
+            if verbose:
+                print(f"Applying ensemble from trusted point...")
+            
+            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
+                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                                      exclude_indices=[obs_idx, best_idx])
+            
+            if verbose:
+                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+            
+            # Update current position
+            t_current = t_trusted
+            
+            # Check termination condition
+            if t_current < left_cutoff:
+                if verbose:
+                    print(f"Left side complete (t_current={t_current:.3f} < cutoff={left_cutoff:.3f})")
+                break
+    
+    # ==================== STEP 3: Fill Right Side (toward t_pred_max) ====================
+    if verbose:
+        print(f"\n=== Step 3: Filling right side ===")
+    
+    right_cutoff = (1 - search_range_upper_pct) * t_max
+    
+    if verbose:
+        print(f"Right cutoff: {right_cutoff:.3f} (will continue while (t_pred_max - t_current) >= {right_cutoff:.3f})")
+    
+    if (t_pred_max - t_obs) < right_cutoff:
+        if verbose:
+            print(f"Right side already covered ((t_pred_max - t_obs)={t_pred_max - t_obs:.3f} < cutoff={right_cutoff:.3f})")
+    else:
+        t_current = t_obs
+        iteration = 0
+        while (t_pred_max - t_current) >= right_cutoff:
+            iteration += 1
+            if verbose:
+                print(f"\n--- Right iteration {iteration}, current position: {t_current:.3f} ---")
+            
+            # Define search range
+            range_lower = t_current + search_range_lower_pct * t_max
+            range_upper = t_current + search_range_upper_pct * t_max
+            
+            # Find indices in this range that have predictions
+            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
+            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
+            
+            if len(candidate_indices) == 0:
+                if verbose:
+                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
+                break
+            
+            # Find the most trusted index (lowest std of mahalanobis distances)
+            best_idx = None
+            best_mean_weight = 0.0
+            
+            for idx in candidate_indices:
+                mean_weight = calculate_trust_score_simple(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, max_n_components=max_n_components)
+                if mean_weight > best_mean_weight:
+                    best_mean_weight = mean_weight
+                    best_idx = idx
+            
+            if verbose:
+                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
+            
+            # Get final prediction for this trusted point
+            x_trusted, u_trusted = aggregate_single_id_simple(
+                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx,max_n_components=max_n_components)
+            t_trusted = t_np[best_idx]
+            
+            # Apply ensemble from this trusted point
+            if verbose:
+                print(f"Applying ensemble from trusted point...")
+            
+            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
+                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
+                                      exclude_indices=[obs_idx, best_idx])
+            
+            if verbose:
+                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
+            
+            # Update current position
+            t_current = t_trusted
+            
+            # Check termination condition
+            if (t_pred_max - t_current) < right_cutoff:
+                if verbose:
+                    print(f"Right side complete ((t_pred_max - t_current)={t_pred_max - t_current:.3f} < cutoff={right_cutoff:.3f})")
+                break
+    
+    # ==================== STEP 4: Final Aggregation ====================
+    if verbose:
+        print(f"\n=== Step 4: Final aggregation ===")
+    
+
+    
+    x_aggregated, u_aggregated = aggregate_ensemble_predictions_simple(x_pred_more_t, u_pred_more_t, max_n_components=max_n_components)
+    
+    x_pred_filtered =  torch.as_tensor(x_aggregated, device=x.device, dtype=x.dtype)
+    u_pred_filtered =  torch.as_tensor(u_aggregated, device=u.device, dtype=u.dtype)
+    
+    # Verify obs_idx still has only 1 prediction
+    assert len(x_pred_more_t[obs_idx]) == 1, f"Observed point should have only 1 value, but has {len(x_pred_more_t[obs_idx])}"
+    
+    # Calculate statistics
+    coverage = sum(1 for i in range(n_points) if len(x_pred_more_t[i]) > 0)
+    total_forward_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+    
+    stats = {
+        'coverage': coverage,
+        'coverage_pct': 100 * coverage / n_points,
+        'mapping_net_calls': forward_pass_count['mapping_net'],
+        'inverse_net_calls': forward_pass_count['inverse_net'],
+        'total_forward_passes': total_forward_passes,
+        'obs_idx': obs_idx,
+        'prediction_counts_per_point': [len(x_pred_more_t[i]) for i in range(n_points)]
+    }
+    
+    if verbose:
+        print(f"\n=== Summary ===")
+        print(f"✓ Observed point {obs_idx} correctly has only 1 value")
+        print(f"Coverage: {coverage}/{n_points} points ({stats['coverage_pct']:.1f}%)")
+        print(f"Total forward passes: {total_forward_passes}")
+        print(f"  - mapping_net calls: {forward_pass_count['mapping_net']}")
+        print(f"  - inverse_net calls: {forward_pass_count['inverse_net']}")
+        print(f"\nSample prediction counts:")
+        for i in [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]:
+            print(f"  Point {i} (t={t_np[i]:.3f}): {len(x_pred_more_t[i])} predictions")
+    
+    return x_pred_filtered, u_pred_filtered, stats
+
+
 def test_model_in_single_trajectory(
     get_data_from_trajectory_id_function, 
     prediction_loss_function, 
@@ -4924,7 +6062,13 @@ def test_model_in_single_trajectory(
     portion_to_visualize=None, 
     max_t_training=None,
     efficiently=True,
+    method = "mahalanobis",
     threshold=1.0,
+    dt=0.1,
+    alpha=1.0,
+    gamma=1.0,
+    cluster_weight_threshold=0.4,
+    max_n_components=5,
     search_range_lower_pct=0.5,
     search_range_upper_pct=0.6,
     verbose=False
@@ -5082,22 +6226,61 @@ def test_model_in_single_trajectory(
             # ==================== ENSEMBLE METHOD ====================
             if max_t_training is None:
                 raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
-            
-            x_pred, u_pred, stats = ensemble_autoregressive_prediction(
-                x=x,
-                u=u,
-                t=t,
-                point_indexes_observed=point_indexes_observed,
-                mapping_net=mapping_net,
-                inverse_net=inverse_net,
-                device=device,
-                max_t_training=max_t_training,
-                threshold=threshold,
-                search_range_lower_pct=search_range_lower_pct,
-                search_range_upper_pct=search_range_upper_pct,
-                verbose=False  # Don't print ensemble internal details
-            )
-            
+        
+            if method == "mahalanobis":
+                x_pred, u_pred, stats = ensemble_autoregressive_prediction_mahalanobis(
+                    x=x,
+                    u=u,
+                    t=t,
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    threshold=threshold,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False  # Don't print ensemble internal details
+                )
+
+            elif method == "gaussian_mixture":
+                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture(
+                    x=x, 
+                    u=u, 
+                    t=t, 
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    dt=dt,
+                    alpha=alpha, 
+                    gamma=gamma,
+                    cluster_weight_threshold=cluster_weight_threshold,
+                    max_n_components=max_n_components,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False
+                )
+            elif method == "gaussian_mixture_simple":
+                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture_simple(
+                    x=x, 
+                    u=u, 
+                    t=t, 
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    max_n_components=max_n_components,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False
+                )
+            else:
+                raise ValueError("Not correctly specified method, try one of: mahalanobis, gaussian_mixture, gaussian_mixture_simple")
+                                
+
             if verbose:
                 print(f"\n=== Ensemble Method - Forward Pass Count ===")
                 print(f"mapping_net calls: {stats['mapping_net_calls']}")
@@ -6170,7 +7353,13 @@ def test_model_in_all_trajectories_in_df(
     plot_trajectories_subsample=None,
     max_t_training=None,
     efficiently=True,
+    method = "mahalanobis",
     threshold=1.0,
+    dt=0.1,
+    alpha=1.0,
+    gamma=1.0,
+    cluster_weight_threshold=0.4,
+    max_n_components=5,
     search_range_lower_pct=0.5,
     search_range_upper_pct=0.6,
     verbose=True
@@ -6336,20 +7525,58 @@ def test_model_in_all_trajectories_in_df(
                 if max_t_training is None:
                     raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
                 
-                x_pred, u_pred, stats = ensemble_autoregressive_prediction(
-                    x=x,
-                    u=u,
-                    t=t,
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    threshold=threshold,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False
-                )
+                if method == "mahalanobis":
+                    x_pred, u_pred, _ = ensemble_autoregressive_prediction_mahalanobis(
+                        x=x,
+                        u=u,
+                        t=t,
+                        point_indexes_observed=point_indexes_observed,
+                        mapping_net=mapping_net,
+                        inverse_net=inverse_net,
+                        device=device,
+                        max_t_training=max_t_training,
+                        threshold=threshold,
+                        search_range_lower_pct=search_range_lower_pct,
+                        search_range_upper_pct=search_range_upper_pct,
+                        verbose=False  # Don't print ensemble internal details
+                    )
+
+                elif method == "gaussian_mixture":
+                    x_pred, u_pred, _ =   ensemble_autoregressive_prediction_gaussian_mixture(
+                        x=x, 
+                        u=u, 
+                        t=t, 
+                        point_indexes_observed=point_indexes_observed,
+                        mapping_net=mapping_net,
+                        inverse_net=inverse_net,
+                        device=device,
+                        max_t_training=max_t_training,
+                        dt=dt,
+                        alpha=alpha, 
+                        gamma=gamma,
+                        cluster_weight_threshold=cluster_weight_threshold,
+                        max_n_components=max_n_components,
+                        search_range_lower_pct=search_range_lower_pct,
+                        search_range_upper_pct=search_range_upper_pct,
+                        verbose=False
+                    )
+                elif method == "gaussian_mixture_simple":
+                    x_pred, u_pred, _ =   ensemble_autoregressive_prediction_gaussian_mixture_simple(
+                        x=x, 
+                        u=u, 
+                        t=t, 
+                        point_indexes_observed=point_indexes_observed,
+                        mapping_net=mapping_net,
+                        inverse_net=inverse_net,
+                        device=device,
+                        max_t_training=max_t_training,
+                        max_n_components=max_n_components,
+                        search_range_lower_pct=search_range_lower_pct,
+                        search_range_upper_pct=search_range_upper_pct,
+                        verbose=False
+                    )
+                else:
+                    raise ValueError("Not correctly specified method, try one of: mahalanobis, gaussian_mixture, gaussian_mixture_simple")
             
             pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
             losses.append(pred_loss_full_trajectory.item())
