@@ -2077,6 +2077,96 @@ def prepare_prediction_inputs(
     return X_final_mean, U_final_mean, t_for_pred
 
 
+def prepare_prediction_inputs_for_real_pendulum_2(
+    X_final: torch.Tensor,
+    U_final: torch.Tensor, 
+    t_batch: torch.Tensor,
+    trajectory_ids: torch.Tensor,
+    possible_t_values_per_trajectory: torch.Tensor,  # Shape: [total_num_trajectories, n_times]
+    stats = None,
+    predict_full_trajectory: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Prepare prediction inputs for trajectories with different time values.
+    
+    Args:
+        X_final: Mapped X values from mapping_net
+        U_final: Mapped U values from mapping_net
+        t_batch: Time values from batch
+        trajectory_ids: Trajectory IDs from batch
+        possible_t_values_per_trajectory: 2D tensor of shape [total_num_trajectories, n_times]
+            where possible_t_values_per_trajectory[trajectory_id] contains the time values
+            for that specific trajectory. Row index = trajectory_id.
+        stats: Precomputed statistics (None in your case)
+        predict_full_trajectory: Whether to predict at all time points
+        
+    Returns:
+        X_final_mean: Mean X value repeated for each time point
+        U_final_mean: Mean U value repeated for each time point  
+        t_for_pred: Time values for prediction (trajectory-specific)
+    """
+    
+    device = X_final.device
+    batch_size = X_final.shape[0]
+    
+    # Ensure possible_t_values_per_trajectory is a tensor on the correct device
+    if not isinstance(possible_t_values_per_trajectory, torch.Tensor):
+        possible_t_values_per_trajectory = torch.tensor(
+            possible_t_values_per_trajectory, 
+            device=device, 
+            dtype=t_batch.dtype
+        )
+    elif possible_t_values_per_trajectory.device != device:
+        possible_t_values_per_trajectory = possible_t_values_per_trajectory.to(device)
+    
+    # Use precomputed stats if available
+    if stats is None:
+        unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
+        n_trajectories = len(unique_ids)
+        
+        # EXACTLY as original - uses float counts
+        counts = torch.zeros(n_trajectories, device=device)
+        counts = counts.scatter_add_(
+            0, 
+            inverse_indices, 
+            torch.ones_like(inverse_indices, dtype=torch.float)
+        )
+        
+        X_sums = torch.zeros(n_trajectories, device=device, dtype=X_final.dtype)
+        U_sums = torch.zeros(n_trajectories, device=device, dtype=U_final.dtype)
+        X_sums = X_sums.scatter_add_(0, inverse_indices, X_final)
+        U_sums = U_sums.scatter_add_(0, inverse_indices, U_final)
+        
+        X_means = X_sums / counts
+        U_means = U_sums / counts
+    else:
+        unique_ids = stats.unique_ids
+        inverse_indices = stats.inverse_indices
+        # Use float counts (matches original)
+        X_means = stats.X_sums / stats.counts_float
+        U_means = stats.U_sums / stats.counts_float
+    
+    if predict_full_trajectory:
+        n_trajectories = len(unique_ids)
+        n_times = possible_t_values_per_trajectory.shape[1]
+        
+        # Each trajectory mean repeated n_times times
+        # Shape: [n_trajectories * n_times]
+        X_final_mean = X_means.repeat_interleave(n_times)  # Gradient safe
+        U_final_mean = U_means.repeat_interleave(n_times)  # Gradient safe
+        
+        # KEY CHANGE: Get trajectory-specific time values
+        # unique_ids contains the trajectory IDs present in this batch (sorted)
+        # Index into possible_t_values_per_trajectory to get the correct times
+        # Shape: [n_trajectories, n_times]
+        t_values_for_batch = possible_t_values_per_trajectory[unique_ids]
+        
+        # Flatten row by row to match the order of X_final_mean and U_final_mean
+        # Shape: [n_trajectories * n_times]
+        t_for_pred = t_values_for_batch.flatten()  # Gradient safe (no grad needed for t anyway)
+        
+        return X_final_mean, U_final_mean, t_for_pred
+
 def generate_prediction_labels(
     train_df: pd.DataFrame,
     train_id_df: pd.DataFrame,
@@ -2196,14 +2286,178 @@ def generate_prediction_labels(
     return X_labels, U_labels, t_labels
 
 
+def generate_prediction_labels_for_real_pendulum(
+    train_df: pd.DataFrame,
+    train_id_df: pd.DataFrame,
+    trajectory_ids: torch.Tensor,
+    t_for_pred: torch.Tensor,
+    batch_t: torch.Tensor,  # The batch['t'] value (1D tensor with single value)
+    get_data_from_trajectory_id: callable,
+    predict_full_trajectory: bool = False,
+    possible_t_values: List[float] = None,
+    alpha: float = 0.5,  # Exponential decay rate hyperparameter
+    window_size: int = 5  # Number of indices on each side with weight 1
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate ground truth labels for prediction task with a weight mask for real pendulum.
+    
+    Args:
+        train_df: DataFrame with columns ['x', 'u', 't']
+        train_id_df: DataFrame with trajectory metadata
+        trajectory_ids: Trajectory IDs for each sample in batch
+        t_for_pred: Time values to predict at
+        batch_t: The sampled time value from the batch (1D tensor with single value)
+        get_data_from_trajectory_id: Function to get trajectory data
+        predict_full_trajectory: If True, predict at all possible_t_values for each unique trajectory
+        possible_t_values: List of all possible time values (required if predict_full_trajectory=True)
+        alpha: Exponential decay rate for weights outside the window (higher = faster decay)
+        window_size: Number of indices on each side of batch_t index that have weight 1
+        
+    Returns:
+        X_labels: Ground truth x values at t_for_pred times
+        U_labels: Ground truth u values at t_for_pred times
+        t_labels: Same as t_for_pred (for consistency)
+        weight_mask: Weight mask with 1s near batch_t and exponentially decaying values elsewhere
+    """
+    device = trajectory_ids.device
+    
+    # NEW BEHAVIOR: Predict full trajectory at all possible_t_values
+    if predict_full_trajectory:
+        if possible_t_values is None:
+            raise ValueError("possible_t_values must be provided when predict_full_trajectory=True")
+        
+        # Get unique trajectories from the batch (maintains order)
+        unique_ids = torch.unique(trajectory_ids).cpu().numpy()
+        n_times = len(possible_t_values)
+        n_trajectories = len(unique_ids)
+        
+        # Initialize output tensors with same shape and device as t_for_pred
+        X_labels = torch.zeros_like(t_for_pred)
+        U_labels = torch.zeros_like(t_for_pred)
+        
+        # Fill in labels for each unique trajectory
+        for traj_idx, traj_id in enumerate(unique_ids):
+            # Get full trajectory data
+            traj_df = get_data_from_trajectory_id(
+                ids_df=train_id_df,
+                data_df=train_df,
+                trajectory_ids=int(traj_id)
+            )
+            
+            if traj_df is None or len(traj_df) == 0:
+                print(f"Error: No data found for trajectory_id {traj_id}")
+                return [], [], [], []
+            
+            # Extract x and u values directly
+            x_values = torch.tensor(traj_df['x'].values, device=device)
+            u_values = torch.tensor(traj_df['u'].values, device=device)
+            
+            # Fill the corresponding block
+            start_idx = traj_idx * n_times
+            end_idx = start_idx + n_times
+            X_labels[start_idx:end_idx] = x_values
+            U_labels[start_idx:end_idx] = u_values
+        
+        t_labels = t_for_pred.clone()
+        
+        # --- Create weight mask ---
+        # Find the index in possible_t_values that corresponds to batch_t
+        batch_t_value = batch_t.item() if batch_t.numel() == 1 else batch_t[0].item()
+        t_array = np.array(possible_t_values)
+        center_idx = np.argmin(np.abs(t_array - batch_t_value))
+        
+        # Create mask for one trajectory block
+        indices = torch.arange(n_times, device=device, dtype=torch.float32)
+        distances = torch.abs(indices - center_idx)
+        
+        # Create single trajectory mask
+        single_mask = torch.where(
+            distances <= window_size,
+            torch.ones_like(distances),  # Weight 1 within window
+            torch.exp(-alpha * (distances - window_size))  # Exponential decay outside
+        )
+        
+        # Repeat the mask for all trajectories
+        weight_mask = single_mask.repeat(n_trajectories)
+        
+        return X_labels, U_labels, t_labels, weight_mask
+    
 
+def generate_prediction_labels_for_real_pendulum_2(
+    train_df: pd.DataFrame,
+    train_id_df: pd.DataFrame,
+    trajectory_ids: torch.Tensor,
+    t_for_pred: torch.Tensor,
+    get_data_from_trajectory_id: callable,
+    predict_full_trajectory: bool = False,
+    possible_t_values_per_trajectory: torch.Tensor = None  # Shape: [total_num_trajectories, n_times]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate ground truth labels for prediction task with trajectory-specific time values.
+    
+    Args:
+        train_df: DataFrame with columns ['x', 'u', 't']
+        train_id_df: DataFrame with trajectory metadata
+        trajectory_ids: Trajectory IDs for each sample in batch
+        t_for_pred: Time values to predict at (trajectory-specific)
+        get_data_from_trajectory_id: Function to get trajectory data
+        predict_full_trajectory: If True, predict at all time values for each unique trajectory
+        possible_t_values_per_trajectory: 2D tensor of shape [total_num_trajectories, n_times]
+            where row index = trajectory_id. Used to determine n_times.
+        
+    Returns:
+        X_labels: Ground truth x values at t_for_pred times
+        U_labels: Ground truth u values at t_for_pred times
+        t_labels: Same as t_for_pred (for consistency)
+    """
+    device = trajectory_ids.device
+    
+    if predict_full_trajectory:
+        if possible_t_values_per_trajectory is None:
+            raise ValueError("possible_t_values_per_trajectory must be provided when predict_full_trajectory=True")
+        
+        # Get n_times from the shape of possible_t_values_per_trajectory
+        n_times = possible_t_values_per_trajectory.shape[1]
+        
+        # Get unique trajectories from the batch (returns SORTED order - same as in prepare_prediction_inputs)
+        unique_ids = torch.unique(trajectory_ids).cpu().numpy()
+        
+        # Initialize output tensors with same shape and device as t_for_pred
+        X_labels = torch.zeros_like(t_for_pred)
+        U_labels = torch.zeros_like(t_for_pred)
+        
+        # Fill in labels for each unique trajectory (in sorted order - matches prepare_prediction_inputs)
+        for traj_idx, traj_id in enumerate(unique_ids):
+            # Get full trajectory data
+            traj_df = get_data_from_trajectory_id(
+                ids_df=train_id_df,
+                data_df=train_df,
+                trajectory_ids=int(traj_id)
+            )
+            
+            if traj_df is None or len(traj_df) == 0:
+                print(f"Error: No data found for trajectory_id {traj_id}")
+                return []
+            
+            # Extract x and u values directly (these are already in correct time order for this trajectory)
+            x_values = torch.tensor(traj_df['x'].values, device=device, dtype=t_for_pred.dtype)
+            u_values = torch.tensor(traj_df['u'].values, device=device, dtype=t_for_pred.dtype)
+            
+            # Fill the corresponding block
+            start_idx = traj_idx * n_times
+            end_idx = start_idx + n_times
+            X_labels[start_idx:end_idx] = x_values
+            U_labels[start_idx:end_idx] = u_values
+        
+        t_labels = t_for_pred.clone()
+        return X_labels, U_labels, t_labels
 
 def prediction_loss(
     x_pred: torch.Tensor,
     u_pred: torch.Tensor,
     X_labels: torch.Tensor,
     U_labels: torch.Tensor,
-    loss_type: str = "mae"
+    loss_type: str = "mse"
 ) -> torch.Tensor:
     """
     Compute prediction loss using either Mean Absolute Error (MAE) or Mean Squared Error (MSE).
@@ -2230,7 +2484,39 @@ def prediction_loss(
     total_loss = x_loss + u_loss
     return total_loss
 
+def prediction_loss_for_real_pendulum(
+    x_pred: torch.Tensor,
+    u_pred: torch.Tensor,
+    X_labels: torch.Tensor,
+    U_labels: torch.Tensor,
+    weight_mask: torch.Tensor,
+    loss_type: str = "mae"
+) -> torch.Tensor:
+    """
+    Compute weighted prediction loss using either Mean Absolute Error (MAE) or Mean Squared Error (MSE).
+    
+    Args:
+        x_pred: Predicted positions from inverse network, shape (batch_size,)
+        u_pred: Predicted velocities from inverse network, shape (batch_size,)
+        X_labels: Ground truth positions, shape (batch_size,)
+        U_labels: Ground truth velocities, shape (batch_size,)
+        weight_mask: Weight mask for each sample, shape (batch_size,)
+        loss_type: Type of loss to use, either 'mae' or 'mse'. Default is 'mae'.
+        
+    Returns:
+        loss: Scalar weighted MAE or MSE loss
+    """
+    if loss_type.lower() == "mae":
+        x_loss = torch.mean(weight_mask * torch.abs(x_pred - X_labels))
+        u_loss = torch.mean(weight_mask * torch.abs(u_pred - U_labels))
+    elif loss_type.lower() == "mse":
+        x_loss = torch.mean(weight_mask * (x_pred - X_labels) ** 2)
+        u_loss = torch.mean(weight_mask * (u_pred - U_labels) ** 2)
+    else:
+        raise ValueError(f"Invalid loss_type '{loss_type}'. Choose either 'mae' or 'mse'.")
 
+    total_loss = x_loss + u_loss
+    return total_loss
 
 def trajectory_normalized_mse(
     x_pred: torch.Tensor,
@@ -4171,6 +4457,1120 @@ def resume_training_from_checkpoint(
             device=device,
         )
 
+def train_model_real_pendulum(
+    # Dataloaders
+    train_loader,
+    randomize_each_epoch_plan,
+    val_loader, 
+
+    
+    #Network
+    mapping_net, 
+    inverse_net,
+     
+    #Needed objects
+
+    get_data_from_trajectory_id,
+    possible_t_values_per_trajectory,
+    possible_t_values_per_trajectory_val,
+    
+    #Needed pandas dataframes
+    train_df,
+    train_id_df,
+    val_df,
+    val_id_df,
+
+    add_noise,
+    
+
+    #Loss calculation hyperparameters
+    loss_type,
+    predict_full_trajectory,
+
+
+    
+    
+    # Optimizer parameters
+    optimizer_type = 'AdamW',
+    
+    learning_rate=1e-4,
+    weight_decay=1e-6,
+
+    scheduler_type='plateau', 
+    scheduler_params=None,    # Dict of params specific to the scheduler. Set if it is a fresh training session.
+    
+
+    # Training parameters
+    num_epochs=30,
+    grad_clip_value=1.0,
+
+    
+    # Early stopping parameters
+    early_stopping=True,
+    patience=5,
+    min_delta=0.001,
+    
+    # Checkpointing
+    save_dir='./checkpoints',
+    save_best_only=True,
+    save_freq_epochs=1,
+    auto_rescue=True,
+    
+    # Logging
+    log_freq_batches=10,
+    verbose=1,
+    
+    # Device
+    device='cuda',
+    
+    #Used for continuing training from checkpoint, leave all None if it is a fresh training session.
+    optimizer=None, 
+    scheduler=None,  
+    continue_from_epoch=None,
+    best_validation_criterio_loss_till_now=None,
+):
+    
+    """
+    Comprehensive training loop.
+    """
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available. Falling back to CPU.")
+        device = 'cpu'
+    
+    print(f"Using device: {device}")
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    mapping_net.to(device)
+    
+    # Create directory for checkpoints
+    os.makedirs(save_dir, exist_ok=True)
+    
+
+
+    def make_json_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, list):
+            return [make_json_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: make_json_serializable(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    def save_rescue_checkpoint(signal_received=None, frame=None):
+            """Save a rescue checkpoint and exit gracefully if needed"""
+            nonlocal epoch, batch_idx, best_val_loss
+            try:
+                rescue_path = os.path.join(save_dir, f"rescue_checkpoint_epoch_{epoch}_batch_{batch_idx}.pt")
+                print(f"\n\n{'='*50}")
+                if signal_received:
+                    print(f"Signal {signal_received} received. Saving rescue checkpoint...")
+                else:
+                    print(f"Exception detected. Saving rescue checkpoint...")
+                    
+
+                # Save current state  
+                save_checkpoint(rescue_path, mapping_net, optimizer, scheduler, epoch, best_val_loss,
+                               extra_info={'interrupted_at_batch': batch_idx, 'exception': traceback.format_exc()})
+                run_hyperparameters ={}
+                run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
+                run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
+                run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
+                run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
+                run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+                run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
+                run_hyperparameters['add_noise'] = add_noise
+
+
+                
+            
+                n_parameters = count_parameters(mapping_net)
+                run_hyperparameters['model_trainable_parameter_count'] = n_parameters
+            
+                model_n_layers = mapping_net.n_layers
+                run_hyperparameters['model_n_layers'] = model_n_layers
+            
+                model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
+                run_hyperparameters['model_hidden_dims'] = model_hidden_dims
+            
+                model_activation = mapping_net.activation 
+                run_hyperparameters['model_activation'] = model_activation
+            
+                model_activation_params = mapping_net.activation_params 
+                run_hyperparameters['model_activation_params'] = model_activation_params
+            
+                model_final_activation = mapping_net.final_activation 
+                run_hyperparameters['model_final_activation'] = model_final_activation
+
+                model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
+                run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
+
+                model_tanh_wrapper = mapping_net.tanh_wrapper
+                run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
+            
+                model_weight_init = mapping_net.weight_init 
+                run_hyperparameters['model_weight_init'] = model_weight_init
+            
+                model_weight_init_params = mapping_net.weight_init_params 
+                run_hyperparameters['model_weight_init_params'] = model_weight_init_params
+            
+                model_bias_init = mapping_net.bias_init 
+                run_hyperparameters['model_bias_init'] = model_bias_init
+            
+                model_bias_init_value = mapping_net.bias_init_value 
+                run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+                model_use_layer_norm = mapping_net.use_layer_norm 
+                run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
+                
+            
+                model_a_eps_min = mapping_net.a_eps_min 
+                run_hyperparameters['model_a_eps_min'] = model_a_eps_min
+            
+                model_a_eps_max = mapping_net.a_eps_max
+                run_hyperparameters['model_a_eps_max'] = model_a_eps_max
+                
+                model_a_k = mapping_net.a_k
+                run_hyperparameters['model_a_k'] = model_a_k
+
+                model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
+                run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
+
+                model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
+                run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
+
+                model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
+                run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
+
+
+                model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
+                run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
+
+                model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
+                run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
+
+
+
+                model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
+                run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
+
+                model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
+                run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
+
+                model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
+                run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
+
+
+                model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
+
+                model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
+
+                model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
+
+                model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
+
+                model_bound_innit = mapping_net.bound_innit
+                run_hyperparameters['model_bound_innit'] = model_bound_innit
+            
+
+                run_hyperparameters['loss_type'] = loss_type
+                run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
+
+
+                run_hyperparameters['grad_clip_value'] = grad_clip_value
+                
+            
+            
+                with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch}.json"), "w") as f:
+                    # Convert any non-serializable objects
+                    serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
+                    json.dump(serializable_run_hyperparameters, f, indent=2)
+
+                print(f"Rescue checkpoint saved to: {rescue_path}")
+                print(f"You can resume training from this checkpoint later.")
+                print(f"{'='*50}\n")
+
+                if signal_received:  # If this was triggered by a signal, exit
+                    sys.exit(0)
+
+            except Exception as e:
+                print(f"Failed to save rescue checkpoint: {e}")
+                
+    epoch = 0 if continue_from_epoch is None else continue_from_epoch
+    batch_idx = 0
+    
+    if auto_rescue:
+        signal.signal(signal.SIGINT, save_rescue_checkpoint)  # Ctrl+C
+        signal.signal(signal.SIGTERM, save_rescue_checkpoint)  # Termination request
+    
+
+    train_batches = train_loader.dataset.total_batches
+    val_batches = len(val_loader)
+
+    
+    
+    # Create parameter lists 
+    mlp_params = []
+    transform_params = []
+    scale_params = []
+
+    for name, param in mapping_net.named_parameters():
+        if ('G_network' in name) or ('F_network' in name):
+            mlp_params.append(param)
+        elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
+            scale_params.append(param)
+        else: #c1, c2, gamma
+            transform_params.append(param)
+        
+    
+
+
+
+    
+
+
+    if optimizer==None:
+        if optimizer_type == 'Adam':
+            print(f"Initializing new Adam optimizer with learning rate: {learning_rate}")
+            optimizer = Adam([
+                {'params': mlp_params, 'lr': learning_rate},
+                {'params': scale_params, 'lr': learning_rate},
+                {'params': transform_params, 'lr': learning_rate},
+            ])
+        elif optimizer_type == 'AdamW':
+            print(f"Initializing new AdamW optimizer with learning rate: {learning_rate}, and weight decay {weight_decay}")
+            optimizer = AdamW([
+                {'params': mlp_params, 'weight_decay': weight_decay},
+                {'params': scale_params, 'weight_decay': 0.0},
+                {'params': transform_params, 'weight_decay': 0.0},
+            ], lr=learning_rate)  
+        else:
+            raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")       
+    
+    # Create scheduler if requested
+    if scheduler==None:
+        print(f"Initializing new scheduler: {scheduler_type} with params: {scheduler_params}")
+
+        if scheduler_type == 'plateau':
+            scheduler_params = scheduler_params or {'mode': 'min', 'factor': 0.1, 'patience': 5, 'verbose': verbose > 0}
+            scheduler = ReduceLROnPlateau(optimizer, **scheduler_params)
+        else:
+            raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
+
+    if (optimizer is not None) and (learning_rate != optimizer.param_groups[0]['lr']):
+        optimizer.param_groups[0]['lr'] = learning_rate
+        print(f"Manually resetting loaded optimizer's learning rate to {optimizer.param_groups[0]['lr']}")
+
+    if (optimizer is not None) and (weight_decay != optimizer.param_groups[0]['weight_decay']):
+        optimizer.param_groups[0]['weight_decay'] = weight_decay
+        print(f"Manually resetting loaded optimizer's weight decay to {optimizer.param_groups[0]['weight_decay']}")
+        
+    # Initialize early stopping variables
+    best_val_loss = float('inf')
+    if best_validation_criterio_loss_till_now is not None:
+        best_val_loss = best_validation_criterio_loss_till_now
+    patience_counter = 0
+    
+
+    
+    # Define a function to run the forward pass
+    def forward_pass(batch, predict_full_trajectory, add_noise):
+        if add_noise:
+            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
+            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
+        
+        else:
+            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
+
+
+
+
+        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs_for_real_pendulum_2(
+            X_final, U_final, 
+            t_batch=batch['t'], 
+            trajectory_ids=batch['trajectory_ids'], 
+            possible_t_values_per_trajectory=possible_t_values_per_trajectory,
+            stats=None,
+            predict_full_trajectory=predict_full_trajectory)
+
+        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
+
+        X_labels, U_labels, _ = generate_prediction_labels_for_real_pendulum_2(
+                train_df=train_df, 
+                train_id_df=train_id_df, 
+                trajectory_ids=batch['trajectory_ids'], 
+                t_for_pred=t_for_pred, 
+                get_data_from_trajectory_id=get_data_from_trajectory_id,
+                predict_full_trajectory=predict_full_trajectory,  
+                possible_t_values_per_trajectory=possible_t_values_per_trajectory,
+            )
+
+            
+        prediction_loss_ = prediction_loss(
+                x_pred=x_pred, 
+                u_pred=u_pred, 
+                X_labels=X_labels, 
+                U_labels=U_labels,
+                loss_type=loss_type
+            )
+
+
+        return prediction_loss_
+    
+    
+    
+    def validation_forward_pass(batch, val_df, val_id_df):
+        X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
+
+        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs_for_real_pendulum_2(
+            X_final, U_final, 
+            t_batch=batch['t'], 
+            trajectory_ids=batch['trajectory_ids'], 
+            possible_t_values_per_trajectory=possible_t_values_per_trajectory_val,
+            stats=None,
+            predict_full_trajectory=predict_full_trajectory)
+
+        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
+
+        X_labels, U_labels, _ = generate_prediction_labels_for_real_pendulum_2(
+        train_df=val_df, 
+        train_id_df=val_id_df, 
+        trajectory_ids=batch['trajectory_ids'], 
+        t_for_pred=t_for_pred, 
+        get_data_from_trajectory_id=get_data_from_trajectory_id,
+        predict_full_trajectory=predict_full_trajectory,  
+        possible_t_values_per_trajectory=possible_t_values_per_trajectory_val,
+
+        )
+
+        prediction_loss_ = prediction_loss(
+                x_pred=x_pred, 
+                u_pred=u_pred, 
+                X_labels=X_labels, 
+                U_labels=U_labels,
+                loss_type=loss_type
+            )
+        return prediction_loss_.item()
+    
+
+    # Training loop
+    start_epoch=0
+    if continue_from_epoch is not None:
+        start_epoch=continue_from_epoch
+        
+    try:
+        for epoch in range(start_epoch, start_epoch+num_epochs):
+                # Initialize epoch_metrics
+
+            if epoch > start_epoch and randomize_each_epoch_plan:
+                train_loader.dataset.on_epoch_start()
+
+
+            epoch_metrics = {}
+            epoch_start_time = time.time()
+
+            
+
+            # Set all models to training mode
+            mapping_net.train()
+            # Initialize metrics
+
+            train_prediction_loss_ = 0.0
+            mean_grad_norm_ = 0.0
+            percentage_of_batches_clipped_in_epoch = 0.0
+            batch_count = 0
+
+            # Progress tracking
+            if verbose > 0:
+                print(f"\n{'='*20} Epoch {epoch}/{start_epoch+num_epochs} {'='*20}")
+
+            # Training loop
+            for batch_idx, batch in enumerate(train_loader):
+
+                optimizer.zero_grad()
+
+                # Run forward pass
+                prediction_loss_ = forward_pass(batch, predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
+
+
+                if torch.isnan(prediction_loss_) or torch.isinf(prediction_loss_):
+                    print(f"Invalid prediction_loss_ value: {prediction_loss_.item()}, skipping batch")
+                    continue
+                # Backward pass
+                prediction_loss_.backward()
+                
+                
+                for name, param in mapping_net.named_parameters():
+                    if param.grad is not None:
+                        # Replace NaN gradients with zeros
+                        if torch.isnan(param.grad).any():
+                            print(f"NaN gradients detected in {name}")
+                            param.grad[torch.isnan(param.grad)] = 0.0
+                        # Replace inf gradients
+                        if torch.isinf(param.grad).any():
+                            print(f"Inf gradients detected in {name}")
+                            param.grad[torch.isinf(param.grad)] = 0.0
+                        # Check for extreme gradients
+                        if verbose>1:
+                            grad_norm_print = param.grad.norm().item()
+                            if grad_norm_print > 10.0:  # Threshold for reporting
+                                print(f"High gradient norm in {name}: {grad_norm_print}")
+                            if grad_norm_print < 0.00001:  
+                                print(f"Low gradient norm in {name}: {grad_norm_print}")
+
+                # Gradient clipping
+                if grad_clip_value is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(mlp_params+scale_params+transform_params, grad_clip_value)
+                    if (grad_norm>grad_clip_value):
+                        percentage_of_batches_clipped_in_epoch += 1.0
+                        if verbose>0:
+                            print(f"Grad clipping activated, grad_norm before clipping: {grad_norm}")
+
+
+                # Optimizer step
+                optimizer.step()
+
+                # Update metrics
+                if grad_clip_value is not None:
+                    mean_grad_norm_ += grad_norm.item()
+                
+
+                train_prediction_loss_ += prediction_loss_.item()
+                batch_count += 1
+
+                # Log progress
+                if verbose > 0 and batch_idx % log_freq_batches == 0:
+                    print(f"Batch {batch_idx}/{train_batches} - Prediction Loss: {prediction_loss_.item():.4f}")
+                    if grad_clip_value is not None:
+                        print(f"Grad norm of batch: {grad_norm.item():.4f}\n")
+
+
+                        
+                
+            # Calculate epoch metrics
+            mean_grad_norm_ /= max(1, batch_count)
+            train_prediction_loss_ /= max(1, batch_count)
+            percentage_of_batches_clipped_in_epoch /= max(1, batch_count)
+
+            # Validation phase
+            val_prediction_loss_ = 0.0
+            val_batch_count = 0
+
+
+            # Set model to evaluation mode
+            mapping_net.eval()
+            
+            epoch_saving_path = os.path.join(save_dir, f"epoch_{epoch}")
+            
+            val_trajectories_dir = os.path.join(epoch_saving_path, f"val_trajectories_data")
+            os.makedirs(val_trajectories_dir, exist_ok=True)
+
+
+
+            
+            
+            # Validation loop
+
+            print("Begining validation phase")
+            for batch_idx, batch in enumerate(val_loader):
+                # Run forward pass
+                prediction_loss_ = validation_forward_pass(batch, val_df=val_df, val_id_df=val_id_df)
+                # Update metrics
+                if prediction_loss_ is not None:
+                    val_prediction_loss_ += prediction_loss_
+                    if verbose > 0 and batch_idx % log_freq_batches == 0:
+                        print(f"Batch {batch_idx}/{val_batches} - Prediction Loss: {prediction_loss_:.4f}")
+                        
+                        
+                        
+                val_batch_count += 1
+                    
+                    
+
+                    
+            # Calculate validation metrics
+
+            val_prediction_loss_ /= max(1, val_batch_count)
+
+
+
+
+            #
+
+
+            # Update epoch_metrics
+            epoch_metrics['epoch'] = epoch
+
+
+            
+            epoch_metrics['percentage_of_batches_clipped_in_epoch'] = percentage_of_batches_clipped_in_epoch*100
+            epoch_metrics['mean_grad_norm_'] = mean_grad_norm_
+
+            epoch_metrics['train_prediction_loss_'] = train_prediction_loss_
+
+            epoch_metrics['val_prediction_loss_'] = val_prediction_loss_
+            
+
+            
+
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            epoch_metrics['learning_rates'] = current_lr
+
+
+            validation_criterio = val_prediction_loss_
+            epoch_metrics['validation_criterio'] = validation_criterio
+
+            if validation_criterio < best_val_loss - min_delta:
+                best_val_loss = validation_criterio
+                epoch_metrics['best_validation_criterio_loss_till_now'] = validation_criterio
+                print(f"Found best validation criterio loss till now:{validation_criterio:.4f}, on epoch {epoch}")
+
+                # Save best model (whether early_stopping is enabled or not)
+                best_model_path = os.path.join(save_dir, "best_model.pt")
+                save_checkpoint(best_model_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
+                if verbose > 0:
+                    print(f"New best model saved with val_loss: {best_val_loss:.4f}")
+
+                patience_counter = 0
+            else:
+                epoch_metrics['best_validation_criterio_loss_till_now'] = best_val_loss
+                if early_stopping:
+                    patience_counter += 1
+                    if verbose > 0:
+                        print(f"Early stopping patience: {patience_counter}/{patience}")
+                
+            with open(os.path.join(epoch_saving_path, "epoch_metrics.json"), "w") as f:
+                # Convert any non-serializable objects
+                serializable_epoch_metrics = make_json_serializable(epoch_metrics)
+                json.dump(serializable_epoch_metrics, f, indent=2)
+            
+            # Step the scheduler if it exists
+            if scheduler is not None:
+                if scheduler_type == 'plateau':
+                    scheduler.step(validation_criterio)  # Pass validation loss to plateau scheduler
+                else:
+                    scheduler.step()
+
+            # Time taken for epoch
+            epoch_time = time.time() - epoch_start_time
+
+            # Print epoch summary
+            if verbose > 0:
+                print(f"\nEpoch {epoch}/{start_epoch+num_epochs} completed in {epoch_time:.2f}s")
+
+
+                print(f"Percentage of batches clipped in epoch: {percentage_of_batches_clipped_in_epoch*100:.1f}%")
+                if grad_clip_value is not None:
+                    print(f"Mean grad norm: {mean_grad_norm_:.4f}")
+
+                print(f"Mean prediction train loss: {train_prediction_loss_:.4f}")
+                
+                
+
+                print(f"Mean prediction val loss: {val_prediction_loss_:.4f}")
+                
+  
+                
+                print(f"Validation criterio: {validation_criterio:.4f}")    
+                
+                print(f"Learning Rate: {current_lr:.6f}")
+
+
+
+            # Save checkpoint if needed
+            if (epoch) % save_freq_epochs == 0 :
+                if not save_best_only:
+                    checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
+                    save_checkpoint(checkpoint_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
+                    if verbose > 0:
+                        print(f"Checkpoint saved to {checkpoint_path}")
+
+            # Early stopping check
+            if early_stopping and patience_counter >= patience:
+                if verbose > 0:
+                    print(f"Early stopping triggered in epoch: {epoch}")
+                break
+
+        run_hyperparameters ={}
+
+        run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
+        run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
+        run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
+        run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
+        run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+        run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
+        run_hyperparameters['add_noise'] = add_noise 
+
+
+
+
+
+
+        
+        n_parameters = count_parameters(mapping_net)
+        run_hyperparameters['model_trainable_parameter_count'] = n_parameters
+
+        model_n_layers = mapping_net.n_layers
+        run_hyperparameters['model_n_layers'] = model_n_layers
+
+        model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
+        run_hyperparameters['model_hidden_dims'] = model_hidden_dims
+
+        model_activation = mapping_net.activation 
+        run_hyperparameters['model_activation'] = model_activation
+
+        model_activation_params = mapping_net.activation_params 
+        run_hyperparameters['model_activation_params'] = model_activation_params
+
+        model_final_activation = mapping_net.final_activation 
+        run_hyperparameters['model_final_activation'] = model_final_activation
+
+        model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
+        run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
+
+        model_tanh_wrapper = mapping_net.tanh_wrapper
+        run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
+
+        model_weight_init = mapping_net.weight_init 
+        run_hyperparameters['model_weight_init'] = model_weight_init
+
+        model_weight_init_params = mapping_net.weight_init_params 
+        run_hyperparameters['model_weight_init_params'] = model_weight_init_params
+
+        model_bias_init = mapping_net.bias_init 
+        run_hyperparameters['model_bias_init'] = model_bias_init
+
+        model_bias_init_value = mapping_net.bias_init_value 
+        run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+        model_use_layer_norm = mapping_net.use_layer_norm 
+        run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
+
+        model_a_eps_min = mapping_net.a_eps_min 
+        run_hyperparameters['model_a_eps_min'] = model_a_eps_min
+
+        model_a_eps_max = mapping_net.a_eps_max
+        run_hyperparameters['model_a_eps_max'] = model_a_eps_max
+
+        model_a_k = mapping_net.a_k
+        run_hyperparameters['model_a_k'] = model_a_k
+
+
+        model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
+        run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
+
+        model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
+        run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
+
+        model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
+        run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
+
+
+        model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
+        run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
+
+        model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
+        run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
+
+
+
+        model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
+        run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
+
+        model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
+        run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
+
+        model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
+        run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
+
+
+        model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
+
+        model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
+
+        model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
+
+        model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
+
+
+
+        model_bound_innit = mapping_net.bound_innit
+        run_hyperparameters['model_bound_innit'] = model_bound_innit
+
+
+        run_hyperparameters['grad_clip_value'] = grad_clip_value
+    
+
+
+        with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch+1}.json"), "w") as f:
+            # Convert any non-serializable objects
+            serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
+            json.dump(serializable_run_hyperparameters, f, indent=2)
+            
+    except Exception as e:
+        if auto_rescue:
+            print(f"\nTraining interrupted by exception: {e}")
+            save_rescue_checkpoint()
+        raise  # Re-raise the exception after saving
+    
+
+
+
+    finally:
+        try:
+            if 'epoch' in locals():
+                # Always save a final checkpoint regardless of how training ended
+                final_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
+                save_checkpoint(final_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
+                if verbose > 0:
+                    print(f"\nFinal state saved to {final_path}")
+            else:
+                print("Exception before epoch loop began")
+        except Exception as e:
+            print(f"Failed to save final checkpoint: {e}")
+
+    # Training complete
+    if verbose > 0:
+        print("\nTraining completed!")
+        print(f"Best validation loss: {best_val_loss:.4f}")
+    
+
+    
+    return 
+
+
+def resume_training_from_checkpoint_real_pendulum(
+    # Checkpoint to resume from
+    checkpoint_path,
+    
+    # Dataloaders
+    train_loader,
+    randomize_each_epoch_plan,
+    val_loader,
+
+    
+    # Network
+    mapping_net,  # inverse_net is created automatically from mapping_net
+    
+    # Needed objects
+
+    get_data_from_trajectory_id,
+    possible_t_values_per_trajectory,
+    possible_t_values_per_trajectory_val,
+    
+    # Needed pandas dataframes
+    train_df,
+    train_id_df,
+    val_df,
+    val_id_df,
+
+    add_noise,
+    
+    # Loss calculation hyperparameters
+
+    predict_full_trajectory,
+    loss_type,
+
+
+    
+    # === RESUME MODE SELECTION ===
+    # MODE A (load_scheduler_and_optimizer=True): Resume with exact optimizer/scheduler state
+    
+    #   - learning_rate: Set to None to use checkpoint LR, or specify to override
+    #   - optimizer_type: MUST match the type used in original training
+    #   - scheduler_type: MUST match the type used in original training
+    #   - scheduler_params: MUST match the params used in original training
+    #
+    # MODE B (load_scheduler_and_optimizer=False): Resume with fresh optimizer/scheduler
+
+    #   - learning_rate: REQUIRED - must specify, will error if None
+    #   - optimizer_type: Can be different from original
+    #   - scheduler_type: Can be different from original
+    #   - scheduler_params: Can be different from original
+    load_scheduler_and_optimizer=False,
+    
+    # Optimizer parameters
+    learning_rate=None,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
+    weight_decay=None,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
+    optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
+    
+    # Scheduler parameters  
+    scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
+    scheduler_params=None,  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+    reset_scheduler_patience = False, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
+    
+    # Training parameters
+    num_epochs=30,  # Number of ADDITIONAL epochs to train (not total epochs)
+    grad_clip_value=3.0,
+    
+    # Early stopping parameters
+    early_stopping=False,
+    patience=20,
+    min_delta=0.001,
+    
+    # Checkpointing
+    save_dir='./checkpoints',  # Should typically match the directory where checkpoint_path is located
+    save_best_only=False,
+    save_freq_epochs=2,
+    auto_rescue=True,
+    
+    # Logging
+    log_freq_batches=50,
+    verbose=2,
+    
+    # Device
+    device='cuda'
+    ):
+    """Resume training from a checkpoint"""
+    if load_scheduler_and_optimizer:
+        mlp_params = []
+        transform_params = []
+        scale_params = []
+
+        for name, param in mapping_net.named_parameters():
+            if ('G_network' in name) or ('F_network' in name):
+                mlp_params.append(param)
+            elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
+                scale_params.append(param)
+            else: #c1, c2, gamma
+                transform_params.append(param)
+
+        if optimizer_type == 'Adam':
+            temp_optimizer = Adam(mlp_params+scale_params+transform_params)
+        elif optimizer_type == 'AdamW':
+            temp_optimizer = AdamW([
+                {'params': mlp_params, 'weight_decay': weight_decay},
+                {'params': scale_params, 'weight_decay': 0.0},
+                {'params': transform_params, 'weight_decay': weight_decay},
+            ])
+
+        temp_scheduler = ReduceLROnPlateau(temp_optimizer, mode='min', factor=0.1, patience=5, verbose=True) #Will be overwritten
+        # Load checkpoint
+        epoch, extra_info, best_val_loss = load_checkpoint(
+            checkpoint_path, mapping_net, device, temp_optimizer, temp_scheduler
+        )
+
+        # Override scheduler params if specified
+        if scheduler_params is not None:
+            print(f"Overriding scheduler params: {scheduler_params}")
+            for key, value in scheduler_params.items():
+                if hasattr(temp_scheduler, key):
+                    setattr(temp_scheduler, key, value)
+                    print(f"  {key}: {getattr(temp_scheduler, key)} -> {value}")
+                else:
+                    print(f"  Warning: scheduler has no attribute '{key}'")
+        else:
+            if hasattr(temp_scheduler, 'patience'):  # ReduceLROnPlateau
+                print("Using loaded scheduler")
+                print(f"  factor: {temp_scheduler.factor}")
+                print(f"  mode: {temp_scheduler.mode}")
+                print(f"  threshold: {temp_scheduler.threshold}")
+                print(f"  cooldown: {temp_scheduler.cooldown}")
+                print(f"  best: {temp_scheduler.best}")
+
+
+        # Reset scheduler patience counter if requested
+        if reset_scheduler_patience:
+            temp_scheduler.num_bad_epochs = 0
+            temp_scheduler.cooldown_counter = 0
+            print(f"Reset scheduler patience counter. Will wait full {temp_scheduler.patience} epochs before reducing LR.")
+        else:
+            # Calculate remaining epochs until LR reduction
+            if temp_scheduler.cooldown_counter > 0:
+                print(f"Scheduler in cooldown mode: {temp_scheduler.cooldown_counter} epochs remaining in cooldown")
+            elif temp_scheduler.num_bad_epochs >= temp_scheduler.patience:
+                print(f"Scheduler ready to reduce LR on next bad epoch (num_bad_epochs={temp_scheduler.num_bad_epochs} >= patience={temp_scheduler.patience})")
+            else:
+                remaining_epochs = temp_scheduler.patience - temp_scheduler.num_bad_epochs
+                print(f"Scheduler status: {temp_scheduler.num_bad_epochs}/{temp_scheduler.patience} bad epochs. Will reduce LR after {remaining_epochs} more bad epochs.")
+
+    else:
+        epoch, extra_info, best_val_loss = load_checkpoint(
+            checkpoint_path, mapping_net, device, None, None
+        )
+
+    if extra_info and 'interrupted_at_batch' in extra_info:
+        continue_from_epoch = epoch
+        print(f"Resuming incomplete epoch {epoch}")
+        if 'exception' in extra_info:
+            print(f"Previous training was interrupted by exception:\n{extra_info['exception']}")
+    else:
+        continue_from_epoch = epoch + 1
+        print(f"Epoch {epoch} was completed, starting from epoch {epoch + 1}")
+    
+    # Use the learning rate from checkpoint if not specified
+    if (learning_rate is None):
+        if load_scheduler_and_optimizer:
+            learning_rate = temp_optimizer.param_groups[0]['lr']
+            print(f"Using learning rate from checkpoint: {learning_rate}")
+        else:
+            print("When load_scheduler_and_optimizer=False you should set Learning Rate")
+            sys.exit(1)
+
+    if (weight_decay is None):
+        if load_scheduler_and_optimizer:
+            weight_decay = temp_optimizer.param_groups[0]['weight_decay']
+            print(f"Using weight decay from checkpoint: {weight_decay}")
+        else:
+            print("When load_scheduler_and_optimizer=False you should set Weight Decay")
+            sys.exit(1)
+            
+    inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
+    
+    # Train for additional epochs
+    print(f"Training for {num_epochs} additional epochs (epochs {continue_from_epoch} to {continue_from_epoch + num_epochs - 1})")
+    
+    # Resume training with the loaded state
+    if load_scheduler_and_optimizer:
+        return train_model_real_pendulum(
+            # Dataloaders
+            train_loader=train_loader,
+            randomize_each_epoch_plan=randomize_each_epoch_plan,
+            val_loader=val_loader,
+
+            
+            # Network
+            mapping_net=mapping_net, 
+            inverse_net=inverse_net,
+            
+            # Needed objects
+
+            get_data_from_trajectory_id=get_data_from_trajectory_id,
+            possible_t_values_per_trajectory=possible_t_values_per_trajectory,
+            possible_t_values_per_trajectory_val=possible_t_values_per_trajectory_val,
+            
+            # Needed pandas dataframes
+            train_df=train_df,
+            train_id_df=train_id_df,
+            val_df=val_df,
+            val_id_df=val_id_df,
+
+            add_noise=add_noise,
+            
+            # Loss calculation hyperparameters
+
+            predict_full_trajectory=predict_full_trajectory,
+            loss_type=loss_type,
+
+
+            
+            # Optimizer parameters - using loaded states
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            optimizer=temp_optimizer,  # Loaded from checkpoint
+            optimizer_type=optimizer_type,
+            scheduler=temp_scheduler,  # Loaded from checkpoint
+            scheduler_type=scheduler_type,
+            scheduler_params=scheduler_params,
+            
+            # Training parameters
+            num_epochs=num_epochs,
+            grad_clip_value=grad_clip_value,
+            continue_from_epoch=continue_from_epoch,
+            best_validation_criterio_loss_till_now=best_val_loss,  # Loaded from checkpoint
+            
+            # Early stopping parameters
+            early_stopping=early_stopping,
+            patience=patience,
+            min_delta=min_delta,
+            
+            # Checkpointing
+            save_dir=save_dir,
+            save_best_only=save_best_only,
+            save_freq_epochs=save_freq_epochs,
+            auto_rescue=auto_rescue,
+            
+            # Logging
+            log_freq_batches=log_freq_batches,
+            verbose=verbose,
+            
+            # Device
+            device=device,
+        )
+    else:
+        return train_model_real_pendulum(
+            # Dataloaders
+            train_loader=train_loader,
+            randomize_each_epoch_plan=randomize_each_epoch_plan,
+            val_loader=val_loader,
+
+            
+            # Network
+            mapping_net=mapping_net, 
+            inverse_net=inverse_net,
+            
+            # Needed objects
+
+            get_data_from_trajectory_id=get_data_from_trajectory_id,
+            possible_t_values_per_trajectory=possible_t_values_per_trajectory,
+            possible_t_values_per_trajectory_val=possible_t_values_per_trajectory_val,
+            
+            # Needed pandas dataframes
+            train_df=train_df,
+            train_id_df=train_id_df,
+            val_df=val_df,
+            val_id_df=val_id_df,
+
+            add_noise=add_noise,
+            
+            # Loss calculation hyperparameters
+
+            predict_full_trajectory=predict_full_trajectory,
+            loss_type=loss_type,
+
+
+
+            
+            # Optimizer parameters - creating fresh
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            optimizer=None,  # Create fresh optimizer
+            optimizer_type=optimizer_type,
+            scheduler=None,  # Create fresh scheduler
+            scheduler_type=scheduler_type,
+            scheduler_params=scheduler_params,
+            
+            # Training parameters
+            num_epochs=num_epochs,
+            grad_clip_value=grad_clip_value,
+            continue_from_epoch=continue_from_epoch,
+            best_validation_criterio_loss_till_now=best_val_loss,  # Loaded from checkpoint
+            
+            # Early stopping parameters
+            early_stopping=early_stopping,
+            patience=patience,
+            min_delta=min_delta,
+            
+            # Checkpointing
+            save_dir=save_dir,
+            save_best_only=save_best_only,
+            save_freq_epochs=save_freq_epochs,
+            auto_rescue=auto_rescue,
+            
+            # Logging
+            log_freq_batches=log_freq_batches,
+            verbose=verbose,
+            
+            # Device
+            device=device,
+        )
+    
 
 def save_checkpoint(path, mapping_net, optimizer, scheduler, epoch, best_val_loss, extra_info=None):
     """Save a checkpoint with all model states and training information."""
@@ -4414,12 +5814,16 @@ def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_traject
     plt.tight_layout()
     plt.show()
 
-def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id, 
-                                     point_indexes_observed=None, show_zeroings=False,
-                                     show_period=False, period=None,
-                                     figsize=(12, 6)):
+
+
+
+
+def plot_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id, 
+                           point_indexes_observed=None, show_zeroings=False,
+                           show_period=False, period=None,
+                           loss_type="euclidean", figsize=(12, 6)):
     """
-    Plot the Euclidean distance between predicted and ground truth values over time.
+    Plot the distance between predicted and ground truth values over time.
     
     Args:
         x: Ground truth positions, shape (n_points,)
@@ -4432,26 +5836,41 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
         show_zeroings: If True, show vertical lines where x or u cross zero
         show_period: If True, show vertical lines at periodic intervals
         period: Period value for periodic markers (required if show_period=True)
+        loss_type: Type of distance metric - "euclidean", "mae", or "mse"
         figsize: Figure size tuple
     """
-
     
     # Validate period argument
     if show_period and period is None:
         raise ValueError("period must be provided when show_period=True")
     
-    # Compute Euclidean distance at each time point
-    euclidean_distances = torch.sqrt((x_pred - x) ** 2 + (u_pred - u) ** 2)
+    # Validate loss_type argument
+    if loss_type not in ["euclidean", "mae", "mse"]:
+        raise ValueError("loss_type must be one of: 'euclidean', 'mae', or 'mse'")
+    
+    # Compute distance based on loss_type
+    if loss_type == "euclidean":
+        distances = torch.sqrt((x_pred - x) ** 2 + (u_pred - u) ** 2)
+        distance_label = "Euclidean Distance"
+        ylabel = "Euclidean Distance in Phase Space"
+    elif loss_type == "mae":
+        distances = torch.abs(x_pred - x) + torch.abs(u_pred - u)
+        distance_label = "MAE Distance"
+        ylabel = "MAE (Mean Absolute Error) in Phase Space"
+    elif loss_type == "mse":
+        distances = (x_pred - x) ** 2 + (u_pred - u) ** 2
+        distance_label = "MSE Distance"
+        ylabel = "MSE (Mean Squared Error) in Phase Space"
     
     # Convert to numpy for plotting
     t_np = t.cpu().numpy()
-    distances_np = euclidean_distances.cpu().detach().numpy()
+    distances_np = distances.cpu().detach().numpy()
     x_np = x.cpu().numpy()
     u_np = u.cpu().numpy()
     
     # Create the plot
     fig, ax = plt.subplots(figsize=figsize)
-    ax.plot(t_np, distances_np, linewidth=2, color='blue', label='Euclidean Distance')
+    ax.plot(t_np, distances_np, linewidth=2, color='blue', label=distance_label)
     
     # Add a bit of padding to x-axis (5% on each side)
     t_range = t_np.max() - t_np.min()
@@ -4529,7 +5948,7 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
     # Highlight observed points if provided
     if point_indexes_observed is not None:
         t_observed = t[point_indexes_observed].cpu().numpy()
-        distances_observed = euclidean_distances[point_indexes_observed].cpu().detach().numpy()
+        distances_observed = distances[point_indexes_observed].cpu().detach().numpy()
         ax.scatter(t_observed, distances_observed, color='red', s=100, zorder=5, 
                    label='Observed Points', marker='o', edgecolors='black', linewidth=1.5)
         
@@ -4563,7 +5982,7 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
                 pass
     
     ax.set_xlabel('Time (t)', fontsize=12)
-    ax.set_ylabel('Euclidean Distance in Phase Space', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(f'Prediction Error Over Time - Trajectory {trajectory_id}', fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -4571,12 +5990,11 @@ def plot_euclidean_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id,
     # Add mean distance as a horizontal line
     mean_distance = distances_np.mean()
     ax.axhline(y=mean_distance, color='green', linestyle='--', linewidth=1.5, 
-               label=f'Mean Distance: {mean_distance:.4f}')
+               label=f'Mean {loss_type.upper()}: {mean_distance:.4f}')
     ax.legend()
     
     plt.tight_layout()
     plt.show()
-
 
 def ensemble_autoregressive_prediction_mahalanobis(
     x, 
@@ -6047,7 +7465,7 @@ def ensemble_autoregressive_prediction_gaussian_mixture_simple(
 
 def test_model_in_single_trajectory(
     get_data_from_trajectory_id_function, 
-    prediction_loss_function, 
+    loss_type, 
     test_id_df, 
     test_df, 
     trajectory_id, 
@@ -6071,7 +7489,8 @@ def test_model_in_single_trajectory(
     max_n_components=5,
     search_range_lower_pct=0.5,
     search_range_upper_pct=0.6,
-    verbose=False
+    verbose=False,
+    plot=True,
 ):
     """
     Test model on a single trajectory.
@@ -6288,9 +7707,17 @@ def test_model_in_single_trajectory(
                 print(f"Total forward passes: {stats['total_forward_passes']}")
                 print(f"Coverage: {stats['coverage_pct']:.1f}%")
         
-        pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+        if loss_type=="euclidean":
+            pred_loss_full_trajectory = prediction_loss_euclidean(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+        elif loss_type=="mae":
+            pred_loss_full_trajectory = prediction_loss(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, loss_type=loss_type)
+        elif loss_type=="mse":
+            pred_loss_full_trajectory = prediction_loss(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, loss_type=loss_type)
+        if plot==False:
+            return pred_loss_full_trajectory
+        
         plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points, portion_to_visualize=portion_to_visualize)
-        plot_euclidean_distance_over_time(x=x, u=u, x_pred=x_pred, u_pred=u_pred, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, show_zeroings=show_zeroings, show_period=show_period, period=period)
+        plot_distance_over_time(x=x, u=u, x_pred=x_pred, u_pred=u_pred, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, show_zeroings=show_zeroings, show_period=show_period, period=period, loss_type=loss_type)
 
 def analyze_means_with_constants(
     save_dir_path,
