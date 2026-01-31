@@ -1993,7 +1993,7 @@ def prepare_prediction_inputs(
     """Prepare prediction inputs - uses precomputed stats"""
     
     device = X_final.device
-    batch_size = X_final.shape[0]
+
     
     # Use precomputed stats if available
     if stats is None:
@@ -2587,7 +2587,7 @@ def prediction_loss_euclidean(
     """
     euclidean_distances = torch.sqrt((x_pred - X_labels) ** 2 + (u_pred - U_labels) ** 2)
     return torch.mean(euclidean_distances)
-
+'''
 def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_loss, prediction_loss, 
                       mapping_coefficient, repulsion_coefficient, prediction_coefficient,
                       mapping_loss_scale, prediction_loss_scale, hsic_loss_slope,
@@ -2657,7 +2657,38 @@ def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_l
     )
     
     return total_loss
+'''
 
+def compute_total_loss(hsic_loss, prediction_loss, prediction_coefficient,
+                      prediction_loss_scale, hsic_loss_slope):
+    """
+    Compute final total loss with scale normalization and gradient-safe safety switch.
+    
+    Args:
+        prediction_loss: Raw prediction loss tensor (with gradients)
+        prediction_coefficient: Fixed weight for prediction loss (float, no gradients)
+        prediction_loss_scale: Fixed scale for prediction loss normalization (float, no gradients)
+
+        
+    Returns:
+        total_loss: Final weighted and scaled loss tensor (gradients flow back to input losses)
+    """
+    
+    # Scale mapping and prediction losses by fixed scales (gradients preserved)
+
+    prediction_loss_scaled = prediction_loss / prediction_loss_scale
+
+    
+
+    hsic_loss_scaled = hsic_loss * hsic_loss_slope
+    
+    
+    # Combine all losses with coefficients
+    total_loss = (
+        hsic_loss_scaled + prediction_coefficient * prediction_loss_scaled
+        )
+    
+    return total_loss
 
 class TrajectoryDataset(Dataset):
     """
@@ -2940,6 +2971,1377 @@ def generate_validation_labels_single_trajectory(
     
     return X_val_labels, U_val_labels, t_val_labels
 
+
+def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, predict_full_trajectory, add_noise, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
+    mapping_net.to(device)
+    mapping_net.eval()
+
+    def forward_pass_for_rescaling(batch,predict_full_trajectory, add_noise):
+        if add_noise:
+            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
+            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
+        
+        else:
+            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
+        X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
+
+        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs(
+            X_final, U_final, 
+            t_batch=batch['t'], 
+            trajectory_ids=batch['trajectory_ids'], 
+            possible_t_values=possible_t_values,
+            stats=None,
+            predict_full_trajectory=predict_full_trajectory)
+        
+        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
+
+        X_labels, U_labels, _ = generate_prediction_labels(
+                train_df=train_df, 
+                train_id_df=train_id_df, 
+                trajectory_ids=batch['trajectory_ids'], 
+                t_for_pred=t_for_pred, 
+                get_data_from_trajectory_id=get_data_from_trajectory_id,
+                predict_full_trajectory=predict_full_trajectory,
+                possible_t_values=possible_t_values,
+            )
+        if normalized_mse:
+            prediction_loss_ = trajectory_normalized_mse(
+            x_pred=x_pred, 
+            u_pred=u_pred, 
+            X_labels=X_labels, 
+            U_labels=U_labels,
+            trajectory_ids=batch['trajectory_ids']
+            )           
+
+        else:
+            prediction_loss_ = prediction_loss(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels,
+                    loss_type=loss_type
+                )
+
+        return prediction_loss_.item()
+
+
+    prediction_losses_list = []
+    for batch_idx, batch in enumerate(train_loader):
+        prediction_loss_ = forward_pass_for_rescaling(batch,predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
+        prediction_losses_list.append(prediction_loss_)
+    prediction_loss_epoch_mean = np.mean(prediction_losses_list)
+
+
+    prediction_loss_epoch_std = np.std(prediction_losses_list)
+
+    if (np.abs(prediction_loss_epoch_mean/prediction_loss_epoch_std)<noise_threshold_mean_divided_by_std):
+
+        prediction_loss_epoch_median = np.median(prediction_losses_list)
+        print(f"Calculated epoch's prediction loss: {prediction_loss_epoch_mean:.4f}±{prediction_loss_epoch_std:.4f}\nWhich is too noisy so using median which is:{prediction_loss_epoch_median:.4f}")
+        if save_returned_values:
+            loss_scales = {"saved_prediction_loss_scale":prediction_loss_epoch_median}
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "loss_scales.pkl")
+            with open(save_path, "wb") as f:
+                pickle.dump(loss_scales, f)
+            print(f"Saved values at {save_path}")
+        return prediction_loss_epoch_median
+    else:
+        print(f"Calculated epoch's prediction loss: {prediction_loss_epoch_mean:.4f}±{prediction_loss_epoch_std:.4f}, returning means")
+        if save_returned_values:
+            loss_scales = {"saved_prediction_loss_scale":prediction_loss_epoch_mean}
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "loss_scales.pkl")
+            with open(save_path, "wb") as f:
+                pickle.dump(loss_scales, f)
+            print(f"Saved values at {save_path}")
+        return prediction_loss_epoch_mean
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def train_model(
+    # Dataloaders
+    train_loader,
+    randomize_each_epoch_plan,
+    val_loader, 
+    val_loader_training_set,
+    
+    #Network
+    mapping_net, 
+    inverse_net,
+     
+    #Needed objects
+
+    get_data_from_trajectory_id,
+    possible_t_values,
+    
+    #Needed pandas dataframes
+    train_df,
+    train_id_df,
+    val_df,
+    val_id_df,
+    add_noise,
+    
+
+    #Loss calculation hyperparameters
+
+    prediction_loss_scale,
+    loss_type,
+    predict_full_trajectory,
+    normalized_mse,
+
+    prediction_coefficient,
+
+    hsic_loss_max_want,
+    on_distribution_val_criterio_weight = 0.75,
+    
+    
+    # Optimizer parameters
+    optimizer_type = 'AdamW',
+    
+    learning_rate=1e-4,
+    weight_decay=1e-6,
+
+    scheduler_type='plateau', 
+    scheduler_params=None,    # Dict of params specific to the scheduler. Set if it is a fresh training session.
+    
+
+    # Training parameters
+    num_epochs=30,
+    grad_clip_value=1.0,
+
+    
+    # Early stopping parameters
+    early_stopping=True,
+    patience=5,
+    min_delta=0.001,
+    
+    # Checkpointing
+    save_dir='./checkpoints',
+    save_best_only=True,
+    save_freq_epochs=1,
+    auto_rescue=True,
+    
+    # Logging
+    log_freq_batches=10,
+    verbose=1,
+    
+    # Device
+    device='cuda',
+    
+    #Used for continuing training from checkpoint, leave all None if it is a fresh training session.
+    optimizer=None, 
+    scheduler=None,  
+    continue_from_epoch=None,
+    best_validation_criterio_loss_till_now=None,
+):
+    
+    """
+    Comprehensive training loop.
+    """
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available. Falling back to CPU.")
+        device = 'cpu'
+    
+    print(f"Using device: {device}")
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    mapping_net.to(device)
+    
+    # Create directory for checkpoints
+    os.makedirs(save_dir, exist_ok=True)
+    
+
+
+    def make_json_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, list):
+            return [make_json_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: make_json_serializable(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    def save_rescue_checkpoint(signal_received=None, frame=None):
+            """Save a rescue checkpoint and exit gracefully if needed"""
+            nonlocal epoch, batch_idx, best_val_loss
+            try:
+                rescue_path = os.path.join(save_dir, f"rescue_checkpoint_epoch_{epoch}_batch_{batch_idx}.pt")
+                print(f"\n\n{'='*50}")
+                if signal_received:
+                    print(f"Signal {signal_received} received. Saving rescue checkpoint...")
+                else:
+                    print(f"Exception detected. Saving rescue checkpoint...")
+                    
+
+                # Save current state  
+                save_checkpoint(rescue_path, mapping_net, optimizer, scheduler, epoch, best_val_loss,
+                               extra_info={'interrupted_at_batch': batch_idx, 'exception': traceback.format_exc()})
+                run_hyperparameters ={}
+                run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
+                run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
+                run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
+                run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
+                run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+                run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
+                run_hyperparameters['add_noise'] = add_noise
+                
+                
+            
+                n_parameters = count_parameters(mapping_net)
+                run_hyperparameters['model_trainable_parameter_count'] = n_parameters
+            
+                model_n_layers = mapping_net.n_layers
+                run_hyperparameters['model_n_layers'] = model_n_layers
+            
+                model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
+                run_hyperparameters['model_hidden_dims'] = model_hidden_dims
+            
+                model_activation = mapping_net.activation 
+                run_hyperparameters['model_activation'] = model_activation
+            
+                model_activation_params = mapping_net.activation_params 
+                run_hyperparameters['model_activation_params'] = model_activation_params
+            
+                model_final_activation = mapping_net.final_activation 
+                run_hyperparameters['model_final_activation'] = model_final_activation
+
+                model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
+                run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
+
+                model_tanh_wrapper = mapping_net.tanh_wrapper
+                run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
+            
+                model_weight_init = mapping_net.weight_init 
+                run_hyperparameters['model_weight_init'] = model_weight_init
+            
+                model_weight_init_params = mapping_net.weight_init_params 
+                run_hyperparameters['model_weight_init_params'] = model_weight_init_params
+            
+                model_bias_init = mapping_net.bias_init 
+                run_hyperparameters['model_bias_init'] = model_bias_init
+            
+                model_bias_init_value = mapping_net.bias_init_value 
+                run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+                model_use_layer_norm = mapping_net.use_layer_norm 
+                run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
+                
+            
+                model_a_eps_min = mapping_net.a_eps_min 
+                run_hyperparameters['model_a_eps_min'] = model_a_eps_min
+            
+                model_a_eps_max = mapping_net.a_eps_max
+                run_hyperparameters['model_a_eps_max'] = model_a_eps_max
+                
+                model_a_k = mapping_net.a_k
+                run_hyperparameters['model_a_k'] = model_a_k
+
+                model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
+                run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
+
+                model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
+                run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
+
+                model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
+                run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
+
+
+                model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
+                run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
+
+                model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
+                run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
+
+
+
+                model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
+                run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
+
+                model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
+                run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
+
+                model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
+                run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
+
+
+                model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
+
+                model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
+
+                model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
+
+                model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
+                run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
+
+                model_bound_innit = mapping_net.bound_innit
+                run_hyperparameters['model_bound_innit'] = model_bound_innit
+            
+
+                run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+                run_hyperparameters['loss_type'] = loss_type
+                run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
+                run_hyperparameters['normalized_mse'] = normalized_mse
+                
+
+                run_hyperparameters['prediction_coefficient'] = prediction_coefficient
+
+                run_hyperparameters['hsic_loss_max_want'] = hsic_loss_max_want
+                run_hyperparameters['on_distribution_val_criterio_weight'] = on_distribution_val_criterio_weight
+                run_hyperparameters['grad_clip_value'] = grad_clip_value
+                
+            
+            
+                with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch}.json"), "w") as f:
+                    # Convert any non-serializable objects
+                    serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
+                    json.dump(serializable_run_hyperparameters, f, indent=2)
+
+                print(f"Rescue checkpoint saved to: {rescue_path}")
+                print(f"You can resume training from this checkpoint later.")
+                print(f"{'='*50}\n")
+
+                if signal_received:  # If this was triggered by a signal, exit
+                    sys.exit(0)
+
+            except Exception as e:
+                print(f"Failed to save rescue checkpoint: {e}")
+                
+    epoch = 0 if continue_from_epoch is None else continue_from_epoch
+    batch_idx = 0
+    
+    if auto_rescue:
+        signal.signal(signal.SIGINT, save_rescue_checkpoint)  # Ctrl+C
+        signal.signal(signal.SIGTERM, save_rescue_checkpoint)  # Termination request
+    
+
+    train_batches = train_loader.dataset.total_batches
+    val_batches = len(val_loader)
+    val_batches_training_set = len(val_loader_training_set)
+    
+    
+    # Create parameter lists 
+    mlp_params = []
+    transform_params = []
+    scale_params = []
+
+    for name, param in mapping_net.named_parameters():
+        if ('G_network' in name) or ('F_network' in name):
+            mlp_params.append(param)
+        elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
+            scale_params.append(param)
+        else: #c1, c2, gamma
+            transform_params.append(param)
+        
+    
+
+
+
+    
+
+
+    if optimizer==None:
+        if optimizer_type == 'Adam':
+            print(f"Initializing new Adam optimizer with learning rate: {learning_rate}")
+            optimizer = Adam([
+                {'params': mlp_params, 'lr': learning_rate},
+                {'params': scale_params, 'lr': learning_rate},
+                {'params': transform_params, 'lr': learning_rate},
+            ])
+        elif optimizer_type == 'AdamW':
+            print(f"Initializing new AdamW optimizer with learning rate: {learning_rate}, and weight decay {weight_decay}")
+            optimizer = AdamW([
+                {'params': mlp_params, 'weight_decay': weight_decay},
+                {'params': scale_params, 'weight_decay': 0.0},
+                {'params': transform_params, 'weight_decay': 0.0},
+            ], lr=learning_rate)  
+        else:
+            raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")       
+    
+    # Create scheduler if requested
+    if scheduler==None:
+        print(f"Initializing new scheduler: {scheduler_type} with params: {scheduler_params}")
+
+        if scheduler_type == 'plateau':
+            scheduler_params = scheduler_params or {'mode': 'min', 'factor': 0.1, 'patience': 5, 'verbose': verbose > 0}
+            scheduler = ReduceLROnPlateau(optimizer, **scheduler_params)
+        else:
+            raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
+
+    if (optimizer is not None) and (learning_rate != optimizer.param_groups[0]['lr']):
+        optimizer.param_groups[0]['lr'] = learning_rate
+        print(f"Manually resetting loaded optimizer's learning rate to {optimizer.param_groups[0]['lr']}")
+
+    if (optimizer is not None) and (weight_decay != optimizer.param_groups[0]['weight_decay']):
+        optimizer.param_groups[0]['weight_decay'] = weight_decay
+        print(f"Manually resetting loaded optimizer's weight decay to {optimizer.param_groups[0]['weight_decay']}")
+        
+    # Initialize early stopping variables
+    best_val_loss = float('inf')
+    if best_validation_criterio_loss_till_now is not None:
+        best_val_loss = best_validation_criterio_loss_till_now
+    patience_counter = 0
+    
+
+    
+    # Define a function to run the forward pass
+    def forward_pass(batch, hsic_loss_slope, predict_full_trajectory, add_noise):
+        if add_noise:
+            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
+            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
+        
+        else:
+            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+
+        stats = TrajectoryStats(X_final, U_final, batch['trajectory_ids'])
+
+
+        hsic_loss_ = hsic_loss(X_final, U_final, batch['trajectory_ids'], sigma_X_means=-1, sigma_U_means=-1, use_unbiased=True, stats=stats)
+
+
+
+
+        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs(
+            X_final, U_final, 
+            t_batch=batch['t'], 
+            trajectory_ids=batch['trajectory_ids'], 
+            possible_t_values=possible_t_values,
+            stats=stats,
+            predict_full_trajectory=predict_full_trajectory)
+
+        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
+
+        X_labels, U_labels, _ = generate_prediction_labels(
+                train_df=train_df, 
+                train_id_df=train_id_df, 
+                trajectory_ids=batch['trajectory_ids'], 
+                t_for_pred=t_for_pred, 
+                get_data_from_trajectory_id=get_data_from_trajectory_id,
+                predict_full_trajectory=predict_full_trajectory,  
+                possible_t_values=possible_t_values 
+            )
+
+        if normalized_mse:
+            prediction_loss_ = trajectory_normalized_mse(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels,
+                    trajectory_ids=batch['trajectory_ids'],
+                    stats=stats
+                )           
+        else:        
+            prediction_loss_ = prediction_loss(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels,
+                    loss_type=loss_type
+                )
+
+        total_loss_ = compute_total_loss(
+                hsic_loss = hsic_loss_,
+                prediction_loss=prediction_loss_,
+                prediction_coefficient=prediction_coefficient,
+                hsic_loss_slope=hsic_loss_slope,
+                prediction_loss_scale=prediction_loss_scale,
+
+            )
+        return total_loss_, hsic_loss_, prediction_loss_
+    
+    
+    
+    def validation_forward_pass(batch, val_df, val_id_df):
+        X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
+        variance_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = compute_single_trajectory_stats(X_final, U_final)
+
+
+        traj_id_tensor = torch.tensor(batch['trajectory_id'], device=X_final.device)
+
+        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs(
+                X_final[0], U_final[0], 
+                t_batch=batch['t'], 
+                trajectory_ids=traj_id_tensor, 
+                possible_t_values=possible_t_values,
+                stats=None,
+                predict_full_trajectory=predict_full_trajectory)
+
+        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
+
+        X_labels, U_labels, _ = generate_prediction_labels(
+        train_df=val_df, 
+        train_id_df=val_id_df, 
+        trajectory_ids=traj_id_tensor, 
+        t_for_pred=t_for_pred, 
+        get_data_from_trajectory_id=get_data_from_trajectory_id,
+        predict_full_trajectory=predict_full_trajectory,  
+        possible_t_values=possible_t_values 
+        )
+
+
+        if normalized_mse:
+            prediction_loss_ = trajectory_normalized_mse(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels,
+                    trajectory_ids=traj_id_tensor,
+                    stats=None
+                )           
+        else:        
+            prediction_loss_ = prediction_loss(
+                    x_pred=x_pred, 
+                    u_pred=u_pred, 
+                    X_labels=X_labels, 
+                    U_labels=U_labels,
+                    loss_type=loss_type
+                )
+
+
+
+        prediction_loss_scaled = prediction_loss_ / prediction_loss_scale
+
+
+        total_loss_ =  prediction_coefficient * prediction_loss_scaled
+
+
+        return total_loss_.item(), variance_loss_.item(), prediction_loss_.item(), X_mean, U_mean, X_var, U_var, X_std, U_std
+    
+    hsic_loss_max_calculated_cache = {}
+    # Training loop
+    start_epoch=0
+    if continue_from_epoch is not None:
+        start_epoch=continue_from_epoch
+        
+    try:
+        for epoch in range(start_epoch, start_epoch+num_epochs):
+                # Initialize epoch_metrics
+
+            if epoch > start_epoch and randomize_each_epoch_plan:
+                train_loader.dataset.on_epoch_start()
+
+
+            epoch_metrics = {}
+            epoch_start_time = time.time()
+
+            
+
+            # Set all models to training mode
+            mapping_net.train()
+            # Initialize metrics
+            train_total_loss_ = 0.0
+            train_hsic_loss_ = 0.0
+            train_prediction_loss_ = 0.0
+            mean_grad_norm_ = 0.0
+            percentage_of_batches_clipped_in_epoch = 0.0
+            batch_count = 0
+
+            # Progress tracking
+            if verbose > 0:
+                print(f"\n{'='*20} Epoch {epoch}/{start_epoch+num_epochs} {'='*20}")
+
+            # Training loop
+            for batch_idx, batch in enumerate(train_loader):
+                
+                
+
+                number_of_trajectories_in_batch =  torch.unique(batch['trajectory_ids']).shape[0]
+                if number_of_trajectories_in_batch not in hsic_loss_max_calculated_cache:
+                    linear_tensor = torch.arange(1, number_of_trajectories_in_batch+1, requires_grad=False)
+                    hsic_loss_max_calculated = hsic_loss_statistics_only(x=torch.Tensor(linear_tensor), y=torch.Tensor(linear_tensor), sigma_x = -1, sigma_y = -1, use_unbiased = True, epsilon = 1e-10).item()
+                    hsic_loss_max_calculated = max(hsic_loss_max_calculated, 0.05)
+                    hsic_loss_max_calculated_cache[number_of_trajectories_in_batch] = hsic_loss_max_calculated
+                else:
+                    hsic_loss_max_calculated = hsic_loss_max_calculated_cache[number_of_trajectories_in_batch]
+                
+                hsic_loss_slope = hsic_loss_max_want / hsic_loss_max_calculated
+
+
+                optimizer.zero_grad()
+
+                # Run forward pass
+                total_loss_, hsic_loss_, prediction_loss_ = forward_pass(batch, hsic_loss_slope, predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
+
+
+                if torch.isnan(total_loss_) or torch.isinf(total_loss_):
+                    print(f"Invalid total_loss_ value: {total_loss_.item()}, skipping batch")
+                    continue
+                # Backward pass
+                total_loss_.backward()
+                
+                
+                for name, param in mapping_net.named_parameters():
+                    if param.grad is not None:
+                        # Replace NaN gradients with zeros
+                        if torch.isnan(param.grad).any():
+                            print(f"NaN gradients detected in {name}")
+                            param.grad[torch.isnan(param.grad)] = 0.0
+                        # Replace inf gradients
+                        if torch.isinf(param.grad).any():
+                            print(f"Inf gradients detected in {name}")
+                            param.grad[torch.isinf(param.grad)] = 0.0
+                        # Check for extreme gradients
+                        if verbose>1:
+                            grad_norm_print = param.grad.norm().item()
+                            if grad_norm_print > 10.0:  # Threshold for reporting
+                                print(f"High gradient norm in {name}: {grad_norm_print}")
+                            if grad_norm_print < 0.00001:  
+                                print(f"Low gradient norm in {name}: {grad_norm_print}")
+
+                # Gradient clipping
+                if grad_clip_value is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(mlp_params+scale_params+transform_params, grad_clip_value)
+                    if (grad_norm>grad_clip_value):
+                        percentage_of_batches_clipped_in_epoch += 1.0
+                        if verbose>0:
+                            print(f"Grad clipping activated, grad_norm before clipping: {grad_norm}")
+
+
+                # Optimizer step
+                optimizer.step()
+
+                # Update metrics
+                if grad_clip_value is not None:
+                    mean_grad_norm_ += grad_norm.item()
+                
+                train_total_loss_ += total_loss_.item()
+                train_hsic_loss_ += hsic_loss_.item()
+                train_prediction_loss_ += prediction_loss_.item()
+                batch_count += 1
+
+                # Log progress
+                if verbose > 0 and batch_idx % log_freq_batches == 0:
+                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Prediction Loss: {prediction_loss_.item():.4f}")
+                    if grad_clip_value is not None:
+                        print(f"Grad norm of batch: {grad_norm.item():.4f}\n")
+
+
+                        
+                
+            # Calculate epoch metrics
+            mean_grad_norm_ /= max(1, batch_count)
+            train_total_loss_ /= max(1, batch_count)
+            train_hsic_loss_ /= max(1, batch_count)
+            train_prediction_loss_ /= max(1, batch_count)
+            percentage_of_batches_clipped_in_epoch /= max(1, batch_count)
+
+            # Validation phase
+            val_total_loss_ = 0.0
+            val_variance_loss_ = 0.0
+            val_prediction_loss_ = 0.0
+            val_batch_count = 0
+
+
+            # Set model to evaluation mode
+            mapping_net.eval()
+            
+            epoch_saving_path = os.path.join(save_dir, f"epoch_{epoch}")
+            
+            val_trajectories_dir = os.path.join(epoch_saving_path, f"val_trajectories_data")
+            os.makedirs(val_trajectories_dir, exist_ok=True)
+
+
+
+            val_train_set_trajectories_dir = os.path.join(epoch_saving_path, f"val_train_set_trajectories_data")
+            os.makedirs(val_train_set_trajectories_dir, exist_ok=True)
+
+
+            
+            
+            # Validation loop
+
+            print("Begining validation phase")
+            for batch_idx, batch in enumerate(val_loader):
+                # Run forward pass
+                total_loss_, variance_loss_, prediction_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = validation_forward_pass(batch, val_df=val_df, val_id_df=val_id_df)
+                # Update metrics
+                if total_loss_ is not None:
+                    val_total_loss_ += total_loss_
+                    val_variance_loss_ += variance_loss_
+                    val_prediction_loss_ += prediction_loss_
+                    if verbose > 0 and batch_idx % log_freq_batches == 0:
+                        print(f"Batch {batch_idx}/{val_batches} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f}  - Prediction Loss: {prediction_loss_:.4f}")
+                        
+                    trajectory_data = {
+                        'total_loss' : total_loss_,
+                        'variance_loss' : variance_loss_,
+                        'prediction_loss' : prediction_loss_,
+                        'X_mean': X_mean,
+                        'U_mean': U_mean,
+                        'X_var': X_var,
+                        'U_var': U_var,
+                        'X_std': X_std,
+                        'U_std': U_std,
+                    }           
+                    with open(os.path.join(val_trajectories_dir, f"trajectory_id_{batch['trajectory_id']}_data.json"), "w") as f:
+                        # Convert any non-serializable objects
+                        serializable_trajectory_data = make_json_serializable(trajectory_data)
+                        json.dump(serializable_trajectory_data, f, indent=2)
+                        
+                        
+                val_batch_count += 1
+                    
+                    
+
+                    
+            # Calculate validation metrics
+            val_total_loss_ /= max(1, val_batch_count)
+            val_variance_loss_ /= max(1, val_batch_count)
+            val_prediction_loss_ /= max(1, val_batch_count)
+
+
+
+
+            
+
+         
+
+            
+            val_total_loss_training_set = 0.0
+            val_variance_loss_training_set = 0.0
+
+            val_prediction_loss_training_set = 0.0
+            val_batch_count_training_set = 0
+            
+
+            print("Begining validation loop on training set data")
+            for batch_idx, batch in enumerate(val_loader_training_set):
+                # Run forward pass
+                total_loss_, variance_loss_, prediction_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = validation_forward_pass(batch, val_df=train_df, val_id_df=train_id_df)
+                
+                # Update metrics
+                if total_loss_ is not None:
+                    val_total_loss_training_set += total_loss_
+                    val_variance_loss_training_set += variance_loss_
+                    val_prediction_loss_training_set += prediction_loss_
+                    if verbose > 0 and batch_idx % log_freq_batches == 0:
+                        print(f"Batch {batch_idx}/{val_batches_training_set} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f}- Prediction Loss: {prediction_loss_:.4f}")
+                    trajectory_data = {
+                        'total_loss' : total_loss_,
+                        'variance_loss' : variance_loss_,
+                        'prediction_loss' : prediction_loss_,
+                        'X_mean': X_mean,
+                        'U_mean': U_mean,
+                        'X_var': X_var,
+                        'U_var': U_var,
+                        'X_std': X_std,
+                        'U_std': U_std,
+                    }           
+                    with open(os.path.join(val_train_set_trajectories_dir, f"trajectory_id_{batch['trajectory_id']}_data.json"), "w") as f:
+                        # Convert any non-serializable objects
+                        serializable_trajectory_data = make_json_serializable(trajectory_data)
+                        json.dump(serializable_trajectory_data, f, indent=2)
+                val_batch_count_training_set += 1
+
+                    
+            # Calculate validation metrics
+            val_total_loss_training_set /= max(1, val_batch_count_training_set)
+            val_variance_loss_training_set /= max(1, val_batch_count_training_set)
+            val_prediction_loss_training_set /= max(1, val_batch_count_training_set)
+
+
+            # Update epoch_metrics
+            epoch_metrics['epoch'] = epoch
+
+
+            
+            epoch_metrics['percentage_of_batches_clipped_in_epoch'] = percentage_of_batches_clipped_in_epoch*100
+            epoch_metrics['mean_grad_norm_'] = mean_grad_norm_
+            epoch_metrics['train_total_loss_'] = train_total_loss_
+
+            epoch_metrics['train_hsic_loss_'] = train_hsic_loss_
+
+            epoch_metrics['train_prediction_loss_'] = train_prediction_loss_
+
+            epoch_metrics['val_total_loss_'] = val_total_loss_
+            epoch_metrics['val_variance_loss_'] = val_variance_loss_
+
+            epoch_metrics['val_prediction_loss_'] = val_prediction_loss_
+            
+
+            
+            epoch_metrics['val_total_loss_training_set'] = val_total_loss_training_set
+            epoch_metrics['val_variance_loss_training_set'] = val_variance_loss_training_set
+
+            epoch_metrics['val_prediction_loss_training_set'] = val_prediction_loss_training_set
+            
+
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            epoch_metrics['learning_rates'] = current_lr
+
+
+            validation_criterio = val_total_loss_
+            epoch_metrics['validation_criterio'] = validation_criterio
+
+            if validation_criterio < best_val_loss - min_delta:
+                best_val_loss = validation_criterio
+                epoch_metrics['best_validation_criterio_loss_till_now'] = validation_criterio
+                print(f"Found best validation criterio loss till now:{validation_criterio:.4f}, on epoch {epoch}")
+
+                # Save best model (whether early_stopping is enabled or not)
+                best_model_path = os.path.join(save_dir, "best_model.pt")
+                save_checkpoint(best_model_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
+                if verbose > 0:
+                    print(f"New best model saved with val_loss: {best_val_loss:.4f}")
+
+                patience_counter = 0
+            else:
+                epoch_metrics['best_validation_criterio_loss_till_now'] = best_val_loss
+                if early_stopping:
+                    patience_counter += 1
+                    if verbose > 0:
+                        print(f"Early stopping patience: {patience_counter}/{patience}")
+                
+            with open(os.path.join(epoch_saving_path, "epoch_metrics.json"), "w") as f:
+                # Convert any non-serializable objects
+                serializable_epoch_metrics = make_json_serializable(epoch_metrics)
+                json.dump(serializable_epoch_metrics, f, indent=2)
+            
+            # Step the scheduler if it exists
+            if scheduler is not None:
+                if scheduler_type == 'plateau':
+                    scheduler.step(validation_criterio)  # Pass validation loss to plateau scheduler
+                else:
+                    scheduler.step()
+
+            # Time taken for epoch
+            epoch_time = time.time() - epoch_start_time
+
+            # Print epoch summary
+            if verbose > 0:
+                print(f"\nEpoch {epoch}/{start_epoch+num_epochs} completed in {epoch_time:.2f}s")
+
+
+                print(f"Percentage of batches clipped in epoch: {percentage_of_batches_clipped_in_epoch*100:.1f}%")
+                if grad_clip_value is not None:
+                    print(f"Mean grad norm: {mean_grad_norm_:.4f}")
+                print(f"Mean total train loss: {train_total_loss_:.4f}")
+
+                print(f"Mean HSIC train loss: {train_hsic_loss_:.4f}")
+
+                print(f"Mean prediction train loss: {train_prediction_loss_:.4f}")
+                
+                
+                print(f"Mean total val loss: {val_total_loss_:.4f}")
+                print(f"Mean variance val loss: {val_variance_loss_:.4f}")
+
+                print(f"Mean prediction val loss: {val_prediction_loss_:.4f}")
+                
+             
+
+                print(f"Mean total val loss training set: {val_total_loss_training_set:.4f}")
+                print(f"Mean variance val loss training set: {val_variance_loss_training_set:.4f}")
+
+                print(f"Mean prediction val loss training set: {val_prediction_loss_training_set:.4f}")    
+                
+                print(f"Validation criterio: {validation_criterio:.4f}")    
+                
+                print(f"Learning Rate: {current_lr:.6f}")
+
+
+
+            # Save checkpoint if needed
+            if (epoch) % save_freq_epochs == 0 :
+                if not save_best_only:
+                    checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
+                    save_checkpoint(checkpoint_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
+                    if verbose > 0:
+                        print(f"Checkpoint saved to {checkpoint_path}")
+
+            # Early stopping check
+            if early_stopping and patience_counter >= patience:
+                if verbose > 0:
+                    print(f"Early stopping triggered in epoch: {epoch}")
+                break
+
+        run_hyperparameters ={}
+
+        run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
+        run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
+        run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
+        run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
+        run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
+        run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
+        run_hyperparameters['add_noise'] = add_noise 
+        
+        n_parameters = count_parameters(mapping_net)
+        run_hyperparameters['model_trainable_parameter_count'] = n_parameters
+
+        model_n_layers = mapping_net.n_layers
+        run_hyperparameters['model_n_layers'] = model_n_layers
+
+        model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
+        run_hyperparameters['model_hidden_dims'] = model_hidden_dims
+
+        model_activation = mapping_net.activation 
+        run_hyperparameters['model_activation'] = model_activation
+
+        model_activation_params = mapping_net.activation_params 
+        run_hyperparameters['model_activation_params'] = model_activation_params
+
+        model_final_activation = mapping_net.final_activation 
+        run_hyperparameters['model_final_activation'] = model_final_activation
+
+        model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
+        run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
+
+        model_tanh_wrapper = mapping_net.tanh_wrapper
+        run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
+
+        model_weight_init = mapping_net.weight_init 
+        run_hyperparameters['model_weight_init'] = model_weight_init
+
+        model_weight_init_params = mapping_net.weight_init_params 
+        run_hyperparameters['model_weight_init_params'] = model_weight_init_params
+
+        model_bias_init = mapping_net.bias_init 
+        run_hyperparameters['model_bias_init'] = model_bias_init
+
+        model_bias_init_value = mapping_net.bias_init_value 
+        run_hyperparameters['model_bias_init_value'] = model_bias_init_value
+
+        model_use_layer_norm = mapping_net.use_layer_norm 
+        run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
+
+        model_a_eps_min = mapping_net.a_eps_min 
+        run_hyperparameters['model_a_eps_min'] = model_a_eps_min
+
+        model_a_eps_max = mapping_net.a_eps_max
+        run_hyperparameters['model_a_eps_max'] = model_a_eps_max
+
+        model_a_k = mapping_net.a_k
+        run_hyperparameters['model_a_k'] = model_a_k
+
+
+        model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
+        run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
+
+        model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
+        run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
+
+        model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
+        run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
+
+
+        model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
+        run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
+
+        model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
+        run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
+
+
+
+        model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
+        run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
+
+        model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
+        run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
+
+        model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
+        run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
+
+
+        model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
+
+        model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
+
+        model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
+
+        model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
+        run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
+
+
+
+        model_bound_innit = mapping_net.bound_innit
+        run_hyperparameters['model_bound_innit'] = model_bound_innit
+
+
+
+
+        run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
+        run_hyperparameters['normalized_mse'] = normalized_mse
+        run_hyperparameters['loss_type'] = loss_type
+        run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
+
+
+
+        run_hyperparameters['prediction_coefficient'] = prediction_coefficient
+        run_hyperparameters['hsic_loss_max_want'] = hsic_loss_max_want
+        run_hyperparameters['on_distribution_val_criterio_weight'] = on_distribution_val_criterio_weight
+        run_hyperparameters['grad_clip_value'] = grad_clip_value
+    
+
+
+        with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch+1}.json"), "w") as f:
+            # Convert any non-serializable objects
+            serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
+            json.dump(serializable_run_hyperparameters, f, indent=2)
+            
+    except Exception as e:
+        if auto_rescue:
+            print(f"\nTraining interrupted by exception: {e}")
+            save_rescue_checkpoint()
+        raise  # Re-raise the exception after saving
+    
+
+
+
+    finally:
+        try:
+            if 'epoch' in locals():
+                # Always save a final checkpoint regardless of how training ended
+                final_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
+                save_checkpoint(final_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
+                if verbose > 0:
+                    print(f"\nFinal state saved to {final_path}")
+            else:
+                print("Exception before epoch loop began")
+        except Exception as e:
+            print(f"Failed to save final checkpoint: {e}")
+
+    # Training complete
+    if verbose > 0:
+        print("\nTraining completed!")
+        print(f"Best validation loss: {best_val_loss:.4f}")
+    
+
+    
+    return 
+
+def resume_training_from_checkpoint(
+    # Checkpoint to resume from
+    checkpoint_path,
+    
+    # Dataloaders
+    train_loader,
+    randomize_each_epoch_plan,
+    val_loader,
+
+    val_loader_training_set,
+    
+    # Network
+    mapping_net,  # inverse_net is created automatically from mapping_net
+    
+    # Needed objects
+    get_data_from_trajectory_id,
+    possible_t_values,
+    
+    # Needed pandas dataframes
+    train_df,
+    train_id_df,
+    val_df,
+    val_id_df,
+    add_noise,
+    
+    # Loss calculation hyperparameters
+    prediction_loss_scale,
+    predict_full_trajectory,
+    loss_type,
+    normalized_mse,
+    prediction_coefficient,
+    hsic_loss_max_want,
+    on_distribution_val_criterio_weight=0.75,
+    
+    # === RESUME MODE SELECTION ===
+    # MODE A (load_scheduler_and_optimizer=True): Resume with exact optimizer/scheduler state
+    
+    #   - learning_rate: Set to None to use checkpoint LR, or specify to override
+    #   - optimizer_type: MUST match the type used in original training
+    #   - scheduler_type: MUST match the type used in original training
+    #   - scheduler_params: MUST match the params used in original training
+    #
+    # MODE B (load_scheduler_and_optimizer=False): Resume with fresh optimizer/scheduler
+
+    #   - learning_rate: REQUIRED - must specify, will error if None
+    #   - optimizer_type: Can be different from original
+    #   - scheduler_type: Can be different from original
+    #   - scheduler_params: Can be different from original
+    load_scheduler_and_optimizer=False,
+    
+    # Optimizer parameters
+    learning_rate=None,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
+    weight_decay=None,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
+    optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
+    
+    # Scheduler parameters  
+    scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
+    scheduler_params=None,  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
+    reset_scheduler_patience = False, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
+    
+    # Training parameters
+    num_epochs=30,  # Number of ADDITIONAL epochs to train (not total epochs)
+    grad_clip_value=3.0,
+    
+    # Early stopping parameters
+    early_stopping=False,
+    patience=20,
+    min_delta=0.001,
+    
+    # Checkpointing
+    save_dir='./checkpoints',  # Should typically match the directory where checkpoint_path is located
+    save_best_only=False,
+    save_freq_epochs=2,
+    auto_rescue=True,
+    
+    # Logging
+    log_freq_batches=50,
+    verbose=2,
+    
+    # Device
+    device='cuda'
+    ):
+    """Resume training from a checkpoint"""
+    if load_scheduler_and_optimizer:
+        mlp_params = []
+        transform_params = []
+        scale_params = []
+
+        for name, param in mapping_net.named_parameters():
+            if ('G_network' in name) or ('F_network' in name):
+                mlp_params.append(param)
+            elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
+                scale_params.append(param)
+            else: #c1, c2, gamma
+                transform_params.append(param)
+
+        if optimizer_type == 'Adam':
+            temp_optimizer = Adam(mlp_params+scale_params+transform_params)
+        elif optimizer_type == 'AdamW':
+            temp_optimizer = AdamW([
+                {'params': mlp_params, 'weight_decay': weight_decay},
+                {'params': scale_params, 'weight_decay': 0.0},
+                {'params': transform_params, 'weight_decay': weight_decay},
+            ])
+
+        temp_scheduler = ReduceLROnPlateau(temp_optimizer, mode='min', factor=0.1, patience=5, verbose=True) #Will be overwritten
+        # Load checkpoint
+        epoch, extra_info, best_val_loss = load_checkpoint(
+            checkpoint_path, mapping_net, device, temp_optimizer, temp_scheduler
+        )
+
+        # Override scheduler params if specified
+        if scheduler_params is not None:
+            print(f"Overriding scheduler params: {scheduler_params}")
+            for key, value in scheduler_params.items():
+                if hasattr(temp_scheduler, key):
+                    setattr(temp_scheduler, key, value)
+                    print(f"  {key}: {getattr(temp_scheduler, key)} -> {value}")
+                else:
+                    print(f"  Warning: scheduler has no attribute '{key}'")
+        else:
+            if hasattr(temp_scheduler, 'patience'):  # ReduceLROnPlateau
+                print("Using loaded scheduler")
+                print(f"  factor: {temp_scheduler.factor}")
+                print(f"  mode: {temp_scheduler.mode}")
+                print(f"  threshold: {temp_scheduler.threshold}")
+                print(f"  cooldown: {temp_scheduler.cooldown}")
+                print(f"  best: {temp_scheduler.best}")
+
+
+        # Reset scheduler patience counter if requested
+        if reset_scheduler_patience:
+            temp_scheduler.num_bad_epochs = 0
+            temp_scheduler.cooldown_counter = 0
+            print(f"Reset scheduler patience counter. Will wait full {temp_scheduler.patience} epochs before reducing LR.")
+        else:
+            # Calculate remaining epochs until LR reduction
+            if temp_scheduler.cooldown_counter > 0:
+                print(f"Scheduler in cooldown mode: {temp_scheduler.cooldown_counter} epochs remaining in cooldown")
+            elif temp_scheduler.num_bad_epochs >= temp_scheduler.patience:
+                print(f"Scheduler ready to reduce LR on next bad epoch (num_bad_epochs={temp_scheduler.num_bad_epochs} >= patience={temp_scheduler.patience})")
+            else:
+                remaining_epochs = temp_scheduler.patience - temp_scheduler.num_bad_epochs
+                print(f"Scheduler status: {temp_scheduler.num_bad_epochs}/{temp_scheduler.patience} bad epochs. Will reduce LR after {remaining_epochs} more bad epochs.")
+
+    else:
+        epoch, extra_info, best_val_loss = load_checkpoint(
+            checkpoint_path, mapping_net, device, None, None
+        )
+
+    if extra_info and 'interrupted_at_batch' in extra_info:
+        continue_from_epoch = epoch
+        print(f"Resuming incomplete epoch {epoch}")
+        if 'exception' in extra_info:
+            print(f"Previous training was interrupted by exception:\n{extra_info['exception']}")
+    else:
+        continue_from_epoch = epoch + 1
+        print(f"Epoch {epoch} was completed, starting from epoch {epoch + 1}")
+    
+    # Use the learning rate from checkpoint if not specified
+    if (learning_rate is None):
+        if load_scheduler_and_optimizer:
+            learning_rate = temp_optimizer.param_groups[0]['lr']
+            print(f"Using learning rate from checkpoint: {learning_rate}")
+        else:
+            print("When load_scheduler_and_optimizer=False you should set Learning Rate")
+            sys.exit(1)
+
+    if (weight_decay is None):
+        if load_scheduler_and_optimizer:
+            weight_decay = temp_optimizer.param_groups[0]['weight_decay']
+            print(f"Using weight decay from checkpoint: {weight_decay}")
+        else:
+            print("When load_scheduler_and_optimizer=False you should set Weight Decay")
+            sys.exit(1)
+            
+    inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
+    
+    # Train for additional epochs
+    print(f"Training for {num_epochs} additional epochs (epochs {continue_from_epoch} to {continue_from_epoch + num_epochs - 1})")
+    
+    # Resume training with the loaded state
+    if load_scheduler_and_optimizer:
+        return train_model(
+            # Dataloaders
+            train_loader=train_loader,
+            randomize_each_epoch_plan=randomize_each_epoch_plan,
+            val_loader=val_loader,
+
+            val_loader_training_set=val_loader_training_set,
+            
+            # Network
+            mapping_net=mapping_net, 
+            inverse_net=inverse_net,
+            
+            # Needed objects
+            get_data_from_trajectory_id=get_data_from_trajectory_id,
+            possible_t_values=possible_t_values,
+            
+            # Needed pandas dataframes
+            train_df=train_df,
+            train_id_df=train_id_df,
+            val_df=val_df,
+            val_id_df=val_id_df,
+
+            add_noise=add_noise,
+            
+            # Loss calculation hyperparameters
+
+            prediction_loss_scale=prediction_loss_scale,
+            predict_full_trajectory=predict_full_trajectory,
+            loss_type=loss_type,
+            normalized_mse=normalized_mse,
+
+            prediction_coefficient=prediction_coefficient,
+            hsic_loss_max_want = hsic_loss_max_want,
+            on_distribution_val_criterio_weight=on_distribution_val_criterio_weight,
+            
+            # Optimizer parameters - using loaded states
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            optimizer=temp_optimizer,  # Loaded from checkpoint
+            optimizer_type=optimizer_type,
+            scheduler=temp_scheduler,  # Loaded from checkpoint
+            scheduler_type=scheduler_type,
+            scheduler_params=scheduler_params,
+            
+            # Training parameters
+            num_epochs=num_epochs,
+            grad_clip_value=grad_clip_value,
+            continue_from_epoch=continue_from_epoch,
+            best_validation_criterio_loss_till_now=best_val_loss,  # Loaded from checkpoint
+            
+            # Early stopping parameters
+            early_stopping=early_stopping,
+            patience=patience,
+            min_delta=min_delta,
+            
+            # Checkpointing
+            save_dir=save_dir,
+            save_best_only=save_best_only,
+            save_freq_epochs=save_freq_epochs,
+            auto_rescue=auto_rescue,
+            
+            # Logging
+            log_freq_batches=log_freq_batches,
+            verbose=verbose,
+            
+            # Device
+            device=device,
+        )
+    else:
+        return train_model(
+            # Dataloaders
+            train_loader=train_loader,
+            randomize_each_epoch_plan=randomize_each_epoch_plan,
+            val_loader=val_loader,
+            val_loader_training_set=val_loader_training_set,
+            
+            # Network
+            mapping_net=mapping_net, 
+            inverse_net=inverse_net,
+            
+            # Needed objects
+            get_data_from_trajectory_id=get_data_from_trajectory_id,
+            possible_t_values=possible_t_values,
+            
+            # Needed pandas dataframes
+            train_df=train_df,
+            train_id_df=train_id_df,
+            val_df=val_df,
+            val_id_df=val_id_df,
+            add_noise=add_noise,
+            
+            # Loss calculation hyperparameters
+            prediction_loss_scale=prediction_loss_scale,
+            predict_full_trajectory=predict_full_trajectory,
+            loss_type=loss_type,
+            normalized_mse=normalized_mse,
+            prediction_coefficient=prediction_coefficient,
+
+            hsic_loss_max_want = hsic_loss_max_want,
+            on_distribution_val_criterio_weight=on_distribution_val_criterio_weight,
+            
+            # Optimizer parameters - creating fresh
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            optimizer=None,  # Create fresh optimizer
+            optimizer_type=optimizer_type,
+            scheduler=None,  # Create fresh scheduler
+            scheduler_type=scheduler_type,
+            scheduler_params=scheduler_params,
+            
+            # Training parameters
+            num_epochs=num_epochs,
+            grad_clip_value=grad_clip_value,
+            continue_from_epoch=continue_from_epoch,
+            best_validation_criterio_loss_till_now=best_val_loss,  # Loaded from checkpoint
+            
+            # Early stopping parameters
+            early_stopping=early_stopping,
+            patience=patience,
+            min_delta=min_delta,
+            
+            # Checkpointing
+            save_dir=save_dir,
+            save_best_only=save_best_only,
+            save_freq_epochs=save_freq_epochs,
+            auto_rescue=auto_rescue,
+            
+            # Logging
+            log_freq_batches=log_freq_batches,
+            verbose=verbose,
+            
+            # Device
+            device=device,)
+    
+'''
 def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, predict_full_trajectory, add_noise, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
     mapping_net.to(device)
     mapping_net.eval()
@@ -4456,7 +5858,7 @@ def resume_training_from_checkpoint(
             # Device
             device=device,
         )
-
+'''
 def train_model_real_pendulum(
     # Dataloaders
     train_loader,
@@ -9488,6 +10890,136 @@ def test_model_variance_with_varying_observed_points(
     
     return result_df
 
+def test_model_variance_with_varying_observed_points_multiple_periods(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    max_t_training,
+    device
+):
+    """
+    Test model by gradually increasing the number of observed points and track mean loss.
+    Points are randomly sampled without replacement.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['num_observed_points', 'mean_loss'], sorted by num_observed_points
+    """
+
+    
+    # Get a sample trajectory to determine the number of available points
+    sample_trajectory_id = int(test_id_df.iloc[0]['trajectory_id'])
+    sample_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=sample_trajectory_id)
+    sample_t = torch.as_tensor(sample_data['t'].to_numpy(dtype=np.float32), device=device)
+    num_points_available = len(sample_data['x'])
+    
+    num_observed_points_list = []
+    mean_variances_list = []
+    segment_indeces_dict = {}
+    
+    if max_t_training is not None and sample_t[-1].item() > max_t_training:
+        # Autoregressive prediction for long trajectories
+        t_np = sample_t.detach().cpu().numpy()
+        t_max = t_np[-1]
+        
+
+        
+        # Determine number of segments
+        num_segments = int(np.ceil(t_max / max_t_training))
+        
+        for seg_idx in range(num_segments):
+            # Determine time range for this segment
+            t_start = seg_idx * max_t_training
+            t_end = min((seg_idx + 1) * max_t_training, t_max)
+            
+            # Find indices in this time range
+            # Avoid overlap: use > for subsequent segments, >= for first segment
+            if seg_idx == 0:
+                seg_mask = (t_np >= t_start) & (t_np <= t_end)
+            else:
+                seg_mask = (t_np > t_start) & (t_np <= t_end)
+            
+            seg_indices = np.where(seg_mask)[0].tolist()
+            
+            if len(seg_indices) == 0:
+                continue
+            
+            segment_indeces_dict[seg_idx] = seg_indices
+
+
+    # Create a random permutation of all available indices
+    random_order = np.random.permutation(num_points_available)
+    
+    # Loop from 1 point to all points
+    for num_points in range(1, num_points_available + 1):
+        # Take the first num_points from the random permutation (sampling without replacement)
+        point_indexes_observed = random_order[:num_points].tolist()
+        
+        selected_set = set(point_indexes_observed)
+
+        # 2. Create the new dictionary using a dictionary comprehension
+        filtered_dict = {
+            k: [val for val in v if val in selected_set]
+            for k, v in segment_indeces_dict.items()
+            # Only include keys where the intersection is not empty
+            if any(val in selected_set for val in v)
+        }
+        
+        # Calculate losses for all trajectories with these observed points
+        variances = []
+        
+        for idx, row in test_id_df.iterrows():
+            trajectory_id = int(row['trajectory_id'])
+            
+            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+            
+            total_variance = torch.tensor(0.0, device=x.device)
+
+            for available_segments in filtered_dict.keys():
+                segment_indeces = filtered_dict[available_segments]
+                relative_t = t[segment_indeces] - available_segments * max_t_training
+                X_final, U_final, t_final = mapping_net(x[segment_indeces], u[segment_indeces], relative_t)
+                
+                if len(X_final) > 1:
+                    X_var = X_final.var(unbiased=True)
+                    U_var = U_final.var(unbiased=True)
+                else:
+                    X_var = torch.tensor(0.0, device=X_final.device)
+                    U_var = torch.tensor(0.0, device=U_final.device)
+
+                total_segment_variance = X_var + U_var
+                total_variance += total_segment_variance
+            total_variance /= len(filtered_dict.keys())
+
+            variances.append(total_variance.item())
+        
+        # Calculate mean loss for this number of observed points
+        mean_variances_of_dataset = np.mean(variances)
+        
+        num_observed_points_list.append(num_points)
+        mean_variances_list.append(mean_variances_of_dataset)
+    
+    # Create dataframe
+    result_df = pd.DataFrame({
+        'num_observed_points': num_observed_points_list,
+        'mean_variance': mean_variances_list
+    }).sort_values('num_observed_points')
+
+    print(result_df.head(10))
+    
+    # Create plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(result_df['num_observed_points'], result_df['mean_variance'], marker='o', linestyle='-')
+    plt.xlabel('Number of Observed Points')
+    plt.ylabel('Mean Variance over full df')
+    plt.title('Mean Variance over full df vs Number of Observed Points')
+    plt.grid(True)
+    plt.show()
+    
+    return result_df
 
 
 
@@ -9721,3 +11253,1071 @@ def test_model_in_all_trajectories_with_different_single_observation_in_df(
     plt.tight_layout()
     plt.show()
     return mean_losses
+
+
+def plot_all_transformed_trajectories(test_id_df, test_df, 
+                                     get_data_from_trajectory_id_function, 
+                                     max_t_training,device, mapping_net, option_1=True, 
+                                     only_plot_percentage=None):
+    """
+    Plot all transformed trajectories with time series and mean value scatter plots.
+    
+    Args:
+        test_id_df: DataFrame containing trajectory metadata (energy, phi or phi0)
+        test_df: DataFrame containing trajectory data (x, u, t)
+        get_data_from_trajectory_id_function: Function to retrieve trajectory data
+        max_t_training: Maximum training time value
+        option_1: If True, show Mean X_final vs Phi and Mean U_final vs Energy.
+                 If False, show Mean X_final vs Energy and Mean U_final vs Phi.
+        only_plot_percentage: If not None, float between 0.0 and 1.0 indicating 
+                             percentage of trajectories to randomly plot in time series (top row only).
+    """
+    # Validate only_plot_percentage
+    if only_plot_percentage is not None:
+        if not (0.0 <= only_plot_percentage <= 1.0):
+            raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
+    
+    # Determine which phi column to use
+    if 'phi' in test_id_df.columns:
+        phi_column = 'phi'
+    elif 'phi0' in test_id_df.columns:
+        phi_column = 'phi0'
+    else:
+        raise ValueError("DataFrame must contain either 'phi' or 'phi0' column")
+    
+    # Get all trajectory IDs
+    trajectory_ids = test_id_df['trajectory_id'].values
+    
+    X_final_list = []
+    U_final_list = []
+    t_final = None
+    
+    # Process all trajectories
+    for trajectory_id in trajectory_ids:
+        test_trajectory_data = get_data_from_trajectory_id_function(
+            test_id_df, test_df, trajectory_ids=trajectory_id
+        )
+        
+        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+        
+        X_final, U_final, t_final = mapping_net(
+            x[t < max_t_training], 
+            u[t < max_t_training], 
+            t[t < max_t_training]
+        )
+        
+        X_final_list.append(X_final)
+        U_final_list.append(U_final)
+    
+    # Convert t_final to numpy
+    t_final_np = t_final.cpu().detach().numpy()
+    
+    # Get phi and energy values for each trajectory
+    phis = test_id_df[phi_column].values
+    energies = test_id_df['energy'].values
+    
+    # Compute mean values for each trajectory
+    X_final_means = [X_tensor.cpu().detach().mean().item() for X_tensor in X_final_list]
+    U_final_means = [U_tensor.cpu().detach().mean().item() for U_tensor in U_final_list]
+    
+    # Determine which trajectories to plot in time series (top row only)
+    if only_plot_percentage is not None:
+        n_trajectories = len(X_final_list)
+        n_to_plot = max(1, int(n_trajectories * only_plot_percentage))
+        plot_indices = np.random.choice(n_trajectories, size=n_to_plot, replace=False)
+        plot_indices = sorted(plot_indices)  # Sort for consistent ordering
+    else:
+        plot_indices = list(range(len(X_final_list)))
+    
+    # Create a consistent color map for all trajectories
+    import matplotlib.cm as cm
+    n_total = len(X_final_list)
+    colors = cm.get_cmap('tab10' if n_total <= 10 else 'tab20' if n_total <= 20 else 'hsv')(np.linspace(0, 1, n_total))
+    
+    # Create a figure with 4 subplots (2x2 grid)
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+    
+    ax1 = fig.add_subplot(gs[0, 0])  # Top-left: X_final time series
+    ax2 = fig.add_subplot(gs[0, 1])  # Top-right: U_final time series
+    ax3 = fig.add_subplot(gs[1, 0])  # Bottom-left: First scatter plot
+    ax4 = fig.add_subplot(gs[1, 1])  # Bottom-right: Second scatter plot
+    
+    # Plot subset of tensors from X_final_list on the first axis with matching colors
+    for i in plot_indices:
+        X_tensor = X_final_list[i]
+        X_np = X_tensor.cpu().detach().numpy()
+        ax1.plot(t_final_np, X_np, alpha=0.7, color=colors[i])
+    
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel('X values')
+    if only_plot_percentage is not None:
+        ax1.set_title(f'X_final_list - {len(plot_indices)} of {len(X_final_list)} Trajectories ({only_plot_percentage*100:.1f}%)')
+    else:
+        ax1.set_title(f'X_final_list - All Trajectories ({len(X_final_list)} total)')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot subset of tensors from U_final_list on the second axis with matching colors
+    for i in plot_indices:
+        U_tensor = U_final_list[i]
+        U_np = U_tensor.cpu().detach().numpy()
+        ax2.plot(t_final_np, U_np, alpha=0.7, color=colors[i])
+    
+    ax2.set_xlabel('Time (t)')
+    ax2.set_ylabel('U values')
+    if only_plot_percentage is not None:
+        ax2.set_title(f'U_final_list - {len(plot_indices)} of {len(U_final_list)} Trajectories ({only_plot_percentage*100:.1f}%)')
+    else:
+        ax2.set_title(f'U_final_list - All Trajectories ({len(U_final_list)} total)')
+    ax2.grid(True, alpha=0.3)
+    
+    # Determine which scatter plots to show based on option_1
+    # NOTE: Scatter plots use ALL trajectories regardless of only_plot_percentage
+    if option_1:
+        # Scatter plot: Mean X_final vs Phi
+        ax3.scatter(X_final_means, phis, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
+        ax3.set_xlabel('Mean X_final', fontsize=12)
+        ax3.set_ylabel(f'{phi_column.capitalize()}', fontsize=12)
+        ax3.set_title(f'Mean X_final vs {phi_column.capitalize()}', fontsize=14)
+        ax3.grid(True, alpha=0.3)
+        
+        # Scatter plot: Mean U_final vs Energy
+        ax4.scatter(U_final_means, energies, s=100, alpha=0.7, color='red', edgecolors='black', linewidth=1.5)
+        ax4.set_xlabel('Mean U_final', fontsize=12)
+        ax4.set_ylabel('Energy', fontsize=12)
+        ax4.set_title('Mean U_final vs Energy', fontsize=14)
+        ax4.grid(True, alpha=0.3)
+    else:
+        # Scatter plot: Mean X_final vs Energy
+        ax3.scatter(X_final_means, energies, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
+        ax3.set_xlabel('Mean X_final', fontsize=12)
+        ax3.set_ylabel('Energy', fontsize=12)
+        ax3.set_title('Mean X_final vs Energy', fontsize=14)
+        ax3.grid(True, alpha=0.3)
+        
+        # Scatter plot: Mean U_final vs Phi
+        ax4.scatter(U_final_means, phis, s=100, alpha=0.7, color='red', edgecolors='black', linewidth=1.5)
+        ax4.set_xlabel('Mean U_final', fontsize=12)
+        ax4.set_ylabel(f'{phi_column.capitalize()}', fontsize=12)
+        ax4.set_title(f'Mean U_final vs {phi_column.capitalize()}', fontsize=14)
+        ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+def plot_all_transformed_trajectories_multiple_periods(test_id_df, test_df, 
+                                     get_data_from_trajectory_id_function, 
+                                     max_t_training, device, mapping_net, option_1=True, 
+                                     only_plot_percentage=None):
+    """
+    Plot all transformed trajectories with time series and mean value scatter plots,
+    including vertical markers for training periods.
+    """
+    # Validate only_plot_percentage
+    if only_plot_percentage is not None:
+        if not (0.0 <= only_plot_percentage <= 1.0):
+            raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
+    
+    # Get all trajectory IDs
+    trajectory_ids = test_id_df['trajectory_id'].values
+    
+    X_final_list = [[] for i in range(trajectory_ids.shape[0])]
+    U_final_list = [[] for i in range(trajectory_ids.shape[0])]
+    
+    # We will store the last time vector to use for the x-axis
+    t_final_np = None
+
+    # Process all trajectories
+    for i, trajectory_id in enumerate(trajectory_ids):
+        test_trajectory_data = get_data_from_trajectory_id_function(
+            test_id_df, test_df, trajectory_ids=trajectory_id
+        )
+        
+        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)               
+        
+        # If this is the last iteration or first, we capture t for plotting purposes
+        # (Assuming all trajectories share the same time grid)
+        t_np = t.detach().cpu().numpy()
+        t_final_np = t_np 
+        
+        if max_t_training is not None and t[-1].item() > max_t_training:
+            t_max = t_np[-1]
+            
+            # Determine number of segments
+            num_segments = int(np.ceil(t_max / max_t_training))
+            
+            for seg_idx in range(num_segments):
+                # Determine time range for this segment
+                t_start = seg_idx * max_t_training
+                t_end = min((seg_idx + 1) * max_t_training, t_max)
+                
+                # Find indices in this time range
+                if seg_idx == 0:
+                    seg_mask = (t_np >= t_start) & (t_np <= t_end)
+                else:
+                    seg_mask = (t_np > t_start) & (t_np <= t_end)
+                
+                seg_indices = np.where(seg_mask)[0]
+                
+                if len(seg_indices) == 0:
+                    continue
+                
+                X_final, U_final, _ = mapping_net(
+                    x[seg_indices], 
+                    u[seg_indices], 
+                    t[0:len(seg_indices)]
+                )
+                
+                # Append data as flat numpy arrays
+                X_final_list[i].extend(X_final.cpu().detach().numpy())
+                U_final_list[i].extend(U_final.cpu().detach().numpy())
+
+    # Determine which trajectories to plot
+    if only_plot_percentage is not None:
+        n_trajectories = trajectory_ids.shape[0]
+        n_to_plot = max(1, int(n_trajectories * only_plot_percentage))
+        plot_indices = np.random.choice(n_trajectories, size=n_to_plot, replace=False)
+        plot_indices = sorted(plot_indices)
+    else:
+        return None
+    
+    # Create colors
+    colors = cm.get_cmap('tab10' if n_trajectories <= 10 else 'tab20' if n_trajectories <= 20 else 'hsv')(np.linspace(0, 1, n_trajectories))
+    
+    # Create figure
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+    
+    ax1 = fig.add_subplot(gs[0, 0])  # Top-left: X_final
+    ax2 = fig.add_subplot(gs[0, 1])  # Top-right: U_final
+
+    # --- PLOT DATA ---
+    for i in plot_indices:
+        X_np = np.array(X_final_list[i])
+        ax1.plot(t_final_np, X_np, alpha=0.7, color=colors[i])
+        
+        U_np = np.array(U_final_list[i])
+        ax2.plot(t_final_np, U_np, alpha=0.7, color=colors[i])
+
+    # --- ADD VERTICAL LINES (Multiples of max_t_training) ---
+    if max_t_training is not None and t_final_np is not None:
+        current_marker = max_t_training
+        max_time_in_plot = t_final_np[-1]
+        
+        first_line = True
+        while current_marker < max_time_in_plot:
+            label = f' (max_t_training {max_t_training:.3f})' if first_line else None
+            
+            # Plot on Axis 1
+            ax1.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+            # Plot on Axis 2
+            ax2.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+            
+            current_marker += max_t_training
+            first_line = False
+
+    # --- FORMATTING & LEGENDS ---
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel('X values')
+    title_suffix = f'{len(plot_indices)} of {len(X_final_list)}' if only_plot_percentage else 'All'
+    ax1.set_title(f'X_final_list - {title_suffix} Trajectories')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='upper right') # Show legend for the vertical lines
+
+    ax2.set_xlabel('Time (t)')
+    ax2.set_ylabel('U values')
+    ax2.set_title(f'U_final_list - {title_suffix} Trajectories')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='upper right') # Show legend for the vertical lines
+    
+    plt.tight_layout()
+    plt.show()
+
+def plot_transformed_trajectory(test_id_df, test_df, trajectory_id, 
+                                get_data_from_trajectory_id_function, mapping_net,
+                                max_t_training, device, option_1=True,
+                                point_indexes_observed=None):
+    """
+    Plot transformed trajectory with energy and phi reference lines (if columns exist).
+    
+    Args:
+        test_id_df: DataFrame containing trajectory metadata (optionally energy, phi or phi0)
+        test_df: DataFrame containing trajectory data (x, u, t)
+        trajectory_id: ID of the trajectory to plot
+        get_data_from_trajectory_id_function: Function to retrieve trajectory data
+        mapping_net: The mapping network to apply transformation
+        max_t_training: Maximum training time value
+        device: Device to use for tensors (e.g., 'cuda:0' or 'cpu')
+        option_1: If True, show phi in X_final and energy in U_final.
+                 If False, show energy in X_final and phi in U_final.
+        point_indexes_observed: Optional list of integers indicating which points were observed.
+                               If provided, creates additional plot with mean lines only.
+    """
+    # Determine which columns are available
+    phi_column = None
+    if 'phi' in test_id_df.columns:
+        phi_column = 'phi'
+    elif 'phi0' in test_id_df.columns:
+        phi_column = 'phi0'
+    
+    has_energy = 'energy' in test_id_df.columns
+    
+    # Load trajectory data
+    test_trajectory_data = get_data_from_trajectory_id_function(
+        test_id_df, test_df, trajectory_ids=trajectory_id
+    )
+    
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+    
+    # Apply mapping network
+    X_final, U_final, t_final = mapping_net(
+        x[t < max_t_training], 
+        u[t < max_t_training], 
+        t[t < max_t_training]
+    )
+    
+    # Fetch energy and phi values for this trajectory (if they exist)
+    trajectory_row = test_id_df[test_id_df['trajectory_id'] == trajectory_id].iloc[0]
+    energy_value = trajectory_row['energy'] if has_energy else None
+    phi_value = trajectory_row[phi_column] if phi_column is not None else None
+    
+    # Convert tensors to numpy (move to CPU first if on GPU)
+    X_final_np = X_final.cpu().detach().numpy()
+    U_final_np = U_final.cpu().detach().numpy()
+    t_final_np = t_final.cpu().detach().numpy()
+    
+    # Get t range
+    t_min = t_final_np.min()
+    t_max = t_final_np.max()
+    
+    # Calculate means from observed points if provided
+    if point_indexes_observed is not None:
+        X_observed_mean = X_final_np[point_indexes_observed].mean()
+        U_observed_mean = U_final_np[point_indexes_observed].mean()
+    
+    # Determine which value goes on which plot based on option_1
+    if option_1:
+        x_reference_value = phi_value
+        x_reference_label = phi_column if phi_column else 'φ'
+        x_reference_color = 'orange'
+        u_reference_value = energy_value
+        u_reference_label = 'Energy'
+        u_reference_color = 'purple'
+    else:
+        x_reference_value = energy_value
+        x_reference_label = 'Energy'
+        x_reference_color = 'purple'
+        u_reference_value = phi_value
+        u_reference_label = phi_column if phi_column else 'φ'
+        u_reference_color = 'orange'
+    
+    # ==================== FIRST PLOT (Original) ====================
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # Plot X_final on the first axis
+    ax1.plot(t_final_np, X_final_np, label='X_final', color='blue')
+    if x_reference_value is not None:
+        ax1.plot([t_min, t_max], [x_reference_value, x_reference_value], 
+                 color=x_reference_color, linestyle='--', linewidth=2, 
+                 label=f'{x_reference_label} = {x_reference_value:.4f}')
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel('X_final')
+    ax1.set_title(f'X_final - Trajectory {trajectory_id}')
+    ax1.grid(True)
+    ax1.legend()
+    
+    # Plot U_final on the second axis
+    ax2.plot(t_final_np, U_final_np, label='U_final', color='red')
+    if u_reference_value is not None:
+        ax2.plot([t_min, t_max], [u_reference_value, u_reference_value], 
+                 color=u_reference_color, linestyle='--', linewidth=2, 
+                 label=f'{u_reference_label} = {u_reference_value:.4f}')
+    ax2.set_xlabel('Time (t)')
+    ax2.set_ylabel('U_final')
+    ax2.set_title(f'U_final - Trajectory {trajectory_id}')
+    ax2.grid(True)
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # ==================== SECOND PLOT (Only Reference and Mean Lines) ====================
+    if point_indexes_observed is not None:
+        fig2, (ax3, ax4) = plt.subplots(2, 1, figsize=(10, 8))
+        
+        # Plot X reference and mean lines only
+        if x_reference_value is not None:
+            ax3.plot([t_min, t_max], [x_reference_value, x_reference_value], 
+                     color=x_reference_color, linestyle='--', linewidth=2, 
+                     label=f'{x_reference_label} = {x_reference_value:.4f}')
+        ax3.plot([t_min, t_max], [X_observed_mean, X_observed_mean], 
+                 color='green', linestyle='-.', linewidth=2, 
+                 label=f'Mean X (observed) = {X_observed_mean:.4f}')
+        ax3.set_xlabel('Time (t)')
+        ax3.set_ylabel('X value')
+        ax3.set_title(f'X Reference vs Observed Mean - Trajectory {trajectory_id}')
+        ax3.grid(True)
+        ax3.legend()
+        
+        # Plot U reference and mean lines only
+        if u_reference_value is not None:
+            ax4.plot([t_min, t_max], [u_reference_value, u_reference_value], 
+                     color=u_reference_color, linestyle='--', linewidth=2, 
+                     label=f'{u_reference_label} = {u_reference_value:.4f}')
+        ax4.plot([t_min, t_max], [U_observed_mean, U_observed_mean], 
+                 color='green', linestyle='-.', linewidth=2, 
+                 label=f'Mean U (observed) = {U_observed_mean:.4f}')
+        ax4.set_xlabel('Time (t)')
+        ax4.set_ylabel('U value')
+        ax4.set_title(f'U Reference vs Observed Mean - Trajectory {trajectory_id}')
+        ax4.grid(True)
+        ax4.legend()
+        
+        plt.tight_layout()
+        plt.show()
+
+def plot_harmonic_oscillator_energy(x_pred, u_pred, x, u, t, k, mass):
+    """
+    Plot energy comparison for harmonic oscillator.
+    
+    E = 0.5 * m * u^2 + 0.5 * k * x^2
+    
+    Or equivalently (dividing by mass):
+    E/m = 0.5 * u^2 + 0.5 * (k/m) * x^2
+    """
+    t_np = t.detach().cpu().numpy()
+    x_pred_np = x_pred.detach().cpu().numpy()
+    u_pred_np = u_pred.detach().cpu().numpy()
+    x_np = x.detach().cpu().numpy()
+    u_np = u.detach().cpu().numpy()
+    
+    omega_squared = k / mass  # = -constant from your class
+    
+    def compute_energy(position, velocity):
+        kinetic = 0.5 * velocity**2
+        potential = 0.5 * omega_squared * position**2
+        return kinetic + potential
+    
+    energy_pred = compute_energy(x_pred_np, u_pred_np)
+    energy_true = compute_energy(x_np, u_np)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(t_np, energy_true, label='True', linewidth=2)
+    plt.plot(t_np, energy_pred, label='Predicted', linewidth=2, linestyle='--')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Energy / mass')
+    plt.title('Harmonic Oscillator Energy: Predicted vs True')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_ideal_pendulum_energy(x_pred, u_pred, x, u, t, g, length):
+    """
+    Plot energy comparison using the same formula as ideal_pendulum_GPT.
+    
+    E = 0.5 * omega^2 + (g/L) * (1 - cos(theta))
+    """
+    t_np = t.detach().cpu().numpy()
+    x_pred_np = x_pred.detach().cpu().numpy()
+    u_pred_np = u_pred.detach().cpu().numpy()
+    x_np = x.detach().cpu().numpy()
+    u_np = u.detach().cpu().numpy()
+    
+    constant = g / length  # same as your self.constant
+    
+    def compute_energy(theta, omega):
+        kinetic = 0.5 * omega**2
+        potential = constant * (1 - np.cos(theta))
+        return kinetic + potential
+    
+    energy_pred = compute_energy(x_pred_np, u_pred_np)
+    energy_true = compute_energy(x_np, u_np)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(t_np, energy_true, label='True', linewidth=2)
+    plt.plot(t_np, energy_pred, label='Predicted', linewidth=2, linestyle='--')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Energy (dimensionless)')
+    plt.title('Pendulum Energy: Predicted vs True')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_real_pendulum_energy(x_pred, u_pred, x, u, t, constant):
+    """
+    Plot energy for the Schmidt-Lipson real pendulum data.
+    Uses the same formula as Hamiltonian Neural Networks paper:
+    H = 2.4*(1 - cos(q)) + p^2
+    """
+    t_np = t.detach().cpu().numpy()
+    x_pred_np = x_pred.detach().cpu().numpy()
+    u_pred_np = u_pred.detach().cpu().numpy()
+    x_np = x.detach().cpu().numpy()
+    u_np = u.detach().cpu().numpy()
+    
+    def compute_energy(q, p, constant=constant):
+        kinetic = p**2          
+        potential = constant * (1 - np.cos(q))
+        return kinetic + potential
+    
+    energy_pred = compute_energy(x_pred_np, u_pred_np)
+    energy_true = compute_energy(x_np, u_np)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(t_np, energy_true, label='True', linewidth=2)
+    plt.plot(t_np, energy_pred, label='Predicted', linewidth=2, linestyle='--')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Energy')
+    plt.title('Real Pendulum Energy: Predicted vs True')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def test_model_energy_in_single_trajectory(
+    get_data_from_trajectory_id_function, 
+    test_id_df, 
+    test_df, 
+    trajectory_id, 
+    mapping_net, 
+    inverse_net, 
+    device, 
+    point_indexes_observed, 
+    max_t_training=None,
+    efficiently=True,
+    method = "mahalanobis",
+    threshold=1.0,
+    dt=0.1,
+    alpha=1.0,
+    gamma=1.0,
+    cluster_weight_threshold=0.4,
+    max_n_components=5,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    case="harmonic_oscillator",
+    length=3.0, k=1, mass=1, g=9.81, constant=2.4,
+    verbose=False,
+
+):
+    """
+    Test model on a single trajectory.
+    
+    Args:
+        efficiently: If True, use standard prediction method. If False, use ensemble method.
+        max_t_training: If not None, use autoregressive prediction for trajectories exceeding this time value
+        threshold: Mahalanobis distance threshold (only used when efficiently=False)
+        search_range_lower_pct: Search range lower bound (only used when efficiently=False)
+        search_range_upper_pct: Search range upper bound (only used when efficiently=False)
+        verbose: If True, print forward pass counts
+    """
+    test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+    if point_indexes_observed:
+        if efficiently:
+            # ==================== EFFICIENT METHOD ====================
+            forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+            
+            # Check if we need segmented prediction
+            if max_t_training is not None and t[-1].item() > max_t_training:
+                # Autoregressive prediction for long trajectories
+                t_np = t.detach().cpu().numpy()
+                t_max = t_np[-1]
+                
+                x_pred_segments = []
+                u_pred_segments = []
+                
+                # Determine number of segments
+                num_segments = int(np.ceil(t_max / max_t_training))
+                
+                for seg_idx in range(num_segments):
+                    # Determine time range for this segment
+                    t_start = seg_idx * max_t_training
+                    t_end = min((seg_idx + 1) * max_t_training, t_max)
+                    
+                    # Find indices in this time range
+                    # Avoid overlap: use > for subsequent segments, >= for first segment
+                    if seg_idx == 0:
+                        seg_mask = (t_np >= t_start) & (t_np <= t_end)
+                    else:
+                        seg_mask = (t_np > t_start) & (t_np <= t_end)
+                    
+                    seg_indices = np.where(seg_mask)[0]
+                    
+                    if len(seg_indices) == 0:
+                        continue
+                    
+                    # Get data for this segment
+                    t_seg = t[seg_indices]
+                    t_seg_relative = t_seg - t_start
+                    
+                    if seg_idx == 0:
+                        # First segment: use actual observed points
+                        # Filter observed indices to only those in this segment
+                        obs_in_seg = [i for i in point_indexes_observed if i in seg_indices]
+                        
+                        if len(obs_in_seg) > 0:
+                            # Get relative positions within the segment
+                            obs_indices_relative = [np.where(seg_indices == i)[0][0] for i in obs_in_seg]
+                            
+                            X_final, U_final, t_final = mapping_net(
+                                x[obs_in_seg], 
+                                u[obs_in_seg], 
+                                t_seg_relative[obs_indices_relative]
+                            )
+                            forward_pass_count['mapping_net'] += 1
+                            
+                            X_final_mean = X_final.mean()
+                            U_final_mean = U_final.mean()
+                            
+                            # Create full shape tensors for this segment
+                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                            
+                            # Place observed values at their relative positions
+                            for i, rel_idx in enumerate(obs_indices_relative):
+                                X_final_full_shape_seg[rel_idx] = X_final[i]
+                                U_final_full_shape_seg[rel_idx] = U_final[i]
+                        else:
+                            # No observations in first segment - use original observations with t=0
+                            X_final, U_final, t_final = mapping_net(
+                                x[point_indexes_observed], 
+                                u[point_indexes_observed], 
+                                torch.zeros(len(point_indexes_observed), device=device, dtype=torch.float32)
+                            )
+                            forward_pass_count['mapping_net'] += 1
+                            
+                            X_final_mean = X_final.mean()
+                            U_final_mean = U_final.mean()
+                            
+                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                            X_final_full_shape_seg[0] = X_final[0]
+                            U_final_full_shape_seg[0] = U_final[0]
+                    else:
+                        # Subsequent segments: use last prediction from previous segment as observation at t=0
+                        x_obs = x_pred_segments[-1][-1].unsqueeze(0)
+                        u_obs = u_pred_segments[-1][-1].unsqueeze(0)
+                        t_obs = torch.tensor([0.0], device=device, dtype=torch.float32)
+                        
+                        X_final, U_final, t_final = mapping_net(x_obs, u_obs, t_obs)
+                        forward_pass_count['mapping_net'] += 1
+                        
+                        X_final_mean = X_final.mean()
+                        U_final_mean = U_final.mean()
+                        
+                        # Create full shape tensors for this segment
+                        X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
+                        U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
+                        
+                        # Place the observation at index 0 (t=0 in relative time)
+                        X_final_full_shape_seg[0] = X_final[0]
+                        U_final_full_shape_seg[0] = U_final[0]
+                    
+                    # Predict for this segment using relative times
+                    x_pred_seg, u_pred_seg, _ = inverse_net(X_final_full_shape_seg, U_final_full_shape_seg, t_seg_relative)
+                    forward_pass_count['inverse_net'] += 1
+                    
+                    x_pred_segments.append(x_pred_seg)
+                    u_pred_segments.append(u_pred_seg)
+                
+                # Concatenate all segments
+                x_pred = torch.cat(x_pred_segments, dim=0)
+                u_pred = torch.cat(u_pred_segments, dim=0)
+            else:
+                # Original logic for trajectories within max_t_training
+                X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
+                forward_pass_count['mapping_net'] += 1
+                
+                X_final_mean = X_final.mean()
+                U_final_mean = U_final.mean()
+                X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
+                U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+                # Replace values at observed indices with actual mapped values
+                X_final_full_shape[point_indexes_observed] = X_final
+                U_final_full_shape[point_indexes_observed] = U_final
+                x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
+                forward_pass_count['inverse_net'] += 1
+            
+            if verbose:
+                total_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+                print(f"\n=== Efficient Method - Forward Pass Count ===")
+                print(f"mapping_net calls: {forward_pass_count['mapping_net']}")
+                print(f"inverse_net calls: {forward_pass_count['inverse_net']}")
+                print(f"Total forward passes: {total_passes}")
+        
+        else:
+            # ==================== ENSEMBLE METHOD ====================
+            if max_t_training is None:
+                raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
+        
+            if method == "mahalanobis":
+                x_pred, u_pred, stats = ensemble_autoregressive_prediction_mahalanobis(
+                    x=x,
+                    u=u,
+                    t=t,
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    threshold=threshold,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False  # Don't print ensemble internal details
+                )
+
+            elif method == "gaussian_mixture":
+                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture(
+                    x=x, 
+                    u=u, 
+                    t=t, 
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    dt=dt,
+                    alpha=alpha, 
+                    gamma=gamma,
+                    cluster_weight_threshold=cluster_weight_threshold,
+                    max_n_components=max_n_components,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False
+                )
+            elif method == "gaussian_mixture_simple":
+                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture_simple(
+                    x=x, 
+                    u=u, 
+                    t=t, 
+                    point_indexes_observed=point_indexes_observed,
+                    mapping_net=mapping_net,
+                    inverse_net=inverse_net,
+                    device=device,
+                    max_t_training=max_t_training,
+                    max_n_components=max_n_components,
+                    search_range_lower_pct=search_range_lower_pct,
+                    search_range_upper_pct=search_range_upper_pct,
+                    verbose=False
+                )
+            else:
+                raise ValueError("Not correctly specified method, try one of: mahalanobis, gaussian_mixture, gaussian_mixture_simple")
+                                
+
+            if verbose:
+                print(f"\n=== Ensemble Method - Forward Pass Count ===")
+                print(f"mapping_net calls: {stats['mapping_net_calls']}")
+                print(f"inverse_net calls: {stats['inverse_net_calls']}")
+                print(f"Total forward passes: {stats['total_forward_passes']}")
+                print(f"Coverage: {stats['coverage_pct']:.1f}%")
+        
+
+        if case == "harmonic_oscillator":
+            plot_harmonic_oscillator_energy(x_pred, u_pred, x, u, t, k, mass)
+        elif case == "ideal_pendulum":
+            plot_ideal_pendulum_energy(x_pred, u_pred, x, u, t, length=length, g=g)
+        elif case == "real_pendulum":
+            plot_real_pendulum_energy(x_pred, u_pred, x, u, t, constant=constant) #, length=length,mass=mass, g=g)
+        
+
+
+def plot_transformed_trajectory_real_pendulum(test_id_df, test_df, trajectory_id, 
+                                              get_data_from_trajectory_id_function, mapping_net,
+                                              max_t_training, device):
+    """
+    Plot transformed trajectory (X_final and U_final) without energy or mean calculations.
+    """
+    # Determine which columns are available
+    phi_column = None
+    if 'phi' in test_id_df.columns:
+        phi_column = 'phi'
+    elif 'phi0' in test_id_df.columns:
+        phi_column = 'phi0'
+    
+    # Load trajectory data
+    test_trajectory_data = get_data_from_trajectory_id_function(
+        test_id_df, test_df, trajectory_ids=trajectory_id
+    )
+    
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+    
+    # Filter by max_t_training
+    mask = t < max_t_training
+    x_filtered = x[mask]
+    u_filtered = u[mask]
+    t_filtered = t[mask]
+    
+    # Apply mapping network
+    X_final, U_final, t_final = mapping_net(x_filtered, u_filtered, t_filtered)
+    
+    # Fetch reference values for this trajectory (if they exist)
+    trajectory_row = test_id_df[test_id_df['trajectory_id'] == trajectory_id].iloc[0]
+    phi_value = trajectory_row[phi_column] if phi_column is not None else None
+    
+    # Convert tensors to numpy
+    X_final_np = X_final.cpu().detach().numpy()
+    U_final_np = U_final.cpu().detach().numpy()
+    t_final_np = t_final.cpu().detach().numpy()
+    
+    # ==================== PLOT: X_final and U_final ====================
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # --- Subplot 1: X_final ---
+    ax1.plot(t_final_np, X_final_np, label='X_final', color='blue')
+    
+    if phi_value is not None:
+        ax1.axhline(y=phi_value, color='orange', linestyle='--', linewidth=2, 
+                    label=f'{phi_column} = {phi_value:.4f}')
+        
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel('X_final')
+    ax1.set_title(f'X_final - Trajectory {trajectory_id}')
+    ax1.grid(True)
+    ax1.legend()
+    
+    # --- Subplot 2: U_final ---
+    ax2.plot(t_final_np, U_final_np, label='U_final', color='red')
+
+    ax2.set_xlabel('Time (t)')
+    ax2.set_ylabel('U_final')
+    ax2.set_title(f'U_final - Trajectory {trajectory_id}')
+    ax2.grid(True)
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def get_top_checkpoint_epochs(save_dir_path, metrics_to_analyze):
+    """
+    For each metric, finds the top 5 epochs (multiples of 10) with the lowest values.
+    Returns a list of unique checkpoint filenames.
+    
+    Args:
+        save_dir_path (str): Path to the main directory containing 'epoch_n' subdirectories.
+        metrics_to_analyze (list of str): List of metric names to analyze.
+    
+    Returns:
+        list of str: List starting with "best_model.pt" followed by unique checkpoint filenames
+                     in format "checkpoint_epoch_{epoch_number}.pt"
+    """
+
+    
+    # --- Collect all epoch directories ---
+    epoch_dirs = sorted(
+        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
+        key=lambda x: int(x.split("_")[1])
+    )
+    
+    # --- Collect data ---
+    metrics_data = {metric: [] for metric in metrics_to_analyze}
+    epochs = []
+    
+    for d in epoch_dirs:
+        epoch_path = os.path.join(save_dir_path, d, "epoch_metrics.json")
+        if not os.path.isfile(epoch_path):
+            continue
+        
+        with open(epoch_path, "r") as f:
+            data = json.load(f)
+        
+        epoch_num = data.get("epoch", int(d.split("_")[1]))
+        epochs.append(epoch_num)
+        
+        for metric in metrics_to_analyze:
+            metrics_data[metric].append(data.get(metric, None))
+    
+    # --- Collect all unique epochs from top 5s ---
+    unique_epochs = set()
+    
+    for metric in metrics_to_analyze:
+        # Filter for epochs that are multiples of 10
+        filtered_data = [
+            (epoch, value) 
+            for epoch, value in zip(epochs, metrics_data[metric]) 
+            if epoch % 10 == 0 and value is not None
+        ]
+        
+        if not filtered_data:
+            continue
+        
+        # Sort by value (lowest first) and take top 5
+        top_5 = sorted(filtered_data, key=lambda x: x[1])[:5]
+        
+        for epoch, value in top_5:
+            unique_epochs.add(epoch)
+    
+    # --- Create checkpoint list ---
+    checkpoint_list = ["best_model.pt"]
+    
+    # Sort epochs and create checkpoint filenames
+    for epoch in sorted(unique_epochs):
+        checkpoint_list.append(f"checkpoint_epoch_{epoch}.pt")
+    
+    return checkpoint_list
+
+
+def evaluate_all_checkpoints(
+    # Checkpoint selection parameters
+    save_dir_path,
+    metrics_to_analyze,
+    # Model instance (already initialized)
+    mapping_net,
+    device,
+    # Test function arguments
+    get_data_from_trajectory_id_function,
+    prediction_loss_function,
+    test_id_df,
+    test_df,
+    point_indexes_observed,
+    recreate_and_plot_phase_space=False,
+    plot_specific_portion=None,
+    connect_points=False,
+    plot_trajectories_subsample=None,
+    max_t_training=None,
+    efficiently=True,
+    method="mahalanobis",
+    threshold=1.0,
+    dt=0.1,
+    alpha=1.0,
+    gamma=1.0,
+    cluster_weight_threshold=0.4,
+    max_n_components=5,
+    search_range_lower_pct=0.5,
+    search_range_upper_pct=0.6,
+    verbose=True
+):
+    """
+    Evaluates all top checkpoints and stores performance metrics.
+    
+    Args:
+        save_dir_path (str): Directory where checkpoints are stored
+        metrics_to_analyze (list): List of metric names to analyze for checkpoint selection
+        mapping_net: Already initialized model instance
+        device (str): Device to run on ('cuda' or 'cpu')
+        ... (all test_model_in_all_trajectories_in_df parameters)
+    
+    Returns:
+        tuple: (results_dict, best_checkpoint_path)
+            - results_dict: Dictionary with checkpoint names as keys and performance metrics as values
+            - best_checkpoint_path: String path to the checkpoint with minimum loss_per_sqrt_energy
+    """
+    # Get list of checkpoints to evaluate
+    checkpoints_list = get_top_checkpoint_epochs(
+        save_dir_path=save_dir_path,
+        metrics_to_analyze=metrics_to_analyze
+    )
+    
+    results = {}
+    
+    print(f"\n🔍 Evaluating {len(checkpoints_list)} checkpoints...\n")
+    
+    for idx, checkpoint_name in enumerate(checkpoints_list, 1):
+        print(f"[{idx}/{len(checkpoints_list)}] Evaluating {checkpoint_name}...")
+        
+        # Construct full checkpoint path
+        checkpoint_path = os.path.join(save_dir_path, checkpoint_name)
+        
+        # Load checkpoint into existing model
+        load_checkpoint(
+            path=checkpoint_path,
+            mapping_net=mapping_net,
+            device=device,
+            optimizer=None,
+            scheduler=None
+        )
+        
+        # Create inverse network
+        inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
+        
+        # Test the model
+        prediction_test_df, mean_prediction_loss_test = test_model_in_all_trajectories_in_df(
+            get_data_from_trajectory_id_function=get_data_from_trajectory_id_function,
+            prediction_loss_function=prediction_loss_function,
+            test_id_df=test_id_df,
+            test_df=test_df,
+            mapping_net=mapping_net,
+            inverse_net=inverse_net,
+            device=device,
+            point_indexes_observed=point_indexes_observed,
+            recreate_and_plot_phase_space=recreate_and_plot_phase_space,
+            plot_specific_portion=plot_specific_portion,
+            connect_points=connect_points,
+            plot_trajectories_subsample=plot_trajectories_subsample,
+            max_t_training=max_t_training,
+            efficiently=efficiently,
+            method=method,
+            threshold=threshold,
+            dt=dt,
+            alpha=alpha,
+            gamma=gamma,
+            cluster_weight_threshold=cluster_weight_threshold,
+            max_n_components=max_n_components,
+            search_range_lower_pct=search_range_lower_pct,
+            search_range_upper_pct=search_range_upper_pct,
+            verbose=verbose
+        )
+        
+        # Find the row with minimum loss_per_sqrt_energy
+        min_idx = prediction_test_df['loss_per_sqrt_energy'].idxmin()
+        min_row = prediction_test_df.loc[min_idx]
+        
+        # Store results
+        results[checkpoint_name] = {
+            'mean_prediction_loss': mean_prediction_loss_test,
+            'min_loss_per_sqrt_energy': min_row['loss_per_sqrt_energy'],
+            'best_trajectory_id': min_row['trajectory_id'],
+            'best_energy': min_row['energy']
+        }
+        
+        print(f"  ✓ Mean loss: {mean_prediction_loss_test:.6f}")
+        print(f"  ✓ Best loss_per_sqrt_energy: {min_row['loss_per_sqrt_energy']:.6f} "
+              f"(trajectory {min_row['trajectory_id']}, energy {min_row['energy']:.4f})\n")
+    
+    print("✅ Evaluation complete!\n")
+    
+    # Print top 5 checkpoints by min_loss_per_sqrt_energy
+    print("=" * 80)
+    print("🏆 TOP 5 CHECKPOINTS BY MIN LOSS PER SQRT ENERGY")
+    print("=" * 80)
+    
+    # Sort results by min_loss_per_sqrt_energy
+    sorted_results = sorted(
+        results.items(),
+        key=lambda x: x[1]['min_loss_per_sqrt_energy']
+    )[:5]
+    
+    for rank, (checkpoint_name, metrics) in enumerate(sorted_results, 1):
+        print(f"\n{rank}. {checkpoint_name}")
+        print(f"   Loss per sqrt energy: {metrics['min_loss_per_sqrt_energy']:.6f}")
+        print(f"   Trajectory ID: {metrics['best_trajectory_id']}")
+        print(f"   Energy: {metrics['best_energy']:.4f}")
+        print(f"   Mean prediction loss: {metrics['mean_prediction_loss']:.6f}")
+    
+    print("\n" + "=" * 80 + "\n")
+    
+    # Get the best checkpoint path
+    best_checkpoint_name = sorted_results[0][0]
+    best_checkpoint_path = os.path.join(save_dir_path, best_checkpoint_name)
+    
+    return results, best_checkpoint_path

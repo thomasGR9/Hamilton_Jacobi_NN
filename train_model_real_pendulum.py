@@ -72,7 +72,7 @@ def main():
     if resume_training == False:
         training_seed = 42
     else:
-        resume_training_counter = 1
+        resume_training_counter = 2
         training_seed = 42 + resume_training_counter
     
     train_dataloader = create_simple_dataloader(
@@ -335,7 +335,7 @@ def main():
             load_scheduler_and_optimizer=True,
             
             # Optimizer parameters
-            learning_rate=1e-4,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
+            learning_rate=0.00001,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
             weight_decay=1e-4,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
             optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
             
