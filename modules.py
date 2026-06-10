@@ -27,6 +27,9 @@ import torch.nn.functional as F
 import re
 from scipy.spatial.distance import mahalanobis
 from sklearn.mixture import BayesianGaussianMixture
+import datetime
+from pathlib import Path
+
 
 
 def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
@@ -1417,132 +1420,7 @@ class TrajectoryStats:
 
 
 
-class IntraTrajectoryVarianceLossEfficient(nn.Module):
-    """Variance loss - uses precomputed stats"""
-    
-    def __init__(self):
-        super().__init__()
-            
-    def forward(
-        self, 
-        X_final: torch.Tensor, 
-        U_final: torch.Tensor, 
-        trajectory_ids: torch.Tensor,
-        stats = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            stats: Optional TrajectoryStats object to avoid recomputation
-        """
-        # Use precomputed stats if available
-        if stats is None:
-            unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
-            n_trajectories = len(unique_ids)
-            
-            # EXACTLY as original - uses float counts
-            counts = torch.zeros(n_trajectories, device=trajectory_ids.device)
-            counts = counts.scatter_add_(0, inverse_indices, 
-                                       torch.ones_like(inverse_indices, dtype=torch.float))
-            
-            X_sums = torch.zeros(n_trajectories, device=X_final.device, dtype=X_final.dtype)
-            U_sums = torch.zeros(n_trajectories, device=U_final.device, dtype=U_final.dtype)
-            X_sums = X_sums.scatter_add_(0, inverse_indices, X_final)
-            U_sums = U_sums.scatter_add_(0, inverse_indices, U_final)
-            
-            X_means = X_sums / counts
-            U_means = U_sums / counts
-            inverse = inverse_indices
-        else:
-            n_trajectories = stats.n_trajectories
-            # Use float counts for variance (matches original)
-            counts = stats.counts_float
-            X_means = stats.X_sums / counts
-            U_means = stats.U_sums / counts
-            inverse = stats.inverse_indices
-        
-        # Rest is IDENTICAL to original
-        X_centered = X_final - X_means[inverse]
-        U_centered = U_final - U_means[inverse]
-        
-        X_sq_sums = torch.zeros(n_trajectories, device=X_final.device, dtype=X_final.dtype)
-        U_sq_sums = torch.zeros(n_trajectories, device=U_final.device, dtype=U_final.dtype)
-        X_sq_sums = X_sq_sums.scatter_add_(0, inverse, X_centered ** 2)
-        U_sq_sums = U_sq_sums.scatter_add_(0, inverse, U_centered ** 2)
-        
-        valid_mask_float = (counts > 1).float()
-        safe_denominator = torch.maximum(
-            counts - 1, 
-            torch.ones_like(counts)
-        )
-        
-        X_variances_all = X_sq_sums / safe_denominator
-        U_variances_all = U_sq_sums / safe_denominator
-        X_variances = X_variances_all * valid_mask_float
-        U_variances = U_variances_all * valid_mask_float
-        
-        total_variance = X_variances.sum() + U_variances.sum()
-        total_mean_variance = total_variance / max(n_trajectories, 1)
-        
-        return total_mean_variance
-    
-class AdaptiveSoftRepulsionLoss(nn.Module):
-    """Adaptive soft repulsion loss - uses precomputed stats"""
-    def __init__(self, epsilon=1e-3, k=1.0):
-        super().__init__()
-        self.epsilon = epsilon
-        self.k = k
-        self.numerical_eps = 1e-8
 
-    def forward(self, X_final, U_final, trajectory_ids, stats=None):
-        """
-        Args:
-            stats: Optional TrajectoryStats object to avoid recomputation
-        """
-        device = X_final.device
-        dtype = X_final.dtype
-        
-        # Use precomputed stats if available
-        if stats is None:
-            unique_ids, inverse = torch.unique(trajectory_ids, return_inverse=True)
-            N = unique_ids.shape[0]
-            
-            if N <= 1:
-                return X_final.sum() * 0.0
-            
-            # EXACTLY as original
-            sums_x = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, X_final)
-            sums_u = torch.zeros(N, device=device, dtype=dtype).scatter_add_(0, inverse, U_final)
-            counts = torch.bincount(inverse, minlength=N).to(dtype=dtype, device=device)
-            
-            X_means = sums_x / counts
-            U_means = sums_u / counts
-        else:
-            N = stats.n_trajectories
-            if N <= 1:
-                return X_final.sum() * 0.0
-            
-            X_means = stats.X_means
-            U_means = stats.U_means
-
-        # Rest is IDENTICAL to original
-        idx = torch.triu_indices(N, N, offset=1, device=device)
-        i, j = idx[0], idx[1]
-
-        dx = X_means[i] - X_means[j]
-        du = U_means[i] - U_means[j]
-        dij = torch.sqrt(dx * dx + du * du + self.numerical_eps)
-
-        c_norms = torch.sqrt(X_means * X_means + U_means * U_means + self.numerical_eps).detach()
-        C_sum_pairs = 0.5 * (c_norms[i] + c_norms[j])
-        eps_t = X_final.new_tensor(self.epsilon)
-        Tij_pairs = torch.maximum(eps_t, self.k * C_sum_pairs).detach()
-
-        exp_vals = torch.exp(-dij / (Tij_pairs + self.numerical_eps))
-        sum_ordered = 2.0 * exp_vals.sum()
-        Z = float(N * (N - 1))
-        loss = sum_ordered / Z
-
-        return loss
     
 def hsic_loss(
     X_final: torch.Tensor, 
@@ -1948,38 +1826,7 @@ class InverseStackedHamiltonianNetwork(nn.Module):
 
         
 
-def reconstruction_loss(
-    x_recon, u_recon, t_recon,
-    x_orig, u_orig, t_orig,
-    loss_type='mse'
-):
-    """
-    Compute reconstruction loss between reconstructed and original values.
-    
-    Args:
-        x_recon, u_recon, t_recon: Reconstructed values from inverse network
-        x_orig, u_orig, t_orig: Original batch values
-        x_weight, u_weight, t_weight: Weights for each component (t_weight=0 by default since t shouldn't change)
-        loss_type: 'mse' for mean squared error or 'mae' for mean absolute error
-        
-    Returns:
-        loss: Scalar loss value
-    """
-    if loss_type == 'mse':
-        x_loss = torch.mean((x_recon - x_orig) ** 2)
-        u_loss = torch.mean((u_recon - u_orig) ** 2)
-        t_loss = torch.mean((t_recon - t_orig) ** 2)
-    elif loss_type == 'mae':
-        x_loss = torch.mean(torch.abs(x_recon - x_orig))
-        u_loss = torch.mean(torch.abs(u_recon - u_orig))
-        t_loss = torch.mean(torch.abs(t_recon - t_orig))
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
-    
-    # Weighted sum
-    total_loss = x_loss + u_loss + t_loss
-    
-    return total_loss
+
 
 def prepare_prediction_inputs(
     X_final: torch.Tensor,
@@ -2075,6 +1922,10 @@ def prepare_prediction_inputs(
         t_for_pred[mask] = selected_times
 
     return X_final_mean, U_final_mean, t_for_pred
+
+
+
+
 
 
 def prepare_prediction_inputs_for_real_pendulum_2(
@@ -2286,101 +2137,7 @@ def generate_prediction_labels(
     return X_labels, U_labels, t_labels
 
 
-def generate_prediction_labels_for_real_pendulum(
-    train_df: pd.DataFrame,
-    train_id_df: pd.DataFrame,
-    trajectory_ids: torch.Tensor,
-    t_for_pred: torch.Tensor,
-    batch_t: torch.Tensor,  # The batch['t'] value (1D tensor with single value)
-    get_data_from_trajectory_id: callable,
-    predict_full_trajectory: bool = False,
-    possible_t_values: List[float] = None,
-    alpha: float = 0.5,  # Exponential decay rate hyperparameter
-    window_size: int = 5  # Number of indices on each side with weight 1
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Generate ground truth labels for prediction task with a weight mask for real pendulum.
-    
-    Args:
-        train_df: DataFrame with columns ['x', 'u', 't']
-        train_id_df: DataFrame with trajectory metadata
-        trajectory_ids: Trajectory IDs for each sample in batch
-        t_for_pred: Time values to predict at
-        batch_t: The sampled time value from the batch (1D tensor with single value)
-        get_data_from_trajectory_id: Function to get trajectory data
-        predict_full_trajectory: If True, predict at all possible_t_values for each unique trajectory
-        possible_t_values: List of all possible time values (required if predict_full_trajectory=True)
-        alpha: Exponential decay rate for weights outside the window (higher = faster decay)
-        window_size: Number of indices on each side of batch_t index that have weight 1
-        
-    Returns:
-        X_labels: Ground truth x values at t_for_pred times
-        U_labels: Ground truth u values at t_for_pred times
-        t_labels: Same as t_for_pred (for consistency)
-        weight_mask: Weight mask with 1s near batch_t and exponentially decaying values elsewhere
-    """
-    device = trajectory_ids.device
-    
-    # NEW BEHAVIOR: Predict full trajectory at all possible_t_values
-    if predict_full_trajectory:
-        if possible_t_values is None:
-            raise ValueError("possible_t_values must be provided when predict_full_trajectory=True")
-        
-        # Get unique trajectories from the batch (maintains order)
-        unique_ids = torch.unique(trajectory_ids).cpu().numpy()
-        n_times = len(possible_t_values)
-        n_trajectories = len(unique_ids)
-        
-        # Initialize output tensors with same shape and device as t_for_pred
-        X_labels = torch.zeros_like(t_for_pred)
-        U_labels = torch.zeros_like(t_for_pred)
-        
-        # Fill in labels for each unique trajectory
-        for traj_idx, traj_id in enumerate(unique_ids):
-            # Get full trajectory data
-            traj_df = get_data_from_trajectory_id(
-                ids_df=train_id_df,
-                data_df=train_df,
-                trajectory_ids=int(traj_id)
-            )
-            
-            if traj_df is None or len(traj_df) == 0:
-                print(f"Error: No data found for trajectory_id {traj_id}")
-                return [], [], [], []
-            
-            # Extract x and u values directly
-            x_values = torch.tensor(traj_df['x'].values, device=device)
-            u_values = torch.tensor(traj_df['u'].values, device=device)
-            
-            # Fill the corresponding block
-            start_idx = traj_idx * n_times
-            end_idx = start_idx + n_times
-            X_labels[start_idx:end_idx] = x_values
-            U_labels[start_idx:end_idx] = u_values
-        
-        t_labels = t_for_pred.clone()
-        
-        # --- Create weight mask ---
-        # Find the index in possible_t_values that corresponds to batch_t
-        batch_t_value = batch_t.item() if batch_t.numel() == 1 else batch_t[0].item()
-        t_array = np.array(possible_t_values)
-        center_idx = np.argmin(np.abs(t_array - batch_t_value))
-        
-        # Create mask for one trajectory block
-        indices = torch.arange(n_times, device=device, dtype=torch.float32)
-        distances = torch.abs(indices - center_idx)
-        
-        # Create single trajectory mask
-        single_mask = torch.where(
-            distances <= window_size,
-            torch.ones_like(distances),  # Weight 1 within window
-            torch.exp(-alpha * (distances - window_size))  # Exponential decay outside
-        )
-        
-        # Repeat the mask for all trajectories
-        weight_mask = single_mask.repeat(n_trajectories)
-        
-        return X_labels, U_labels, t_labels, weight_mask
+
     
 
 def generate_prediction_labels_for_real_pendulum_2(
@@ -2484,88 +2241,9 @@ def prediction_loss(
     total_loss = x_loss + u_loss
     return total_loss
 
-def prediction_loss_for_real_pendulum(
-    x_pred: torch.Tensor,
-    u_pred: torch.Tensor,
-    X_labels: torch.Tensor,
-    U_labels: torch.Tensor,
-    weight_mask: torch.Tensor,
-    loss_type: str = "mae"
-) -> torch.Tensor:
-    """
-    Compute weighted prediction loss using either Mean Absolute Error (MAE) or Mean Squared Error (MSE).
-    
-    Args:
-        x_pred: Predicted positions from inverse network, shape (batch_size,)
-        u_pred: Predicted velocities from inverse network, shape (batch_size,)
-        X_labels: Ground truth positions, shape (batch_size,)
-        U_labels: Ground truth velocities, shape (batch_size,)
-        weight_mask: Weight mask for each sample, shape (batch_size,)
-        loss_type: Type of loss to use, either 'mae' or 'mse'. Default is 'mae'.
-        
-    Returns:
-        loss: Scalar weighted MAE or MSE loss
-    """
-    if loss_type.lower() == "mae":
-        x_loss = torch.mean(weight_mask * torch.abs(x_pred - X_labels))
-        u_loss = torch.mean(weight_mask * torch.abs(u_pred - U_labels))
-    elif loss_type.lower() == "mse":
-        x_loss = torch.mean(weight_mask * (x_pred - X_labels) ** 2)
-        u_loss = torch.mean(weight_mask * (u_pred - U_labels) ** 2)
-    else:
-        raise ValueError(f"Invalid loss_type '{loss_type}'. Choose either 'mae' or 'mse'.")
 
-    total_loss = x_loss + u_loss
-    return total_loss
 
-def trajectory_normalized_mse(
-    x_pred: torch.Tensor,
-    u_pred: torch.Tensor,
-    X_labels: torch.Tensor,
-    U_labels: torch.Tensor,
-    trajectory_ids: torch.Tensor,
-    eps: float = 1e-8,
-    stats = None
-) -> torch.Tensor:
-    """Trajectory-normalized MSE - uses precomputed stats for grouping only"""
-    
-    device = x_pred.device
-    
-    # Use precomputed stats if available (only need grouping info)
-    if stats is None:
-        unique_ids, inverse_indices = torch.unique(trajectory_ids, return_inverse=True)
-        n_trajectories = len(unique_ids)
-        
-        # EXACTLY as original - uses float counts
-        counts = torch.zeros(n_trajectories, device=device)
-        counts = counts.scatter_add_(
-            0, 
-            inverse_indices, 
-            torch.ones_like(inverse_indices, dtype=torch.float)
-        )
-    else:
-        inverse_indices = stats.inverse_indices
-        n_trajectories = stats.n_trajectories
-        counts = stats.counts_float
-    
-    # Rest is IDENTICAL to original
-    X_sq_sums = torch.zeros(n_trajectories, device=device, dtype=X_labels.dtype)
-    U_sq_sums = torch.zeros(n_trajectories, device=device, dtype=U_labels.dtype)
-    X_sq_sums = X_sq_sums.scatter_add_(0, inverse_indices, X_labels**2)
-    U_sq_sums = U_sq_sums.scatter_add_(0, inverse_indices, U_labels**2)
-    
-    scale_x_per_traj = (torch.sqrt(X_sq_sums / counts) + eps).detach()
-    scale_u_per_traj = (torch.sqrt(U_sq_sums / counts) + eps).detach()
-    
-    scale_x = scale_x_per_traj[inverse_indices]
-    scale_u = scale_u_per_traj[inverse_indices]
-    
-    err_x_normalized = (x_pred - X_labels) / scale_x
-    err_u_normalized = (u_pred - U_labels) / scale_u
-    
-    loss = torch.mean(err_x_normalized**2 + err_u_normalized**2)
-    
-    return loss
+
 
 def prediction_loss_euclidean(
     x_pred: torch.Tensor,
@@ -2587,77 +2265,7 @@ def prediction_loss_euclidean(
     """
     euclidean_distances = torch.sqrt((x_pred - X_labels) ** 2 + (u_pred - U_labels) ** 2)
     return torch.mean(euclidean_distances)
-'''
-def compute_total_loss(mapping_loss, repulsion_loss, hsic_loss, reconstruction_loss, prediction_loss, 
-                      mapping_coefficient, repulsion_coefficient, prediction_coefficient,
-                      mapping_loss_scale, prediction_loss_scale, hsic_loss_slope,
-                      reconstruction_threshold, reconstruction_loss_multiplier):
-    """
-    Compute final total loss with scale normalization and gradient-safe safety switch.
-    
-    Args:
-        mapping_loss: Raw mapping loss tensor (with gradients)
-        repulsion_loss: Raw repulsion loss tensor (with gradients)
-        reconstruction_loss: Raw reconstruction loss tensor (with gradients)
-        prediction_loss: Raw prediction loss tensor (with gradients)
-        mapping_coefficient: Fixed weight for mapping loss (float, no gradients)
-        repulsion_coefficient: Fixed weight for repulsion loss (float, no gradients)
-        prediction_coefficient: Fixed weight for prediction loss (float, no gradients)
-        mapping_loss_scale: Fixed scale for mapping loss normalization (float, no gradients)
-        prediction_loss_scale: Fixed scale for prediction loss normalization (float, no gradients)
-        reconstruction_threshold: Threshold for reconstruction safety switch (float, no gradients)
-        reconstruction_loss_multiplier: Target multiplier when threshold exceeded (float, no gradients)
-        
-    Returns:
-        total_loss: Final weighted and scaled loss tensor (gradients flow back to input losses)
-    """
-    
-    # Scale mapping and prediction losses by fixed scales (gradients preserved)
-    mapping_loss_scaled = mapping_loss / mapping_loss_scale
-    prediction_loss_scaled = prediction_loss / prediction_loss_scale
 
-    
-
-    hsic_loss_scaled = hsic_loss * hsic_loss_slope
-    
-    # ===== GRADIENT-SAFE SAFETY SWITCH =====
-
-    
-    # Very sharp transition 
-    # This creates an almost step-like function
-    sharpness = 100.0  # Higher = sharper transition (closer to original if/else)
-    
-    smooth_factor = torch.sigmoid(
-        sharpness * (reconstruction_loss.detach() - reconstruction_threshold)
-    )
-    
-    # Compute the high-loss multiplier
-    # Use detach() to get values without gradient flow for the multiplier calculation
-    avg_other_losses = (mapping_loss_scaled.detach() + prediction_loss_scaled.detach()) / 2
-    target_loss = reconstruction_loss_multiplier * avg_other_losses
-    
-    # Safe division with epsilon
-    eps = 1e-8
-    high_multiplier = target_loss / (reconstruction_loss.detach() + eps)
-    
-    # Smooth interpolation between multipliers
-    # Below threshold: multiplier ≈ 1.0
-    # Above threshold: multiplier ≈ high_multiplier
-    multiplier = 1.0 * (1 - smooth_factor) + high_multiplier * smooth_factor
-    
-    reconstruction_loss_scaled = reconstruction_loss * multiplier
-    
-    # Combine all losses with coefficients
-    total_loss = (
-        mapping_coefficient * mapping_loss_scaled + 
-        repulsion_coefficient * repulsion_loss +
-        hsic_loss_scaled +
-        reconstruction_loss_scaled +
-        prediction_coefficient * prediction_loss_scaled
-    )
-    
-    return total_loss
-'''
 
 def compute_total_loss(hsic_loss, prediction_loss, prediction_coefficient,
                       prediction_loss_scale, hsic_loss_slope):
@@ -2869,110 +2477,13 @@ def compute_single_trajectory_stats(X_final, U_final):
     # Return all as numpy values
     return total_variance,  X_mean.item(), U_mean.item(), X_var.item(), U_var.item(), X_std.item(), U_std.item()
 
-def single_trajectory_normalized_mse(
-    x_pred: torch.Tensor,
-    u_pred: torch.Tensor,
-    X_labels: torch.Tensor,
-    U_labels: torch.Tensor,
-    eps: float = 1e-8
-) -> torch.Tensor:
-    """
-    Compute normalized MSE for a single trajectory.
-    All inputs belong to the same trajectory - no grouping needed.
-    
-    Args:
-        x_pred: Predicted positions from single trajectory, shape (n_samples,)
-        u_pred: Predicted velocities from single trajectory, shape (n_samples,)
-        X_labels: Ground truth positions from single trajectory, shape (n_samples,)
-        U_labels: Ground truth velocities from single trajectory, shape (n_samples,)
-        eps: Small constant for numerical stability
-        
-    Returns:
-        loss: Scalar normalized MSE loss
-    """
-    # Compute RMS scales directly (no grouping needed)
-    # RMS = sqrt(mean(values^2))
-    scale_x = torch.sqrt(torch.mean(X_labels**2)) + eps
-    scale_u = torch.sqrt(torch.mean(U_labels**2)) + eps
-    
-    # CRITICAL: Detach scales to prevent gradient flow
-    scale_x = scale_x.detach()
-    scale_u = scale_u.detach()
-    
-    # Compute normalized errors
-    err_x_normalized = (x_pred - X_labels) / scale_x
-    err_u_normalized = (u_pred - U_labels) / scale_u
-    
-    # MSE of normalized errors
-    loss = torch.mean(err_x_normalized**2 + err_u_normalized**2)
-    
-    return loss
 
 
-def generate_validation_labels_single_trajectory(
-    val_df: pd.DataFrame,
-    val_id_df: pd.DataFrame,
-    trajectory_id: int,  # Single trajectory ID (np.int64)
-    t_rearranged: torch.Tensor,  # Rearranged times to predict at
-    get_data_from_trajectory_id: callable
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Generate ground truth labels for validation with single trajectory.
-    
-    Args:
-        val_df: DataFrame with columns ['x', 'u', 't']
-        val_id_df: DataFrame with trajectory metadata
-        trajectory_id: Single trajectory ID (int or np.int64)
-        t_rearranged: Rearranged time values to predict at
-        get_data_from_trajectory_id: Function to get trajectory data
-        
-    Returns:
-        X_val_labels: Ground truth x values at t_rearranged times
-        U_val_labels: Ground truth u values at t_rearranged times
-        t_val_labels: Same as t_rearranged (for consistency)
-    """
-    n_points = len(t_rearranged)
-    device = t_rearranged.device
-    
-    # Initialize output tensors
-    X_val_labels = torch.zeros(n_points, device=device)
-    U_val_labels = torch.zeros(n_points, device=device)
-    
-    # Get trajectory data once
-    traj_df = get_data_from_trajectory_id(
-        ids_df=val_id_df,
-        data_df=val_df,
-        trajectory_ids=trajectory_id
-    )
-    
-    # Get trajectory values
-    t_values = traj_df['t'].values
-    x_values = traj_df['x'].values
-    u_values = traj_df['u'].values
-    
-    # Convert rearranged times to numpy
-    t_rearranged_np = t_rearranged.cpu().numpy()
-    
-    # For each rearranged time, find corresponding x, u
-    for i in range(n_points):
-        t_target = t_rearranged_np[i]
-        
-        # Find exact match (should always exist for validation)
-        exact_match = np.isclose(t_values, t_target, atol=1e-8)
-        if exact_match.any():
-            idx = np.where(exact_match)[0][0]
-            X_val_labels[i] = x_values[idx]
-            U_val_labels[i] = u_values[idx]
-        else:
-            print(f"Warning: Time {t_target} not found in trajectory {trajectory_id}")
-    
-    # t_labels is just t_rearranged for consistency
-    t_val_labels = t_rearranged.clone()
-    
-    return X_val_labels, U_val_labels, t_val_labels
 
 
-def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, predict_full_trajectory, add_noise, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
+
+
+def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, predict_full_trajectory, add_noise, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
     mapping_net.to(device)
     mapping_net.eval()
 
@@ -3006,23 +2517,15 @@ def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, 
                 predict_full_trajectory=predict_full_trajectory,
                 possible_t_values=possible_t_values,
             )
-        if normalized_mse:
-            prediction_loss_ = trajectory_normalized_mse(
-            x_pred=x_pred, 
-            u_pred=u_pred, 
-            X_labels=X_labels, 
-            U_labels=U_labels,
-            trajectory_ids=batch['trajectory_ids']
-            )           
+       
 
-        else:
-            prediction_loss_ = prediction_loss(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    loss_type=loss_type
-                )
+        prediction_loss_ = prediction_loss(
+                x_pred=x_pred, 
+                u_pred=u_pred, 
+                X_labels=X_labels, 
+                U_labels=U_labels,
+                loss_type=loss_type
+            )
 
         return prediction_loss_.item()
 
@@ -3091,7 +2594,6 @@ def train_model(
     prediction_loss_scale,
     loss_type,
     predict_full_trajectory,
-    normalized_mse,
 
     prediction_coefficient,
 
@@ -3293,7 +2795,6 @@ def train_model(
                 run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
                 run_hyperparameters['loss_type'] = loss_type
                 run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
-                run_hyperparameters['normalized_mse'] = normalized_mse
                 
 
                 run_hyperparameters['prediction_coefficient'] = prediction_coefficient
@@ -3432,24 +2933,15 @@ def train_model(
                 predict_full_trajectory=predict_full_trajectory,  
                 possible_t_values=possible_t_values 
             )
-
-        if normalized_mse:
-            prediction_loss_ = trajectory_normalized_mse(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    trajectory_ids=batch['trajectory_ids'],
-                    stats=stats
-                )           
-        else:        
-            prediction_loss_ = prediction_loss(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    loss_type=loss_type
-                )
+         
+       
+        prediction_loss_ = prediction_loss(
+                x_pred=x_pred, 
+                u_pred=u_pred, 
+                X_labels=X_labels, 
+                U_labels=U_labels,
+                loss_type=loss_type
+            )
 
         total_loss_ = compute_total_loss(
                 hsic_loss = hsic_loss_,
@@ -3490,24 +2982,14 @@ def train_model(
         possible_t_values=possible_t_values 
         )
 
-
-        if normalized_mse:
-            prediction_loss_ = trajectory_normalized_mse(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    trajectory_ids=traj_id_tensor,
-                    stats=None
-                )           
-        else:        
-            prediction_loss_ = prediction_loss(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    loss_type=loss_type
-                )
+   
+        prediction_loss_ = prediction_loss(
+                x_pred=x_pred, 
+                u_pred=u_pred, 
+                X_labels=X_labels, 
+                U_labels=U_labels,
+                loss_type=loss_type
+        )
 
 
 
@@ -3975,7 +3457,6 @@ def train_model(
 
 
         run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
-        run_hyperparameters['normalized_mse'] = normalized_mse
         run_hyperparameters['loss_type'] = loss_type
         run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
 
@@ -4053,7 +3534,6 @@ def resume_training_from_checkpoint(
     prediction_loss_scale,
     predict_full_trajectory,
     loss_type,
-    normalized_mse,
     prediction_coefficient,
     hsic_loss_max_want,
     on_distribution_val_criterio_weight=0.75,
@@ -4236,7 +3716,6 @@ def resume_training_from_checkpoint(
             prediction_loss_scale=prediction_loss_scale,
             predict_full_trajectory=predict_full_trajectory,
             loss_type=loss_type,
-            normalized_mse=normalized_mse,
 
             prediction_coefficient=prediction_coefficient,
             hsic_loss_max_want = hsic_loss_max_want,
@@ -4302,7 +3781,6 @@ def resume_training_from_checkpoint(
             prediction_loss_scale=prediction_loss_scale,
             predict_full_trajectory=predict_full_trajectory,
             loss_type=loss_type,
-            normalized_mse=normalized_mse,
             prediction_coefficient=prediction_coefficient,
 
             hsic_loss_max_want = hsic_loss_max_want,
@@ -4341,1524 +3819,7 @@ def resume_training_from_checkpoint(
             # Device
             device=device,)
     
-'''
-def calculate_losses_scale_on_untrained(train_loader, mapping_net, inverse_net, var_loss_class, get_data_from_trajectory_id, possible_t_values, train_df, train_id_df,loss_type, predict_full_trajectory, add_noise, normalized_mse, save_returned_values, save_dir, noise_threshold_mean_divided_by_std = 2, device="cuda"):
-    mapping_net.to(device)
-    mapping_net.eval()
 
-    def forward_pass_for_rescaling(batch,predict_full_trajectory, add_noise):
-        if add_noise:
-            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
-            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
-        
-        else:
-            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
-
-        X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
-        variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'])
-
-        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs(
-            X_final, U_final, 
-            t_batch=batch['t'], 
-            trajectory_ids=batch['trajectory_ids'], 
-            possible_t_values=possible_t_values,
-            stats=None,
-            predict_full_trajectory=predict_full_trajectory)
-        
-        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
-
-        X_labels, U_labels, _ = generate_prediction_labels(
-                train_df=train_df, 
-                train_id_df=train_id_df, 
-                trajectory_ids=batch['trajectory_ids'], 
-                t_for_pred=t_for_pred, 
-                get_data_from_trajectory_id=get_data_from_trajectory_id,
-                predict_full_trajectory=predict_full_trajectory,
-                possible_t_values=possible_t_values,
-            )
-        if normalized_mse:
-            prediction_loss_ = trajectory_normalized_mse(
-            x_pred=x_pred, 
-            u_pred=u_pred, 
-            X_labels=X_labels, 
-            U_labels=U_labels,
-            trajectory_ids=batch['trajectory_ids']
-            )           
-
-        else:
-            prediction_loss_ = prediction_loss(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    loss_type=loss_type
-                )
-
-        return variance_loss_.item(), prediction_loss_.item()
-
-    variance_losses_list = []
-    prediction_losses_list = []
-    for batch_idx, batch in enumerate(train_loader):
-        variance_loss_, prediction_loss_ = forward_pass_for_rescaling(batch,predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
-        variance_losses_list.append(variance_loss_)
-        prediction_losses_list.append(prediction_loss_)
-    variance_loss_epoch_mean = np.mean(variance_losses_list)
-    prediction_loss_epoch_mean = np.mean(prediction_losses_list)
-
-    variance_loss_epoch_std = np.std(variance_losses_list)
-    prediction_loss_epoch_std = np.std(prediction_losses_list)
-
-    if (np.abs(variance_loss_epoch_mean/variance_loss_epoch_std)<noise_threshold_mean_divided_by_std) or (np.abs(prediction_loss_epoch_mean/prediction_loss_epoch_std)<noise_threshold_mean_divided_by_std):
-        variance_loss_epoch_median = np.median(variance_losses_list)
-        prediction_loss_epoch_median = np.median(prediction_losses_list)
-        print(f"Calculated epoch's variance loss: {variance_loss_epoch_mean:.4f}±{variance_loss_epoch_std:.4f} and prediction loss: {prediction_loss_epoch_mean:.4f}±{prediction_loss_epoch_std:.4f}\nWhich is too noisy so using median which is for variance:{variance_loss_epoch_median:.4f} and for prediction:{prediction_loss_epoch_median:.4f}")
-        if save_returned_values:
-            loss_scales = {"saved_mapping_loss_scale": variance_loss_epoch_median, "saved_prediction_loss_scale":prediction_loss_epoch_median}
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, "loss_scales.pkl")
-            with open(save_path, "wb") as f:
-                pickle.dump(loss_scales, f)
-            print(f"Saved values at {save_path}")
-        return variance_loss_epoch_median, prediction_loss_epoch_median
-    else:
-        print(f"Calculated epoch's variance loss: {variance_loss_epoch_mean:.4f}±{variance_loss_epoch_std:.4f} and prediction loss: {prediction_loss_epoch_mean:.4f}±{prediction_loss_epoch_std:.4f}, returning means")
-        if save_returned_values:
-            loss_scales = {"saved_mapping_loss_scale": variance_loss_epoch_mean, "saved_prediction_loss_scale":prediction_loss_epoch_mean}
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, "loss_scales.pkl")
-            with open(save_path, "wb") as f:
-                pickle.dump(loss_scales, f)
-            print(f"Saved values at {save_path}")
-        return variance_loss_epoch_mean, prediction_loss_epoch_mean
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def train_model(
-    # Dataloaders
-    train_loader,
-    randomize_each_epoch_plan,
-    val_loader, 
-    val_loader_high_energy,
-    val_loader_training_set,
-    
-    #Network
-    mapping_net, 
-    inverse_net,
-     
-    #Needed objects
-    var_loss_class,
-    repulsion_loss_class,
-    get_data_from_trajectory_id,
-    possible_t_values,
-    
-    #Needed pandas dataframes
-    train_df,
-    train_id_df,
-    val_df,
-    val_id_df,
-    val_df_high_energy,
-    val_id_df_high_energy,
-    add_noise,
-    
-
-    #Loss calculation hyperparameters
-    mapping_loss_scale,
-    prediction_loss_scale,
-    loss_type,
-    predict_full_trajectory,
-    normalized_mse,
-    mapping_coefficient,
-    repulsion_coefficient,
-    prediction_coefficient,
-    reconstruction_threshold,
-    reconstruction_loss_multiplier,
-    hsic_loss_max_want,
-    on_distribution_val_criterio_weight = 0.75,
-    
-    
-    # Optimizer parameters
-    optimizer_type = 'AdamW',
-    
-    learning_rate=1e-4,
-    weight_decay=1e-6,
-
-    scheduler_type='plateau', 
-    scheduler_params=None,    # Dict of params specific to the scheduler. Set if it is a fresh training session.
-    
-
-    # Training parameters
-    num_epochs=30,
-    grad_clip_value=1.0,
-
-    
-    # Early stopping parameters
-    early_stopping=True,
-    patience=5,
-    min_delta=0.001,
-    
-    # Checkpointing
-    save_dir='./checkpoints',
-    save_best_only=True,
-    save_freq_epochs=1,
-    auto_rescue=True,
-    
-    # Logging
-    log_freq_batches=10,
-    verbose=1,
-    
-    # Device
-    device='cuda',
-    
-    #Used for continuing training from checkpoint, leave all None if it is a fresh training session.
-    optimizer=None, 
-    scheduler=None,  
-    continue_from_epoch=None,
-    best_validation_criterio_loss_till_now=None,
-):
-    
-    """
-    Comprehensive training loop.
-    """
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("WARNING: CUDA requested but not available. Falling back to CPU.")
-        device = 'cpu'
-    
-    print(f"Using device: {device}")
-    if device == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    mapping_net.to(device)
-    
-    # Create directory for checkpoints
-    os.makedirs(save_dir, exist_ok=True)
-    
-
-
-    def make_json_serializable(obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, list):
-            return [make_json_serializable(item) for item in obj]
-        elif isinstance(obj, dict):
-            return {key: make_json_serializable(value) for key, value in obj.items()}
-        else:
-            return obj
-
-    def save_rescue_checkpoint(signal_received=None, frame=None):
-            """Save a rescue checkpoint and exit gracefully if needed"""
-            nonlocal epoch, batch_idx, best_val_loss
-            try:
-                rescue_path = os.path.join(save_dir, f"rescue_checkpoint_epoch_{epoch}_batch_{batch_idx}.pt")
-                print(f"\n\n{'='*50}")
-                if signal_received:
-                    print(f"Signal {signal_received} received. Saving rescue checkpoint...")
-                else:
-                    print(f"Exception detected. Saving rescue checkpoint...")
-                    
-
-                # Save current state  
-                save_checkpoint(rescue_path, mapping_net, optimizer, scheduler, epoch, best_val_loss,
-                               extra_info={'interrupted_at_batch': batch_idx, 'exception': traceback.format_exc()})
-                run_hyperparameters ={}
-                run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
-                run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
-                run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
-                run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
-                run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
-                run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
-                run_hyperparameters['add_noise'] = add_noise
-                
-                
-            
-                n_parameters = count_parameters(mapping_net)
-                run_hyperparameters['model_trainable_parameter_count'] = n_parameters
-            
-                model_n_layers = mapping_net.n_layers
-                run_hyperparameters['model_n_layers'] = model_n_layers
-            
-                model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
-                run_hyperparameters['model_hidden_dims'] = model_hidden_dims
-            
-                model_activation = mapping_net.activation 
-                run_hyperparameters['model_activation'] = model_activation
-            
-                model_activation_params = mapping_net.activation_params 
-                run_hyperparameters['model_activation_params'] = model_activation_params
-            
-                model_final_activation = mapping_net.final_activation 
-                run_hyperparameters['model_final_activation'] = model_final_activation
-
-                model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
-                run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
-
-                model_tanh_wrapper = mapping_net.tanh_wrapper
-                run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
-            
-                model_weight_init = mapping_net.weight_init 
-                run_hyperparameters['model_weight_init'] = model_weight_init
-            
-                model_weight_init_params = mapping_net.weight_init_params 
-                run_hyperparameters['model_weight_init_params'] = model_weight_init_params
-            
-                model_bias_init = mapping_net.bias_init 
-                run_hyperparameters['model_bias_init'] = model_bias_init
-            
-                model_bias_init_value = mapping_net.bias_init_value 
-                run_hyperparameters['model_bias_init_value'] = model_bias_init_value
-
-                model_use_layer_norm = mapping_net.use_layer_norm 
-                run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
-                
-            
-                model_a_eps_min = mapping_net.a_eps_min 
-                run_hyperparameters['model_a_eps_min'] = model_a_eps_min
-            
-                model_a_eps_max = mapping_net.a_eps_max
-                run_hyperparameters['model_a_eps_max'] = model_a_eps_max
-                
-                model_a_k = mapping_net.a_k
-                run_hyperparameters['model_a_k'] = model_a_k
-
-                model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
-                run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
-
-                model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
-                run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
-
-                model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
-                run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
-
-
-                model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
-                run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
-
-                model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
-                run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
-
-
-
-                model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
-                run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
-
-                model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
-                run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
-
-                model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
-                run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
-
-
-                model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
-                run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
-
-                model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
-                run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
-
-                model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
-                run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
-
-                model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
-                run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
-
-                model_bound_innit = mapping_net.bound_innit
-                run_hyperparameters['model_bound_innit'] = model_bound_innit
-            
-                repulsion_loss_epsilon = repulsion_loss_class.epsilon
-                run_hyperparameters['repulsion_loss_epsilon'] = repulsion_loss_epsilon
-            
-                repulsion_loss_k = repulsion_loss_class.k
-                run_hyperparameters['repulsion_loss_k'] = repulsion_loss_k
-            
-                run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
-                run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
-                run_hyperparameters['loss_type'] = loss_type
-                run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
-                run_hyperparameters['normalized_mse'] = normalized_mse
-                
-            
-                run_hyperparameters['mapping_coefficient'] = mapping_coefficient
-                run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
-                run_hyperparameters['prediction_coefficient'] = prediction_coefficient
-                run_hyperparameters['reconstruction_threshold'] = reconstruction_threshold
-                run_hyperparameters['reconstruction_loss_multiplier'] = reconstruction_loss_multiplier
-                run_hyperparameters['hsic_loss_max_want'] = hsic_loss_max_want
-                run_hyperparameters['on_distribution_val_criterio_weight'] = on_distribution_val_criterio_weight
-                run_hyperparameters['grad_clip_value'] = grad_clip_value
-                
-            
-            
-                with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch}.json"), "w") as f:
-                    # Convert any non-serializable objects
-                    serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
-                    json.dump(serializable_run_hyperparameters, f, indent=2)
-
-                print(f"Rescue checkpoint saved to: {rescue_path}")
-                print(f"You can resume training from this checkpoint later.")
-                print(f"{'='*50}\n")
-
-                if signal_received:  # If this was triggered by a signal, exit
-                    sys.exit(0)
-
-            except Exception as e:
-                print(f"Failed to save rescue checkpoint: {e}")
-                
-    epoch = 0 if continue_from_epoch is None else continue_from_epoch
-    batch_idx = 0
-    
-    if auto_rescue:
-        signal.signal(signal.SIGINT, save_rescue_checkpoint)  # Ctrl+C
-        signal.signal(signal.SIGTERM, save_rescue_checkpoint)  # Termination request
-    
-
-    train_batches = train_loader.dataset.total_batches
-    val_batches = len(val_loader)
-    val_batches_high_energy = len(val_loader_high_energy)
-    val_batches_training_set = len(val_loader_training_set)
-    
-    
-    # Create parameter lists 
-    mlp_params = []
-    transform_params = []
-    scale_params = []
-
-    for name, param in mapping_net.named_parameters():
-        if ('G_network' in name) or ('F_network' in name):
-            mlp_params.append(param)
-        elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
-            scale_params.append(param)
-        else: #c1, c2, gamma
-            transform_params.append(param)
-        
-    
-
-
-
-    
-
-
-    if optimizer==None:
-        if optimizer_type == 'Adam':
-            print(f"Initializing new Adam optimizer with learning rate: {learning_rate}")
-            optimizer = Adam([
-                {'params': mlp_params, 'lr': learning_rate},
-                {'params': scale_params, 'lr': learning_rate},
-                {'params': transform_params, 'lr': learning_rate},
-            ])
-        elif optimizer_type == 'AdamW':
-            print(f"Initializing new AdamW optimizer with learning rate: {learning_rate}, and weight decay {weight_decay}")
-            optimizer = AdamW([
-                {'params': mlp_params, 'weight_decay': weight_decay},
-                {'params': scale_params, 'weight_decay': 0.0},
-                {'params': transform_params, 'weight_decay': 0.0},
-            ], lr=learning_rate)  
-        else:
-            raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")       
-    
-    # Create scheduler if requested
-    if scheduler==None:
-        print(f"Initializing new scheduler: {scheduler_type} with params: {scheduler_params}")
-
-        if scheduler_type == 'plateau':
-            scheduler_params = scheduler_params or {'mode': 'min', 'factor': 0.1, 'patience': 5, 'verbose': verbose > 0}
-            scheduler = ReduceLROnPlateau(optimizer, **scheduler_params)
-        else:
-            raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
-
-    if (optimizer is not None) and (learning_rate != optimizer.param_groups[0]['lr']):
-        optimizer.param_groups[0]['lr'] = learning_rate
-        print(f"Manually resetting loaded optimizer's learning rate to {optimizer.param_groups[0]['lr']}")
-
-    if (optimizer is not None) and (weight_decay != optimizer.param_groups[0]['weight_decay']):
-        optimizer.param_groups[0]['weight_decay'] = weight_decay
-        print(f"Manually resetting loaded optimizer's weight decay to {optimizer.param_groups[0]['weight_decay']}")
-        
-    # Initialize early stopping variables
-    best_val_loss = float('inf')
-    if best_validation_criterio_loss_till_now is not None:
-        best_val_loss = best_validation_criterio_loss_till_now
-    patience_counter = 0
-    
-
-    
-    # Define a function to run the forward pass
-    def forward_pass(batch, hsic_loss_slope, predict_full_trajectory, add_noise):
-        if add_noise:
-            noisy_x, noisy_u = add_gaussian_noise(batch['x'], batch['u'], variance=0.1)
-            X_final, U_final, t_final = mapping_net(noisy_x, noisy_u, batch['t'])
-        
-        else:
-            X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
-
-        stats = TrajectoryStats(X_final, U_final, batch['trajectory_ids'])
-
-
-        variance_loss_ = var_loss_class(X_final, U_final, batch['trajectory_ids'], stats=stats)
-
-        repulsion_loss_ = repulsion_loss_class(X_final, U_final, batch['trajectory_ids'], stats=stats)
-        hsic_loss_ = hsic_loss(X_final, U_final, batch['trajectory_ids'], sigma_X_means=-1, sigma_U_means=-1, use_unbiased=True, stats=stats)
-
-
-        x_recon, u_recon, t_recon = inverse_net(X_final, U_final, t_final)
-        if add_noise:
-            reconstruction_loss_ = reconstruction_loss(
-                    x_recon=x_recon, u_recon=u_recon, t_recon=t_recon,
-                    x_orig=noisy_x, u_orig=noisy_u, t_orig=batch['t'],
-                    loss_type='mse'
-                )
-        else:
-            reconstruction_loss_ = reconstruction_loss(
-                    x_recon=x_recon, u_recon=u_recon, t_recon=t_recon,
-                    x_orig=batch['x'], u_orig=batch['u'], t_orig=batch['t'],
-                    loss_type='mse'
-                )  
-
-
-        X_final_mean, U_final_mean, t_for_pred = prepare_prediction_inputs(
-            X_final, U_final, 
-            t_batch=batch['t'], 
-            trajectory_ids=batch['trajectory_ids'], 
-            possible_t_values=possible_t_values,
-            stats=stats,
-            predict_full_trajectory=predict_full_trajectory)
-
-        x_pred, u_pred, _ = inverse_net(X_final_mean, U_final_mean, t_for_pred)
-
-        X_labels, U_labels, _ = generate_prediction_labels(
-                train_df=train_df, 
-                train_id_df=train_id_df, 
-                trajectory_ids=batch['trajectory_ids'], 
-                t_for_pred=t_for_pred, 
-                get_data_from_trajectory_id=get_data_from_trajectory_id,
-                predict_full_trajectory=predict_full_trajectory,  
-                possible_t_values=possible_t_values 
-            )
-
-        if normalized_mse:
-            prediction_loss_ = trajectory_normalized_mse(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    trajectory_ids=batch['trajectory_ids'],
-                    stats=stats
-                )           
-        else:        
-            prediction_loss_ = prediction_loss(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_labels, 
-                    U_labels=U_labels,
-                    loss_type=loss_type
-                )
-
-        total_loss_ = compute_total_loss(
-                mapping_loss=variance_loss_, 
-                repulsion_loss = repulsion_loss_,
-                hsic_loss = hsic_loss_,
-                reconstruction_loss=reconstruction_loss_, 
-                prediction_loss=prediction_loss_,
-                mapping_coefficient=mapping_coefficient, 
-                repulsion_coefficient=repulsion_coefficient,
-                prediction_coefficient=prediction_coefficient,
-                hsic_loss_slope=hsic_loss_slope,
-                mapping_loss_scale=mapping_loss_scale, 
-                prediction_loss_scale=prediction_loss_scale,
-                reconstruction_threshold=reconstruction_threshold, 
-                reconstruction_loss_multiplier=reconstruction_loss_multiplier
-            )
-        return total_loss_, variance_loss_, repulsion_loss_, hsic_loss_, reconstruction_loss_, prediction_loss_
-    
-    
-    
-    def validation_forward_pass(batch, val_df, val_id_df):
-        X_final, U_final, t_final = mapping_net(batch['x'], batch['u'], batch['t'])
-        variance_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = compute_single_trajectory_stats(X_final, U_final)
-
-
-        x_recon, u_recon, t_recon = inverse_net(X_final, U_final, t_final)
-        reconstruction_loss_ = reconstruction_loss(
-                x_recon=x_recon, u_recon=u_recon, t_recon=t_recon,
-                x_orig=batch['x'], u_orig=batch['u'], t_orig=batch['t'],
-                loss_type='mse'
-            )
-
-        X_final_mean_full, U_final_mean_full, t_rearranged = prepare_validation_inputs(X_final, U_final, t_final)
-
-        x_pred, u_pred, _ = inverse_net(X_final_mean_full, U_final_mean_full, t_rearranged)
-
-        X_val_labels, U_val_labels, _ = generate_validation_labels_single_trajectory(
-                val_df=val_df, 
-                val_id_df=val_id_df, 
-                trajectory_id=batch['trajectory_id'], 
-                t_rearranged=t_rearranged, 
-                get_data_from_trajectory_id=get_data_from_trajectory_id
-            )
-
-
-        if normalized_mse:
-            prediction_loss_ = single_trajectory_normalized_mse(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_val_labels, 
-                    U_labels=U_val_labels,
-                )           
-        else:        
-            prediction_loss_ = prediction_loss(
-                    x_pred=x_pred, 
-                    u_pred=u_pred, 
-                    X_labels=X_val_labels, 
-                    U_labels=U_val_labels,
-                    loss_type=loss_type
-                )
-
-
-        repulsion_loss_= torch.zeros_like(variance_loss_)
-        hsic_loss_= torch.zeros_like(variance_loss_)
-        total_loss_ = compute_total_loss(
-                mapping_loss=variance_loss_, 
-                repulsion_loss=repulsion_loss_,
-                hsic_loss = hsic_loss_,
-                reconstruction_loss=reconstruction_loss_, 
-                prediction_loss=prediction_loss_,
-                mapping_coefficient=mapping_coefficient, 
-                repulsion_coefficient=repulsion_coefficient,
-                prediction_coefficient=prediction_coefficient,
-                mapping_loss_scale=mapping_loss_scale, 
-                hsic_loss_slope=1.0,
-                prediction_loss_scale=prediction_loss_scale,
-                reconstruction_threshold=reconstruction_threshold, 
-                reconstruction_loss_multiplier=reconstruction_loss_multiplier
-            )
-        return total_loss_.item(), variance_loss_.item(), reconstruction_loss_.item(), prediction_loss_.item(), X_mean, U_mean, X_var, U_var, X_std, U_std
-    
-    hsic_loss_max_calculated_cache = {}
-    # Training loop
-    start_epoch=0
-    if continue_from_epoch is not None:
-        start_epoch=continue_from_epoch
-        
-    try:
-        for epoch in range(start_epoch, start_epoch+num_epochs):
-                # Initialize epoch_metrics
-
-            if epoch > start_epoch and randomize_each_epoch_plan:
-                train_loader.dataset.on_epoch_start()
-
-
-            epoch_metrics = {}
-            epoch_start_time = time.time()
-
-            
-
-            # Set all models to training mode
-            mapping_net.train()
-            # Initialize metrics
-            train_total_loss_ = 0.0
-            train_variance_loss_ = 0.0
-            train_repulsion_loss_ = 0.0
-            train_hsic_loss_ = 0.0
-            train_reconstruction_loss_ = 0.0
-            train_prediction_loss_ = 0.0
-            mean_grad_norm_ = 0.0
-            percentage_of_batches_clipped_in_epoch = 0.0
-            batch_count = 0
-
-            # Progress tracking
-            if verbose > 0:
-                print(f"\n{'='*20} Epoch {epoch}/{start_epoch+num_epochs} {'='*20}")
-
-            # Training loop
-            for batch_idx, batch in enumerate(train_loader):
-                
-                
-
-                number_of_trajectories_in_batch =  torch.unique(batch['trajectory_ids']).shape[0]
-                if number_of_trajectories_in_batch not in hsic_loss_max_calculated_cache:
-                    linear_tensor = torch.arange(1, number_of_trajectories_in_batch+1, requires_grad=False)
-                    hsic_loss_max_calculated = hsic_loss_statistics_only(x=torch.Tensor(linear_tensor), y=torch.Tensor(linear_tensor), sigma_x = -1, sigma_y = -1, use_unbiased = True, epsilon = 1e-10).item()
-                    hsic_loss_max_calculated = max(hsic_loss_max_calculated, 0.05)
-                    hsic_loss_max_calculated_cache[number_of_trajectories_in_batch] = hsic_loss_max_calculated
-                else:
-                    hsic_loss_max_calculated = hsic_loss_max_calculated_cache[number_of_trajectories_in_batch]
-                
-                hsic_loss_slope = hsic_loss_max_want / hsic_loss_max_calculated
-
-
-                optimizer.zero_grad()
-
-                # Run forward pass
-                total_loss_, variance_loss_, repulsion_loss_, hsic_loss_, reconstruction_loss_, prediction_loss_ = forward_pass(batch, hsic_loss_slope, predict_full_trajectory=predict_full_trajectory, add_noise=add_noise)
-
-
-                if torch.isnan(total_loss_) or torch.isinf(total_loss_):
-                    print(f"Invalid total_loss_ value: {total_loss_.item()}, skipping batch")
-                    continue
-                # Backward pass
-                total_loss_.backward()
-                
-                
-                for name, param in mapping_net.named_parameters():
-                    if param.grad is not None:
-                        # Replace NaN gradients with zeros
-                        if torch.isnan(param.grad).any():
-                            print(f"NaN gradients detected in {name}")
-                            param.grad[torch.isnan(param.grad)] = 0.0
-                        # Replace inf gradients
-                        if torch.isinf(param.grad).any():
-                            print(f"Inf gradients detected in {name}")
-                            param.grad[torch.isinf(param.grad)] = 0.0
-                        # Check for extreme gradients
-                        if verbose>1:
-                            grad_norm_print = param.grad.norm().item()
-                            if grad_norm_print > 10.0:  # Threshold for reporting
-                                print(f"High gradient norm in {name}: {grad_norm_print}")
-                            if grad_norm_print < 0.00001:  
-                                print(f"Low gradient norm in {name}: {grad_norm_print}")
-
-                # Gradient clipping
-                if grad_clip_value is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(mlp_params+scale_params+transform_params, grad_clip_value)
-                    if (grad_norm>grad_clip_value):
-                        percentage_of_batches_clipped_in_epoch += 1.0
-                        if verbose>0:
-                            print(f"Grad clipping activated, grad_norm before clipping: {grad_norm}")
-
-
-                # Optimizer step
-                optimizer.step()
-
-                # Update metrics
-                if grad_clip_value is not None:
-                    mean_grad_norm_ += grad_norm.item()
-                
-                train_total_loss_ += total_loss_.item()
-                train_variance_loss_ += variance_loss_.item()
-                train_repulsion_loss_ += repulsion_loss_.item()
-                train_hsic_loss_ += hsic_loss_.item()
-                train_reconstruction_loss_ += reconstruction_loss_.item()
-                train_prediction_loss_ += prediction_loss_.item()
-                batch_count += 1
-
-                # Log progress
-                if verbose > 0 and batch_idx % log_freq_batches == 0:
-                    print(f"Batch {batch_idx}/{train_batches} - Total Loss: {total_loss_.item():.4f} - Variance Loss: {variance_loss_.item():.4f} - Repulsion Loss: {repulsion_loss_.item():.4f} - HSIC Loss: {hsic_loss_.item():.4f} - Reconstruction Loss: {reconstruction_loss_.item():.4f} - Prediction Loss: {prediction_loss_.item():.4f}")
-                    if grad_clip_value is not None:
-                        print(f"Grad norm of batch: {grad_norm.item():.4f}\n")
-
-
-                        
-                
-            # Calculate epoch metrics
-            mean_grad_norm_ /= max(1, batch_count)
-            train_total_loss_ /= max(1, batch_count)
-            train_variance_loss_ /= max(1, batch_count)
-            train_repulsion_loss_ /= max(1, batch_count)
-            train_hsic_loss_ /= max(1, batch_count)
-            train_reconstruction_loss_ /= max(1, batch_count)
-            train_prediction_loss_ /= max(1, batch_count)
-            percentage_of_batches_clipped_in_epoch /= max(1, batch_count)
-
-            # Validation phase
-            val_total_loss_ = 0.0
-            val_variance_loss_ = 0.0
-            val_reconstruction_loss_ = 0.0
-            val_prediction_loss_ = 0.0
-            val_batch_count = 0
-
-
-            # Set model to evaluation mode
-            mapping_net.eval()
-            
-            epoch_saving_path = os.path.join(save_dir, f"epoch_{epoch}")
-            
-            val_trajectories_dir = os.path.join(epoch_saving_path, f"val_trajectories_data")
-            os.makedirs(val_trajectories_dir, exist_ok=True)
-
-            val_high_energy_trajectories_dir = os.path.join(epoch_saving_path, f"val_high_energy_trajectories_data")
-            os.makedirs(val_high_energy_trajectories_dir, exist_ok=True)
-
-            val_train_set_trajectories_dir = os.path.join(epoch_saving_path, f"val_train_set_trajectories_data")
-            os.makedirs(val_train_set_trajectories_dir, exist_ok=True)
-
-
-            
-            
-            # Validation loop
-
-            print("Begining validation phase")
-            for batch_idx, batch in enumerate(val_loader):
-                # Run forward pass
-                total_loss_, variance_loss_, reconstruction_loss_, prediction_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = validation_forward_pass(batch, val_df=val_df, val_id_df=val_id_df)
-                # Update metrics
-                if total_loss_ is not None:
-                    val_total_loss_ += total_loss_
-                    val_variance_loss_ += variance_loss_
-                    val_reconstruction_loss_ += reconstruction_loss_
-                    val_prediction_loss_ += prediction_loss_
-                    if verbose > 0 and batch_idx % log_freq_batches == 0:
-                        print(f"Batch {batch_idx}/{val_batches} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f}) - Prediction Loss: {prediction_loss_:.4f}")
-                        
-                    trajectory_data = {
-                        'total_loss' : total_loss_,
-                        'variance_loss' : variance_loss_,
-                        'reconstruction_loss' : reconstruction_loss_,
-                        'prediction_loss' : prediction_loss_,
-                        'X_mean': X_mean,
-                        'U_mean': U_mean,
-                        'X_var': X_var,
-                        'U_var': U_var,
-                        'X_std': X_std,
-                        'U_std': U_std,
-                    }           
-                    with open(os.path.join(val_trajectories_dir, f"trajectory_id_{batch['trajectory_id']}_data.json"), "w") as f:
-                        # Convert any non-serializable objects
-                        serializable_trajectory_data = make_json_serializable(trajectory_data)
-                        json.dump(serializable_trajectory_data, f, indent=2)
-                        
-                        
-                val_batch_count += 1
-                    
-                    
-
-                    
-            # Calculate validation metrics
-            val_total_loss_ /= max(1, val_batch_count)
-            val_variance_loss_ /= max(1, val_batch_count)
-            val_reconstruction_loss_ /= max(1, val_batch_count)
-            val_prediction_loss_ /= max(1, val_batch_count)
-
-
-
-
-            #High Energy validation loop
-            
-            val_total_loss_high_energy = 0.0
-            val_variance_loss_high_energy = 0.0
-            val_reconstruction_loss_high_energy = 0.0
-            val_prediction_loss_high_energy = 0.0
-            val_batch_count_high_energy = 0
-            
-
-            print("Begining high energy validation phase")
-            for batch_idx, batch in enumerate(val_loader_high_energy):
-                # Run forward pass
-                total_loss_, variance_loss_, reconstruction_loss_, prediction_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = validation_forward_pass(batch, val_df=val_df_high_energy, val_id_df=val_id_df_high_energy)
-                
-                # Update metrics
-                if total_loss_ is not None:
-                    val_total_loss_high_energy += total_loss_
-                    val_variance_loss_high_energy += variance_loss_
-                    val_reconstruction_loss_high_energy += reconstruction_loss_
-                    val_prediction_loss_high_energy += prediction_loss_
-                    if verbose > 0 and batch_idx % log_freq_batches == 0:
-                        print(f"Batch {batch_idx}/{val_batches_high_energy} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f}) - Prediction Loss: {prediction_loss_:.4f}")
-                        
-                    trajectory_data = {
-                        'total_loss' : total_loss_,
-                        'variance_loss' : variance_loss_,
-                        'reconstruction_loss' : reconstruction_loss_,
-                        'prediction_loss' : prediction_loss_,
-                        'X_mean': X_mean,
-                        'U_mean': U_mean,
-                        'X_var': X_var,
-                        'U_var': U_var,
-                        'X_std': X_std,
-                        'U_std': U_std,
-                    }           
-                    with open(os.path.join(val_high_energy_trajectories_dir, f"trajectory_id_{batch['trajectory_id']}_data.json"), "w") as f:
-                        # Convert any non-serializable objects
-                        serializable_trajectory_data = make_json_serializable(trajectory_data)
-                        json.dump(serializable_trajectory_data, f, indent=2)
-                val_batch_count_high_energy += 1
-
-                    
-            # Calculate validation metrics
-            val_total_loss_high_energy /= max(1, val_batch_count_high_energy)
-            val_variance_loss_high_energy /= max(1, val_batch_count_high_energy)
-            val_reconstruction_loss_high_energy /= max(1, val_batch_count_high_energy)
-            val_prediction_loss_high_energy /= max(1, val_batch_count_high_energy)
-
-            #Validation loop on training set data (per trajectory)
-            
-            val_total_loss_training_set = 0.0
-            val_variance_loss_training_set = 0.0
-            val_reconstruction_loss_training_set = 0.0
-            val_prediction_loss_training_set = 0.0
-            val_batch_count_training_set = 0
-            
-
-            print("Begining validation loop on training set data")
-            for batch_idx, batch in enumerate(val_loader_training_set):
-                # Run forward pass
-                total_loss_, variance_loss_, reconstruction_loss_, prediction_loss_, X_mean, U_mean, X_var, U_var, X_std, U_std = validation_forward_pass(batch, val_df=train_df, val_id_df=train_id_df)
-                
-                # Update metrics
-                if total_loss_ is not None:
-                    val_total_loss_training_set += total_loss_
-                    val_variance_loss_training_set += variance_loss_
-                    val_reconstruction_loss_training_set += reconstruction_loss_
-                    val_prediction_loss_training_set += prediction_loss_
-                    if verbose > 0 and batch_idx % log_freq_batches == 0:
-                        print(f"Batch {batch_idx}/{val_batches_training_set} - Total Loss: {total_loss_:.4f}- Variance Loss: {variance_loss_:.4f} - Reconstruction Loss: {reconstruction_loss_:.4f} - Prediction Loss: {prediction_loss_:.4f}")
-                    trajectory_data = {
-                        'total_loss' : total_loss_,
-                        'variance_loss' : variance_loss_,
-                        'reconstruction_loss' : reconstruction_loss_,
-                        'prediction_loss' : prediction_loss_,
-                        'X_mean': X_mean,
-                        'U_mean': U_mean,
-                        'X_var': X_var,
-                        'U_var': U_var,
-                        'X_std': X_std,
-                        'U_std': U_std,
-                    }           
-                    with open(os.path.join(val_train_set_trajectories_dir, f"trajectory_id_{batch['trajectory_id']}_data.json"), "w") as f:
-                        # Convert any non-serializable objects
-                        serializable_trajectory_data = make_json_serializable(trajectory_data)
-                        json.dump(serializable_trajectory_data, f, indent=2)
-                val_batch_count_training_set += 1
-
-                    
-            # Calculate validation metrics
-            val_total_loss_training_set /= max(1, val_batch_count_training_set)
-            val_variance_loss_training_set /= max(1, val_batch_count_training_set)
-            val_reconstruction_loss_training_set /= max(1, val_batch_count_training_set)
-            val_prediction_loss_training_set /= max(1, val_batch_count_training_set)
-
-
-            # Update epoch_metrics
-            epoch_metrics['epoch'] = epoch
-
-
-            
-            epoch_metrics['percentage_of_batches_clipped_in_epoch'] = percentage_of_batches_clipped_in_epoch*100
-            epoch_metrics['mean_grad_norm_'] = mean_grad_norm_
-            epoch_metrics['train_total_loss_'] = train_total_loss_
-            epoch_metrics['train_variance_loss_'] = train_variance_loss_
-            epoch_metrics['train_repulsion_loss_'] = train_repulsion_loss_
-            epoch_metrics['train_hsic_loss_'] = train_hsic_loss_
-            epoch_metrics['train_reconstruction_loss_'] = train_reconstruction_loss_
-            epoch_metrics['train_prediction_loss_'] = train_prediction_loss_
-
-            epoch_metrics['val_total_loss_'] = val_total_loss_
-            epoch_metrics['val_variance_loss_'] = val_variance_loss_
-            epoch_metrics['val_reconstruction_loss_'] = val_reconstruction_loss_
-            epoch_metrics['val_prediction_loss_'] = val_prediction_loss_
-            
-            epoch_metrics['val_total_loss_high_energy'] = val_total_loss_high_energy
-            epoch_metrics['val_variance_loss_high_energy'] = val_variance_loss_high_energy
-            epoch_metrics['val_reconstruction_loss_high_energy'] = val_reconstruction_loss_high_energy
-            epoch_metrics['val_prediction_loss_high_energy'] = val_prediction_loss_high_energy
-            
-            epoch_metrics['val_total_loss_training_set'] = val_total_loss_training_set
-            epoch_metrics['val_variance_loss_training_set'] = val_variance_loss_training_set
-            epoch_metrics['val_reconstruction_loss_training_set'] = val_reconstruction_loss_training_set
-            epoch_metrics['val_prediction_loss_training_set'] = val_prediction_loss_training_set
-            
-
-            # Get current learning rate
-            current_lr = optimizer.param_groups[0]['lr']
-            epoch_metrics['learning_rates'] = current_lr
-
-
-            validation_criterio = on_distribution_val_criterio_weight*val_total_loss_ + (1.0-on_distribution_val_criterio_weight)*val_total_loss_high_energy
-            epoch_metrics['validation_criterio'] = validation_criterio
-
-            if validation_criterio < best_val_loss - min_delta:
-                best_val_loss = validation_criterio
-                epoch_metrics['best_validation_criterio_loss_till_now'] = validation_criterio
-                print(f"Found best validation criterio loss till now:{validation_criterio:.4f}, on epoch {epoch}")
-
-                # Save best model (whether early_stopping is enabled or not)
-                best_model_path = os.path.join(save_dir, "best_model.pt")
-                save_checkpoint(best_model_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
-                if verbose > 0:
-                    print(f"New best model saved with val_loss: {best_val_loss:.4f}")
-
-                patience_counter = 0
-            else:
-                epoch_metrics['best_validation_criterio_loss_till_now'] = best_val_loss
-                if early_stopping:
-                    patience_counter += 1
-                    if verbose > 0:
-                        print(f"Early stopping patience: {patience_counter}/{patience}")
-                
-            with open(os.path.join(epoch_saving_path, "epoch_metrics.json"), "w") as f:
-                # Convert any non-serializable objects
-                serializable_epoch_metrics = make_json_serializable(epoch_metrics)
-                json.dump(serializable_epoch_metrics, f, indent=2)
-            
-            # Step the scheduler if it exists
-            if scheduler is not None:
-                if scheduler_type == 'plateau':
-                    scheduler.step(validation_criterio)  # Pass validation loss to plateau scheduler
-                else:
-                    scheduler.step()
-
-            # Time taken for epoch
-            epoch_time = time.time() - epoch_start_time
-
-            # Print epoch summary
-            if verbose > 0:
-                print(f"\nEpoch {epoch}/{start_epoch+num_epochs} completed in {epoch_time:.2f}s")
-
-
-                print(f"Percentage of batches clipped in epoch: {percentage_of_batches_clipped_in_epoch*100:.1f}%")
-                if grad_clip_value is not None:
-                    print(f"Mean grad norm: {mean_grad_norm_:.4f}")
-                print(f"Mean total train loss: {train_total_loss_:.4f}")
-                print(f"Mean variance train loss: {train_variance_loss_:.4f}")
-                print(f"Mean repulsion train loss: {train_repulsion_loss_:.4f}")
-                print(f"Mean HSIC train loss: {train_hsic_loss_:.4f}")
-                print(f"Mean reconstruction train loss: {train_reconstruction_loss_:.4f}")
-                print(f"Mean prediction train loss: {train_prediction_loss_:.4f}")
-                
-                
-                print(f"Mean total val loss: {val_total_loss_:.4f}")
-                print(f"Mean variance val loss: {val_variance_loss_:.4f}")
-                print(f"Mean reconstruction val loss: {val_reconstruction_loss_:.4f}")
-                print(f"Mean prediction val loss: {val_prediction_loss_:.4f}")
-                
-                print(f"Mean total val loss high energy: {val_total_loss_high_energy:.4f}")
-                print(f"Mean variance val loss high energy: {val_variance_loss_high_energy:.4f}")
-                print(f"Mean reconstruction val loss high energy: {val_reconstruction_loss_high_energy:.4f}")
-                print(f"Mean prediction val loss high energy: {val_prediction_loss_high_energy:.4f}")               
-
-                print(f"Mean total val loss training set: {val_total_loss_training_set:.4f}")
-                print(f"Mean variance val loss training set: {val_variance_loss_training_set:.4f}")
-                print(f"Mean reconstruction val loss training set: {val_reconstruction_loss_training_set:.4f}")
-                print(f"Mean prediction val loss training set: {val_prediction_loss_training_set:.4f}")    
-                
-                print(f"Validation criterio: {validation_criterio:.4f}")    
-                
-                print(f"Learning Rate: {current_lr:.6f}")
-
-
-
-            # Save checkpoint if needed
-            if (epoch) % save_freq_epochs == 0 :
-                if not save_best_only:
-                    checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
-                    save_checkpoint(checkpoint_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
-                    if verbose > 0:
-                        print(f"Checkpoint saved to {checkpoint_path}")
-
-            # Early stopping check
-            if early_stopping and patience_counter >= patience:
-                if verbose > 0:
-                    print(f"Early stopping triggered in epoch: {epoch}")
-                break
-
-        run_hyperparameters ={}
-
-        run_hyperparameters['train_dataloader_batch_size'] = train_loader.dataset.batch_size
-        run_hyperparameters['train_dataloader_segment_length'] = train_loader.dataset.segment_length
-        run_hyperparameters['train_dataloader_n_segments'] = train_loader.dataset.n_segments
-        run_hyperparameters['train_dataloader_ratio'] = train_loader.dataset.ratio
-        run_hyperparameters['train_dataloader_batch_traj'] = train_loader.dataset.batch_traj
-        run_hyperparameters['randomize_each_epoch_plan'] = randomize_each_epoch_plan 
-        run_hyperparameters['add_noise'] = add_noise 
-        
-        n_parameters = count_parameters(mapping_net)
-        run_hyperparameters['model_trainable_parameter_count'] = n_parameters
-
-        model_n_layers = mapping_net.n_layers
-        run_hyperparameters['model_n_layers'] = model_n_layers
-
-        model_hidden_dims = mapping_net.layers[0].step_1.hidden_dims
-        run_hyperparameters['model_hidden_dims'] = model_hidden_dims
-
-        model_activation = mapping_net.activation 
-        run_hyperparameters['model_activation'] = model_activation
-
-        model_activation_params = mapping_net.activation_params 
-        run_hyperparameters['model_activation_params'] = model_activation_params
-
-        model_final_activation = mapping_net.final_activation 
-        run_hyperparameters['model_final_activation'] = model_final_activation
-
-        model_final_activation_only_on_final_layer = mapping_net.final_activation_only_on_final_layer 
-        run_hyperparameters['model_final_activation_only_on_final_layer'] = model_final_activation_only_on_final_layer
-
-        model_tanh_wrapper = mapping_net.tanh_wrapper
-        run_hyperparameters['model_tanh_wrapper'] = model_tanh_wrapper
-
-        model_weight_init = mapping_net.weight_init 
-        run_hyperparameters['model_weight_init'] = model_weight_init
-
-        model_weight_init_params = mapping_net.weight_init_params 
-        run_hyperparameters['model_weight_init_params'] = model_weight_init_params
-
-        model_bias_init = mapping_net.bias_init 
-        run_hyperparameters['model_bias_init'] = model_bias_init
-
-        model_bias_init_value = mapping_net.bias_init_value 
-        run_hyperparameters['model_bias_init_value'] = model_bias_init_value
-
-        model_use_layer_norm = mapping_net.use_layer_norm 
-        run_hyperparameters['model_use_layer_norm'] = model_use_layer_norm
-
-        model_a_eps_min = mapping_net.a_eps_min 
-        run_hyperparameters['model_a_eps_min'] = model_a_eps_min
-
-        model_a_eps_max = mapping_net.a_eps_max
-        run_hyperparameters['model_a_eps_max'] = model_a_eps_max
-
-        model_a_k = mapping_net.a_k
-        run_hyperparameters['model_a_k'] = model_a_k
-
-
-        model_step_1_a_mean_innit = mapping_net.step_1_a_mean_innit
-        run_hyperparameters['model_step_1_a_mean_innit'] = model_step_1_a_mean_innit
-
-        model_step_1_gamma_mean_innit = mapping_net.step_1_gamma_mean_innit
-        run_hyperparameters['model_step_1_gamma_mean_innit'] = model_step_1_gamma_mean_innit
-
-        model_step_1_c1_mean_innit = mapping_net.step_1_c1_mean_innit
-        run_hyperparameters['model_step_1_c1_mean_innit'] = model_step_1_c1_mean_innit
-
-
-        model_step_1_c2_mean_innit = mapping_net.step_1_c2_mean_innit
-        run_hyperparameters['model_step_1_c2_mean_innit'] = model_step_1_c2_mean_innit
-
-        model_step_2_a_mean_innit = mapping_net.step_2_a_mean_innit
-        run_hyperparameters['model_step_2_a_mean_innit'] = model_step_2_a_mean_innit
-
-
-
-        model_step_2_gamma_mean_innit = mapping_net.step_2_gamma_mean_innit
-        run_hyperparameters['model_step_2_gamma_mean_innit'] = model_step_2_gamma_mean_innit
-
-        model_step_2_c1_mean_innit = mapping_net.step_2_c1_mean_innit
-        run_hyperparameters['model_step_2_c1_mean_innit'] = model_step_2_c1_mean_innit
-
-        model_step_2_c2_mean_innit = mapping_net.step_2_c2_mean_innit
-        run_hyperparameters['model_step_2_c2_mean_innit'] = model_step_2_c2_mean_innit
-
-
-        model_std_to_mean_ratio_a_mean_init = mapping_net.std_to_mean_ratio_a_mean_init
-        run_hyperparameters['model_std_to_mean_ratio_a_mean_init'] = model_std_to_mean_ratio_a_mean_init
-
-        model_std_to_mean_ratio_gamma_mean_init = mapping_net.std_to_mean_ratio_gamma_mean_init
-        run_hyperparameters['model_std_to_mean_ratio_gamma_mean_init'] = model_std_to_mean_ratio_gamma_mean_init
-
-        model_std_to_mean_ratio_c1_mean_init = mapping_net.std_to_mean_ratio_c1_mean_init
-        run_hyperparameters['model_std_to_mean_ratio_c1_mean_init'] = model_std_to_mean_ratio_c1_mean_init
-
-        model_std_to_mean_ratio_c2_mean_init = mapping_net.std_to_mean_ratio_c2_mean_init
-        run_hyperparameters['model_std_to_mean_ratio_c2_mean_init'] = model_std_to_mean_ratio_c2_mean_init
-
-
-
-        model_bound_innit = mapping_net.bound_innit
-        run_hyperparameters['model_bound_innit'] = model_bound_innit
-
-        repulsion_loss_epsilon = repulsion_loss_class.epsilon
-        run_hyperparameters['repulsion_loss_epsilon'] = repulsion_loss_epsilon
-
-        repulsion_loss_k = repulsion_loss_class.k
-        run_hyperparameters['repulsion_loss_k'] = repulsion_loss_k
-
-        run_hyperparameters['mapping_loss_scale'] = mapping_loss_scale
-        run_hyperparameters['prediction_loss_scale'] = prediction_loss_scale
-        run_hyperparameters['normalized_mse'] = normalized_mse
-        run_hyperparameters['loss_type'] = loss_type
-        run_hyperparameters['predict_full_trajectory'] = predict_full_trajectory
-
-
-        run_hyperparameters['mapping_coefficient'] = mapping_coefficient
-        run_hyperparameters['repulsion_coefficient'] = repulsion_coefficient
-        run_hyperparameters['prediction_coefficient'] = prediction_coefficient
-        run_hyperparameters['reconstruction_threshold'] = reconstruction_threshold
-        run_hyperparameters['reconstruction_loss_multiplier'] = reconstruction_loss_multiplier
-        run_hyperparameters['hsic_loss_max_want'] = hsic_loss_max_want
-        run_hyperparameters['on_distribution_val_criterio_weight'] = on_distribution_val_criterio_weight
-        run_hyperparameters['grad_clip_value'] = grad_clip_value
-    
-
-
-        with open(os.path.join(save_dir, f"run_from_epochs_{start_epoch}_to_{epoch+1}.json"), "w") as f:
-            # Convert any non-serializable objects
-            serializable_run_hyperparameters = make_json_serializable(run_hyperparameters)
-            json.dump(serializable_run_hyperparameters, f, indent=2)
-            
-    except Exception as e:
-        if auto_rescue:
-            print(f"\nTraining interrupted by exception: {e}")
-            save_rescue_checkpoint()
-        raise  # Re-raise the exception after saving
-    
-
-
-
-    finally:
-        try:
-            if 'epoch' in locals():
-                # Always save a final checkpoint regardless of how training ended
-                final_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
-                save_checkpoint(final_path, mapping_net, optimizer, scheduler, epoch, best_val_loss)
-                if verbose > 0:
-                    print(f"\nFinal state saved to {final_path}")
-            else:
-                print("Exception before epoch loop began")
-        except Exception as e:
-            print(f"Failed to save final checkpoint: {e}")
-
-    # Training complete
-    if verbose > 0:
-        print("\nTraining completed!")
-        print(f"Best validation loss: {best_val_loss:.4f}")
-    
-
-    
-    return 
-
-def resume_training_from_checkpoint(
-    # Checkpoint to resume from
-    checkpoint_path,
-    
-    # Dataloaders
-    train_loader,
-    randomize_each_epoch_plan,
-    val_loader,
-    val_loader_high_energy,
-    val_loader_training_set,
-    
-    # Network
-    mapping_net,  # inverse_net is created automatically from mapping_net
-    
-    # Needed objects
-    var_loss_class,
-    repulsion_loss_class,
-    get_data_from_trajectory_id,
-    possible_t_values,
-    
-    # Needed pandas dataframes
-    train_df,
-    train_id_df,
-    val_df,
-    val_id_df,
-    val_df_high_energy,
-    val_id_df_high_energy,
-    add_noise,
-    
-    # Loss calculation hyperparameters
-    mapping_loss_scale,
-    prediction_loss_scale,
-    predict_full_trajectory,
-    loss_type,
-    normalized_mse,
-    mapping_coefficient,
-    repulsion_coefficient,
-    prediction_coefficient,
-    reconstruction_threshold,
-    reconstruction_loss_multiplier,
-    hsic_loss_max_want,
-    on_distribution_val_criterio_weight=0.75,
-    
-    # === RESUME MODE SELECTION ===
-    # MODE A (load_scheduler_and_optimizer=True): Resume with exact optimizer/scheduler state
-    
-    #   - learning_rate: Set to None to use checkpoint LR, or specify to override
-    #   - optimizer_type: MUST match the type used in original training
-    #   - scheduler_type: MUST match the type used in original training
-    #   - scheduler_params: MUST match the params used in original training
-    #
-    # MODE B (load_scheduler_and_optimizer=False): Resume with fresh optimizer/scheduler
-
-    #   - learning_rate: REQUIRED - must specify, will error if None
-    #   - optimizer_type: Can be different from original
-    #   - scheduler_type: Can be different from original
-    #   - scheduler_params: Can be different from original
-    load_scheduler_and_optimizer=False,
-    
-    # Optimizer parameters
-    learning_rate=None,  # MODE A: None=use checkpoint LR, or specify to override | MODE B: REQUIRED, must specify
-    weight_decay=None,   # MODE A: None=use checkpoint weight_decay, or specify to override | MODE B: REQUIRED, must specify
-    optimizer_type='AdamW',  # MODE A: must match original | MODE B: can be different
-    
-    # Scheduler parameters  
-    scheduler_type='plateau',  # MODE A: must match original | MODE B: can be different
-    scheduler_params=None,  # MODE A: can differ. Functionality would depend on reset_scheduler_patience | MODE B: can be different
-    reset_scheduler_patience = False, #Only relevant on MODE A. Set True to reset num_bad_epochs. Use True if you want the learning rate to be lowered after the full patience amount. Use False if you want continuity, already waited N epochs, just need M-N more where M: loaded num_bad_epochs from previous training
-    
-    # Training parameters
-    num_epochs=30,  # Number of ADDITIONAL epochs to train (not total epochs)
-    grad_clip_value=3.0,
-    
-    # Early stopping parameters
-    early_stopping=False,
-    patience=20,
-    min_delta=0.001,
-    
-    # Checkpointing
-    save_dir='./checkpoints',  # Should typically match the directory where checkpoint_path is located
-    save_best_only=False,
-    save_freq_epochs=2,
-    auto_rescue=True,
-    
-    # Logging
-    log_freq_batches=50,
-    verbose=2,
-    
-    # Device
-    device='cuda'
-    ):
-    """Resume training from a checkpoint"""
-    if load_scheduler_and_optimizer:
-        mlp_params = []
-        transform_params = []
-        scale_params = []
-
-        for name, param in mapping_net.named_parameters():
-            if ('G_network' in name) or ('F_network' in name):
-                mlp_params.append(param)
-            elif ('g_bound' in name) or ('f_bound' in name) or ('a_raw' in name):
-                scale_params.append(param)
-            else: #c1, c2, gamma
-                transform_params.append(param)
-
-        if optimizer_type == 'Adam':
-            temp_optimizer = Adam(mlp_params+scale_params+transform_params)
-        elif optimizer_type == 'AdamW':
-            temp_optimizer = AdamW([
-                {'params': mlp_params, 'weight_decay': weight_decay},
-                {'params': scale_params, 'weight_decay': 0.0},
-                {'params': transform_params, 'weight_decay': weight_decay},
-            ])
-
-        temp_scheduler = ReduceLROnPlateau(temp_optimizer, mode='min', factor=0.1, patience=5, verbose=True) #Will be overwritten
-        # Load checkpoint
-        epoch, extra_info, best_val_loss = load_checkpoint(
-            checkpoint_path, mapping_net, device, temp_optimizer, temp_scheduler
-        )
-
-        # Override scheduler params if specified
-        if scheduler_params is not None:
-            print(f"Overriding scheduler params: {scheduler_params}")
-            for key, value in scheduler_params.items():
-                if hasattr(temp_scheduler, key):
-                    setattr(temp_scheduler, key, value)
-                    print(f"  {key}: {getattr(temp_scheduler, key)} -> {value}")
-                else:
-                    print(f"  Warning: scheduler has no attribute '{key}'")
-        else:
-            if hasattr(temp_scheduler, 'patience'):  # ReduceLROnPlateau
-                print("Using loaded scheduler")
-                print(f"  factor: {temp_scheduler.factor}")
-                print(f"  mode: {temp_scheduler.mode}")
-                print(f"  threshold: {temp_scheduler.threshold}")
-                print(f"  cooldown: {temp_scheduler.cooldown}")
-                print(f"  best: {temp_scheduler.best}")
-
-
-        # Reset scheduler patience counter if requested
-        if reset_scheduler_patience:
-            temp_scheduler.num_bad_epochs = 0
-            temp_scheduler.cooldown_counter = 0
-            print(f"Reset scheduler patience counter. Will wait full {temp_scheduler.patience} epochs before reducing LR.")
-        else:
-            # Calculate remaining epochs until LR reduction
-            if temp_scheduler.cooldown_counter > 0:
-                print(f"Scheduler in cooldown mode: {temp_scheduler.cooldown_counter} epochs remaining in cooldown")
-            elif temp_scheduler.num_bad_epochs >= temp_scheduler.patience:
-                print(f"Scheduler ready to reduce LR on next bad epoch (num_bad_epochs={temp_scheduler.num_bad_epochs} >= patience={temp_scheduler.patience})")
-            else:
-                remaining_epochs = temp_scheduler.patience - temp_scheduler.num_bad_epochs
-                print(f"Scheduler status: {temp_scheduler.num_bad_epochs}/{temp_scheduler.patience} bad epochs. Will reduce LR after {remaining_epochs} more bad epochs.")
-
-    else:
-        epoch, extra_info, best_val_loss = load_checkpoint(
-            checkpoint_path, mapping_net, device, None, None
-        )
-
-    if extra_info and 'interrupted_at_batch' in extra_info:
-        continue_from_epoch = epoch
-        print(f"Resuming incomplete epoch {epoch}")
-        if 'exception' in extra_info:
-            print(f"Previous training was interrupted by exception:\n{extra_info['exception']}")
-    else:
-        continue_from_epoch = epoch + 1
-        print(f"Epoch {epoch} was completed, starting from epoch {epoch + 1}")
-    
-    # Use the learning rate from checkpoint if not specified
-    if (learning_rate is None):
-        if load_scheduler_and_optimizer:
-            learning_rate = temp_optimizer.param_groups[0]['lr']
-            print(f"Using learning rate from checkpoint: {learning_rate}")
-        else:
-            print("When load_scheduler_and_optimizer=False you should set Learning Rate")
-            sys.exit(1)
-
-    if (weight_decay is None):
-        if load_scheduler_and_optimizer:
-            weight_decay = temp_optimizer.param_groups[0]['weight_decay']
-            print(f"Using weight decay from checkpoint: {weight_decay}")
-        else:
-            print("When load_scheduler_and_optimizer=False you should set Weight Decay")
-            sys.exit(1)
-            
-    inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
-    
-    # Train for additional epochs
-    print(f"Training for {num_epochs} additional epochs (epochs {continue_from_epoch} to {continue_from_epoch + num_epochs - 1})")
-    
-    # Resume training with the loaded state
-    if load_scheduler_and_optimizer:
-        return train_model(
-            # Dataloaders
-            train_loader=train_loader,
-            randomize_each_epoch_plan=randomize_each_epoch_plan,
-            val_loader=val_loader,
-            val_loader_high_energy=val_loader_high_energy,
-            val_loader_training_set=val_loader_training_set,
-            
-            # Network
-            mapping_net=mapping_net, 
-            inverse_net=inverse_net,
-            
-            # Needed objects
-            var_loss_class=var_loss_class,
-            repulsion_loss_class=repulsion_loss_class,
-            get_data_from_trajectory_id=get_data_from_trajectory_id,
-            possible_t_values=possible_t_values,
-            
-            # Needed pandas dataframes
-            train_df=train_df,
-            train_id_df=train_id_df,
-            val_df=val_df,
-            val_id_df=val_id_df,
-            val_df_high_energy=val_df_high_energy,
-            val_id_df_high_energy=val_id_df_high_energy,
-            add_noise=add_noise,
-            
-            # Loss calculation hyperparameters
-            mapping_loss_scale=mapping_loss_scale,
-            prediction_loss_scale=prediction_loss_scale,
-            predict_full_trajectory=predict_full_trajectory,
-            loss_type=loss_type,
-            normalized_mse=normalized_mse,
-            mapping_coefficient=mapping_coefficient,
-            repulsion_coefficient=repulsion_coefficient,
-            prediction_coefficient=prediction_coefficient,
-            reconstruction_threshold=reconstruction_threshold,
-            reconstruction_loss_multiplier=reconstruction_loss_multiplier,
-            hsic_loss_max_want = hsic_loss_max_want,
-            on_distribution_val_criterio_weight=on_distribution_val_criterio_weight,
-            
-            # Optimizer parameters - using loaded states
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            optimizer=temp_optimizer,  # Loaded from checkpoint
-            optimizer_type=optimizer_type,
-            scheduler=temp_scheduler,  # Loaded from checkpoint
-            scheduler_type=scheduler_type,
-            scheduler_params=scheduler_params,
-            
-            # Training parameters
-            num_epochs=num_epochs,
-            grad_clip_value=grad_clip_value,
-            continue_from_epoch=continue_from_epoch,
-            best_validation_criterio_loss_till_now=best_val_loss,  # Loaded from checkpoint
-            
-            # Early stopping parameters
-            early_stopping=early_stopping,
-            patience=patience,
-            min_delta=min_delta,
-            
-            # Checkpointing
-            save_dir=save_dir,
-            save_best_only=save_best_only,
-            save_freq_epochs=save_freq_epochs,
-            auto_rescue=auto_rescue,
-            
-            # Logging
-            log_freq_batches=log_freq_batches,
-            verbose=verbose,
-            
-            # Device
-            device=device,
-        )
-    else:
-        return train_model(
-            # Dataloaders
-            train_loader=train_loader,
-            randomize_each_epoch_plan=randomize_each_epoch_plan,
-            val_loader=val_loader,
-            val_loader_high_energy=val_loader_high_energy,
-            val_loader_training_set=val_loader_training_set,
-            
-            # Network
-            mapping_net=mapping_net, 
-            inverse_net=inverse_net,
-            
-            # Needed objects
-            var_loss_class=var_loss_class,
-            repulsion_loss_class=repulsion_loss_class,
-            get_data_from_trajectory_id=get_data_from_trajectory_id,
-            possible_t_values=possible_t_values,
-            
-            # Needed pandas dataframes
-            train_df=train_df,
-            train_id_df=train_id_df,
-            val_df=val_df,
-            val_id_df=val_id_df,
-            val_df_high_energy=val_df_high_energy,
-            val_id_df_high_energy=val_id_df_high_energy,
-            add_noise=add_noise,
-            
-            # Loss calculation hyperparameters
-            mapping_loss_scale=mapping_loss_scale,
-            prediction_loss_scale=prediction_loss_scale,
-            predict_full_trajectory=predict_full_trajectory,
-            loss_type=loss_type,
-            normalized_mse=normalized_mse,
-            mapping_coefficient=mapping_coefficient,
-            repulsion_coefficient=repulsion_coefficient,
-            prediction_coefficient=prediction_coefficient,
-            reconstruction_threshold=reconstruction_threshold,
-            reconstruction_loss_multiplier=reconstruction_loss_multiplier,
-            hsic_loss_max_want = hsic_loss_max_want,
-            on_distribution_val_criterio_weight=on_distribution_val_criterio_weight,
-            
-            # Optimizer parameters - creating fresh
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            optimizer=None,  # Create fresh optimizer
-            optimizer_type=optimizer_type,
-            scheduler=None,  # Create fresh scheduler
-            scheduler_type=scheduler_type,
-            scheduler_params=scheduler_params,
-            
-            # Training parameters
-            num_epochs=num_epochs,
-            grad_clip_value=grad_clip_value,
-            continue_from_epoch=continue_from_epoch,
-            best_validation_criterio_loss_till_now=best_val_loss,  # Loaded from checkpoint
-            
-            # Early stopping parameters
-            early_stopping=early_stopping,
-            patience=patience,
-            min_delta=min_delta,
-            
-            # Checkpointing
-            save_dir=save_dir,
-            save_best_only=save_best_only,
-            save_freq_epochs=save_freq_epochs,
-            auto_rescue=auto_rescue,
-            
-            # Logging
-            log_freq_batches=log_freq_batches,
-            verbose=verbose,
-            
-            # Device
-            device=device,
-        )
-'''
 def train_model_real_pendulum(
     # Dataloaders
     train_loader,
@@ -7063,1806 +5024,426 @@ def add_phi_A_columns(df):
     return df[cols]
 
 
-def plot_differencies(df, pendulum=False):
-    """
-    Plot relationships between means and constants.
-    
-    Args:
-        df: DataFrame with columns ['trajectory_id', 'X_mean', 'U_mean'] and constants
-        pendulum: If True, use columns 'phi0' and 'energy' instead of 'phi' and 'A'
-    """
-    # Define column names based on pendulum mode
-    if pendulum:
-        col_x = "phi0"
-        col_y = "energy"
-    else:
-        col_x = "phi"
-        col_y = "A"
-    
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
-    axes = axes.flatten()
-    
-    # Row 1: X_mean vs col_y and col_x
-    axes[0].scatter(df['X_mean'], df[col_y], s=20)
-    axes[0].set_xlabel('X_mean')
-    axes[0].set_ylabel(col_y)
-    axes[0].set_title(f'{col_y} vs X_mean')
-    
-    axes[1].scatter(df['X_mean'], df[col_x], s=20)
-    axes[1].set_xlabel('X_mean')
-    axes[1].set_ylabel(col_x)
-    axes[1].set_title(f'{col_x} vs X_mean')
-    
-    # Row 2: U_mean vs col_y and col_x
-    axes[2].scatter(df['U_mean'], df[col_y], s=20)
-    axes[2].set_xlabel('U_mean')
-    axes[2].set_ylabel(col_y)
-    axes[2].set_title(f'{col_y} vs U_mean')
-    
-    axes[3].scatter(df['U_mean'], df[col_x], s=20)
-    axes[3].set_xlabel('U_mean')
-    axes[3].set_ylabel(col_x)
-    axes[3].set_title(f'{col_x} vs U_mean')
-    
-    # Row 3: col_y vs col_x and X_mean vs U_mean
-    axes[4].scatter(df[col_y], df[col_x], s=20)
-    axes[4].set_xlabel(col_y)
-    axes[4].set_ylabel(col_x)
-    axes[4].set_title(f'{col_x} vs {col_y}')
-    
-    axes[5].scatter(df['X_mean'], df['U_mean'], s=20)
-    axes[5].set_xlabel('X_mean')
-    axes[5].set_ylabel('U_mean')
-    axes[5].set_title('U_mean vs X_mean')
-    
-    plt.tight_layout()
-    plt.show()
-
-
-
-def plot_prediction_vs_ground_truth(x, u, x_pred, u_pred, pred_loss_full_trajectory, t, trajectory_id,
-                                     point_indexes_observed, figsize=(12, 7), connect_points=False,
-                                     portion_to_visualize=None):
-    """
-    Plot ground truth vs predictions with loss metric and time visualization.
-    portion_to_visualize: list [start_idx, end_idx] -> restricts the displayed portion (index-based)
-    """
-
-    # Convert tensors to numpy
-    x_np = x.detach().cpu().numpy().flatten()
-    u_np = u.detach().cpu().numpy().flatten()
-    x_pred_np = x_pred.detach().cpu().numpy().flatten()
-    u_pred_np = u_pred.detach().cpu().numpy().flatten()
-    t_np = t.detach().cpu().numpy().flatten()
-    loss_value = pred_loss_full_trajectory.item()
-
-    # Handle visualization portion and adjust observed indices
-    observed_indices_to_plot = point_indexes_observed.copy() if isinstance(point_indexes_observed, list) else list(point_indexes_observed)
-    
-    if portion_to_visualize is not None:
-        start_idx, end_idx = portion_to_visualize
-        x_np = x_np[start_idx:end_idx]
-        u_np = u_np[start_idx:end_idx]
-        x_pred_np = x_pred_np[start_idx:end_idx]
-        u_pred_np = u_pred_np[start_idx:end_idx]
-        t_np = t_np[start_idx:end_idx]
-        
-        # Adjust observed indices to be relative to the visualized portion
-        observed_indices_to_plot = [idx - start_idx for idx in point_indexes_observed 
-                                     if start_idx <= idx < end_idx]
-
-    # Print observed times (not shown in plot)
-    t_observed = t[point_indexes_observed].detach().cpu().numpy()
-    print(f"Observed time points: {t_observed}")
-
-    # Get number of observed points
-    num_observed = len(point_indexes_observed)
-
-    # Create the plot
-    fig, ax = plt.subplots(figsize=figsize)
-
-    # Plot with time-based colormaps (using very different color schemes)
-    scatter_gt = ax.scatter(x_np, u_np, c=t_np, cmap='Blues',
-                            label='Ground Truth', alpha=0.8, s=60, edgecolors='darkblue', linewidths=0.5)
-    scatter_pred = ax.scatter(x_pred_np, u_pred_np, c=t_np, cmap='Reds',
-                              label='Prediction', alpha=0.8, s=60, edgecolors='darkred', linewidths=0.5)
-
-    # Connect points if requested
-    if connect_points:
-        ax.plot(x_np, u_np, 'b-', alpha=0.3, linewidth=1.5)
-        ax.plot(x_pred_np, u_pred_np, 'r-', alpha=0.3, linewidth=1.5)
-
-    # Mark initial points with stars
-    ax.scatter(x_np[0], u_np[0], c='blue', marker='*', s=400,
-               edgecolors='black', linewidths=2.5, label='Start (Ground Truth)', zorder=5)
-    ax.scatter(x_pred_np[0], u_pred_np[0], c='red', marker='*', s=400,
-               edgecolors='black', linewidths=2.5, label='Start (Prediction)', zorder=5)
-
-    # Mark observed points with squares (same for ground truth and prediction)
-    if len(observed_indices_to_plot) > 0:
-        x_observed = x_np[observed_indices_to_plot]
-        u_observed = u_np[observed_indices_to_plot]
-        t_observed_plot = t_np[observed_indices_to_plot]
-        
-        # Plot observed points with square markers
-        ax.scatter(x_observed, u_observed, c=t_observed_plot, cmap='Greens',
-                   marker='s', s=120, edgecolors='darkgreen', linewidths=2, 
-                   label='Observed Points', zorder=6)
-
-    # Add colorbars for time (side by side)
-    cbar_gt = plt.colorbar(scatter_gt, ax=ax, pad=0.02, fraction=0.046)
-    cbar_gt.set_label('Time (Ground Truth)', fontsize=10, color='darkblue', fontweight='bold')
-    cbar_gt.ax.tick_params(labelsize=9)
-
-    cbar_pred = plt.colorbar(scatter_pred, ax=ax, pad=0.12, fraction=0.046)
-    cbar_pred.set_label('Time (Prediction)', fontsize=10, color='darkred', fontweight='bold')
-    cbar_pred.ax.tick_params(labelsize=9)
-
-    # Labels and title
-    ax.set_xlabel('x', fontsize=12)
-    ax.set_ylabel('u', fontsize=12)
-    ax.set_title(f'Prediction vs Ground Truth - Trajectory ID: {trajectory_id}', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=9, loc='best')
-    ax.grid(True, alpha=0.3)
-
-    # Annotate loss and portion info
-    textstr = f'Loss: {loss_value:.4f}\nTime range: [{t_np[0]:.2f}, {t_np[-1]:.2f}]\nObserved points: {num_observed}'
-    if portion_to_visualize is not None:
-        textstr += f'\nPlotted range: [{portion_to_visualize[0]}, {portion_to_visualize[1]}]'
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-    ax.text(0.05, 0.95, textstr, transform=ax.transAxes,
-            fontsize=11, verticalalignment='top', bbox=props)
-
-    plt.tight_layout()
-    plt.show()
 
 
 
 
 
-def plot_distance_over_time(x, u, x_pred, u_pred, t, trajectory_id, 
-                           point_indexes_observed=None, show_zeroings=False,
-                           show_period=False, period=None,
-                           loss_type="euclidean", figsize=(12, 6)):
-    """
-    Plot the distance between predicted and ground truth values over time.
-    
-    Args:
-        x: Ground truth positions, shape (n_points,)
-        u: Ground truth velocities, shape (n_points,)
-        x_pred: Predicted positions, shape (n_points,)
-        u_pred: Predicted velocities, shape (n_points,)
-        t: Time values (sorted), shape (n_points,)
-        trajectory_id: ID of the trajectory being plotted
-        point_indexes_observed: Optional indices of observed points to highlight
-        show_zeroings: If True, show vertical lines where x or u cross zero
-        show_period: If True, show vertical lines at periodic intervals
-        period: Period value for periodic markers (required if show_period=True)
-        loss_type: Type of distance metric - "euclidean", "mae", or "mse"
-        figsize: Figure size tuple
-    """
-    
-    # Validate period argument
-    if show_period and period is None:
-        raise ValueError("period must be provided when show_period=True")
-    
-    # Validate loss_type argument
-    if loss_type not in ["euclidean", "mae", "mse"]:
-        raise ValueError("loss_type must be one of: 'euclidean', 'mae', or 'mse'")
-    
-    # Compute distance based on loss_type
-    if loss_type == "euclidean":
-        distances = torch.sqrt((x_pred - x) ** 2 + (u_pred - u) ** 2)
-        distance_label = "Euclidean Distance"
-        ylabel = "Euclidean Distance in Phase Space"
-    elif loss_type == "mae":
-        distances = torch.abs(x_pred - x) + torch.abs(u_pred - u)
-        distance_label = "MAE Distance"
-        ylabel = "MAE (Mean Absolute Error) in Phase Space"
-    elif loss_type == "mse":
-        distances = (x_pred - x) ** 2 + (u_pred - u) ** 2
-        distance_label = "MSE Distance"
-        ylabel = "MSE (Mean Squared Error) in Phase Space"
-    
-    # Convert to numpy for plotting
-    t_np = t.cpu().numpy()
-    distances_np = distances.cpu().detach().numpy()
-    x_np = x.cpu().numpy()
-    u_np = u.cpu().numpy()
-    
-    # Create the plot
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.plot(t_np, distances_np, linewidth=2, color='blue', label=distance_label)
-    
-    # Add a bit of padding to x-axis (5% on each side)
-    t_range = t_np.max() - t_np.min()
-    padding = t_range * 0.05
-    ax.set_xlim(t_np.min() - padding, t_np.max() + padding)
-    
-    # Show period markers if requested
-    if show_period and period is not None:
-        # Find the starting point (first multiple of period >= t_min)
-        t_min = t_np.min()
-        t_max = t_np.max()
-        
-        # Start from the first multiple of period that is >= t_min
-        start_multiple = int(np.ceil(t_min / period))
-        end_multiple = int(np.floor(t_max / period))
-        
-        # Generate all period markers
-        period_times = [i * period for i in range(start_multiple, end_multiple + 1)]
-        
-        # Plot period markers (skip t=0)
-        period_plotted = False
-        for period_time in period_times:
-            if t_min <= period_time <= t_max and abs(period_time) > 1e-9:  # Skip t=0
-                label = f'Period ({period:.3f})' if not period_plotted else None
-                ax.axvline(x=period_time, color='cyan', linestyle='-', linewidth=1.5, 
-                          alpha=0.6, label=label)
-                period_plotted = True
-    
-    # Show zero crossings if requested
-    if show_zeroings:
-        # Detect x zero crossings
-        x_crossings = []
-        for i in range(len(x_np) - 1):
-            # Check for sign change
-            if x_np[i] * x_np[i + 1] < 0:  # Different signs means zero crossing
-                # Find which point is closest to zero
-                if abs(x_np[i]) < abs(x_np[i + 1]):
-                    x_crossings.append(i)
-                else:
-                    x_crossings.append(i + 1)
-            # Also check if exactly zero
-            elif x_np[i] == 0 and (i == 0 or x_np[i-1] * x_np[i+1] <= 0):
-                x_crossings.append(i)
-        
-        # Detect u zero crossings
-        u_crossings = []
-        for i in range(len(u_np) - 1):
-            # Check for sign change
-            if u_np[i] * u_np[i + 1] < 0:  # Different signs means zero crossing
-                # Find which point is closest to zero
-                if abs(u_np[i]) < abs(u_np[i + 1]):
-                    u_crossings.append(i)
-                else:
-                    u_crossings.append(i + 1)
-            # Also check if exactly zero
-            elif u_np[i] == 0 and (i == 0 or u_np[i-1] * u_np[i+1] <= 0):
-                u_crossings.append(i)
-        
-        # Plot x zero crossings
-        x_crossing_plotted = False
-        for idx in x_crossings:
-            label = 'x ≈ 0' if not x_crossing_plotted else None
-            ax.axvline(x=t_np[idx], color='purple', linestyle=':', linewidth=1.5, 
-                      alpha=0.5, label=label)
-            x_crossing_plotted = True
-        
-        # Plot u zero crossings
-        u_crossing_plotted = False
-        for idx in u_crossings:
-            label = 'u ≈ 0' if not u_crossing_plotted else None
-            ax.axvline(x=t_np[idx], color='magenta', linestyle=':', linewidth=1.5, 
-                      alpha=0.6, label=label)
-            u_crossing_plotted = True
-    
-    # Highlight observed points if provided
-    if point_indexes_observed is not None:
-        t_observed = t[point_indexes_observed].cpu().numpy()
-        distances_observed = distances[point_indexes_observed].cpu().detach().numpy()
-        ax.scatter(t_observed, distances_observed, color='red', s=100, zorder=5, 
-                   label='Observed Points', marker='o', edgecolors='black', linewidth=1.5)
-        
-        # Get current ticks and add observed times
-        current_xticks = list(ax.get_xticks())
-        # Add observed times to ticks
-        for t_obs in t_observed:
-            current_xticks.append(t_obs)
-        # Sort and remove duplicates
-        current_xticks = sorted(set(current_xticks))
-        # Only keep ticks within the padded data range
-        current_xticks = [tick for tick in current_xticks 
-                         if (t_np.min() - padding) <= tick <= (t_np.max() + padding)]
-        
-        ax.set_xticks(current_xticks)
-        
-        # Force matplotlib to draw and update labels
-        fig.canvas.draw()
-        
-        # Color the observed time labels in red
-        labels = ax.get_xticklabels()
-        for label in labels:
-            try:
-                # Get the actual position of the tick, not the text
-                tick_value = label.get_position()[0]
-                # Check if this tick is close to any observed time
-                if np.any(np.abs(tick_value - t_observed) < 1e-6):
-                    label.set_color('red')
-                    label.set_fontweight('bold')
-            except (ValueError, AttributeError, IndexError):
-                pass
-    
-    ax.set_xlabel('Time (t)', fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f'Prediction Error Over Time - Trajectory {trajectory_id}', fontsize=14)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    
-    # Add mean distance as a horizontal line
-    mean_distance = distances_np.mean()
-    ax.axhline(y=mean_distance, color='green', linestyle='--', linewidth=1.5, 
-               label=f'Mean {loss_type.upper()}: {mean_distance:.4f}')
-    ax.legend()
-    
-    plt.tight_layout()
-    plt.show()
 
-def ensemble_autoregressive_prediction_mahalanobis(
-    x, 
-    u, 
-    t, 
-    point_indexes_observed,
+
+
+
+
+
+
+
+
+
+
+
+def Autoregressive_Handoff_Inference_Protocol(
     mapping_net,
     inverse_net,
+    x_obs,
+    u_obs,
+    t_obs,
+    t_min,
+    t_max,
+    Tmax,
+    query_times,
+    query_indices,
     device,
-    max_t_training,
-    threshold=1.0,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
-    verbose=False
 ):
     """
-    Make predictions using ensemble method with autoregressive extension for long trajectories.
+    Autoregressive Handoff Inference Protocol.
     
     Args:
-        x: Ground truth x values (torch tensor)
-        u: Ground truth u values (torch tensor)
-        t: Time values (torch tensor)
-        point_indexes_observed: List with single index of observed point
-        mapping_net: Neural network for forward mapping
-        inverse_net: Neural network for inverse mapping
-        device: Device for computation (cuda/cpu)
-        max_t_training: Maximum time value the model was trained on
-        threshold: Mahalanobis distance threshold for outlier filtering
-        search_range_lower_pct: Lower bound of search range as fraction of tmax (closer to current)
-        search_range_upper_pct: Upper bound of search range as fraction of tmax (farther from current)
-        verbose: If True, print progress and count forward passes
+        mapping_net: trained MappingNet
+        inverse_net: trained InverseNet
+        x_obs: scalar tensor, observed q value
+        u_obs: scalar tensor, observed p value
+        t_obs: float, observation time
+        t_min: float, start of prediction interval
+        t_max: float, end of prediction interval
+        Tmax: float, maximum normalized temporal horizon
+        query_times: 1D numpy array of query times (excluding t_obs)
+        query_indices: list of ints, original indices corresponding to query_times
+        device: torch device
     
     Returns:
-        x_pred_filtered: Filtered x predictions (torch tensor)
-        u_pred_filtered: Filtered u predictions (torch tensor)
-        stats: Dictionary with statistics (num_forward_passes, coverage, etc.)
+        pred_dict: dict mapping original index -> (x_pred, u_pred)
+        forward_pass_count: dict with 'mapping_net' and 'inverse_net' counts
     """
+    # Input validation
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
     
-    # Forward pass counter
+    if not isinstance(query_indices, list):
+        raise ValueError(f"query_indices must be a list, got {type(query_indices)}")
+    
+    if len(query_indices) != len(query_times):
+        raise ValueError(f"query_indices and query_times must have the same length, got {len(query_indices)} and {len(query_times)}")
+
     forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
-    
-    def apply_ensemble_prediction(x_obs_val, u_obs_val, t_obs_val, t, t_max, x_pred_more_t, u_pred_more_t, 
-                                   mapping_net, inverse_net, device, n_points, t_np, indices_array, exclude_indices):
-        """
-        Apply full ensemble method from a single observation point.
-        Adds predictions to the existing x_pred_more_t and u_pred_more_t lists.
-        """
-        # Create all latent representations (pretending observation is at each time t[i])
-        X_observed_full_shape = torch.full_like(t, fill_value=x_obs_val)
-        U_observed_full_shape = torch.full_like(t, fill_value=u_obs_val)
-        X_final_more_t, U_final_more_t, _ = mapping_net(X_observed_full_shape, U_observed_full_shape, t)
+    pred_dict = {}
+
+    if len(query_indices) == 0:
+        return pred_dict, forward_pass_count
+
+    # Case 1: Direct Prediction
+    if (t_max - t_min) <= Tmax:
+        t_rel_obs = torch.tensor([t_obs - t_min], device=device, dtype=torch.float32)
+        Q, P, _ = mapping_net(x_obs.unsqueeze(0), u_obs.unsqueeze(0), t_rel_obs)
         forward_pass_count['mapping_net'] += 1
-        
-        # Define prediction window around this observation
-        abs_time_lower = max(0, t_obs_val - t_max)
-        abs_time_upper = min(t_np[-1], t_obs_val + t_max)
-        in_prediction_window = (t_np >= abs_time_lower) & (t_np <= abs_time_upper)
-        
-        # Create exclusion mask for all indices to exclude
-        exclude_mask = np.ones(n_points, dtype=bool)
-        for idx in exclude_indices:
-            exclude_mask[idx] = False
-        
-        # For each perspective i
-        for i in range(n_points):
-            # From perspective i, calculate relative times for all points
-            t_rel_all = t_np - t_obs_val + t_np[i]
-            
-            # Find valid points within the prediction window (excluding specified indices)
-            valid_mask = (t_rel_all >= 0) & (t_rel_all <= t_max) & in_prediction_window & exclude_mask
-            valid_indices = np.where(valid_mask)[0]
-            
-            if len(valid_indices) > 0:
-                # Get relative times for valid points
-                t_rel_valid = torch.tensor(t_rel_all[valid_indices], device=device, dtype=torch.float32)
-                
-                # Create full-shape tensors filled with the latent values from perspective i
-                X_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=X_final_more_t[i].item())
-                U_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=U_final_more_t[i].item())
-                
-                # Batch predict for all valid points from this perspective
-                x_pred_batch, u_pred_batch, _ = inverse_net(X_final_i_full_shape, U_final_i_full_shape, t_rel_valid)
-                forward_pass_count['inverse_net'] += 1
-                
-                # Convert predictions to CPU once for the entire batch
-                x_pred_batch_cpu = x_pred_batch.detach().cpu()
-                u_pred_batch_cpu = u_pred_batch.detach().cpu()
-                
-                # Store predictions (ADD to existing lists)
-                for idx, j in enumerate(valid_indices):
-                    x_pred_more_t[j].append(x_pred_batch_cpu[idx].item())
-                    u_pred_more_t[j].append(u_pred_batch_cpu[idx].item())
-    
-    # ==================== MAIN ALGORITHM ====================
-    
-    # Validate inputs
-    assert len(point_indexes_observed) == 1, "This function only works with exactly one observation"
-    
-    obs_idx = point_indexes_observed[0]
-    t_max = max_t_training
-    t_np = t.detach().cpu().numpy()
-    t_obs = t_np[obs_idx]
-    t_pred_max = t_np[-1]
-    n_points = len(t)
-    
-    if verbose:
-        print(f"=== Ensemble Autoregressive Prediction ===")
-        print(f"Observation at index {obs_idx}, absolute time {t_obs:.3f}")
-        print(f"Full trajectory time range: [0, {t_pred_max:.3f}]")
-        print(f"Training time max: {t_max:.3f}")
-        print(f"Search range: [{search_range_lower_pct*100}%, {search_range_upper_pct*100}%] of tmax")
-    
-    # Initialize prediction lists for each time point
-    x_pred_more_t = [[] for _ in range(n_points)]
-    u_pred_more_t = [[] for _ in range(n_points)]
-    
-    # The observed point gets its true value (and ONLY this value)
-    x_pred_more_t[obs_idx].append(x[obs_idx].item())
-    u_pred_more_t[obs_idx].append(u[obs_idx].item())
-    
-    # Get observed values
-    x_obs = x[obs_idx].item()
-    u_obs = u[obs_idx].item()
-    
-    # Pre-compute index array
-    indices_array = np.arange(n_points)
-    
-    # ==================== STEP 1: Initial Ensemble from True Observation ====================
-    if verbose:
-        print(f"\n=== Step 1: Initial ensemble from true observation ===")
-    
-    apply_ensemble_prediction(x_obs, u_obs, t_obs, t, t_max, x_pred_more_t, u_pred_more_t,
-                              mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                              exclude_indices=[obs_idx])
-    
-    if verbose:
-        print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-    
-    # ==================== STEP 2: Fill Left Side (toward t=0) ====================
-    if verbose:
-        print(f"\n=== Step 2: Filling left side ===")
-    
-    left_cutoff = (1 - search_range_upper_pct) * t_max
-    
-    if verbose:
-        print(f"Left cutoff: {left_cutoff:.3f} (will continue while t_current >= {left_cutoff:.3f})")
-    
-    if t_obs < left_cutoff:
-        if verbose:
-            print(f"Left side already covered (t_obs={t_obs:.3f} < cutoff={left_cutoff:.3f})")
-    else:
-        t_current = t_obs
-        iteration = 0
-        while t_current >= left_cutoff:
-            iteration += 1
-            if verbose:
-                print(f"\n--- Left iteration {iteration}, current position: {t_current:.3f} ---")
-            
-            # Define search range
-            range_lower = t_current - search_range_upper_pct * t_max
-            range_upper = t_current - search_range_lower_pct * t_max
-            
-            # Find indices in this range that have predictions
-            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
-            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
-            
-            if len(candidate_indices) == 0:
-                if verbose:
-                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
-                break
-            
-            # Find the most trusted index (lowest std of mahalanobis distances)
-            best_idx = None
-            best_std = float('inf')
-            
-            for idx in candidate_indices:
-                _, _, std_dist = filter_outliers_mahalanobis(
-                    x_pred_more_t[idx], u_pred_more_t[idx], threshold=threshold, return_std=True
-                )
-                if std_dist < best_std:
-                    best_std = std_dist
-                    best_idx = idx
-            
-            if verbose:
-                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (std={best_std:.4f})")
-            
-            # Get final prediction for this trusted point
-            x_trusted, u_trusted = filter_outliers_mahalanobis(
-                x_pred_more_t[best_idx], u_pred_more_t[best_idx], threshold=threshold
-            )
-            t_trusted = t_np[best_idx]
-            
-            # Apply ensemble from this trusted point
-            if verbose:
-                print(f"Applying ensemble from trusted point...")
-            
-            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
-                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                                      exclude_indices=[obs_idx, best_idx])
-            
-            if verbose:
-                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-            
-            # Update current position
-            t_current = t_trusted
-            
-            # Check termination condition
-            if t_current < left_cutoff:
-                if verbose:
-                    print(f"Left side complete (t_current={t_current:.3f} < cutoff={left_cutoff:.3f})")
-                break
-    
-    # ==================== STEP 3: Fill Right Side (toward t_pred_max) ====================
-    if verbose:
-        print(f"\n=== Step 3: Filling right side ===")
-    
-    right_cutoff = (1 - search_range_upper_pct) * t_max
-    
-    if verbose:
-        print(f"Right cutoff: {right_cutoff:.3f} (will continue while (t_pred_max - t_current) >= {right_cutoff:.3f})")
-    
-    if (t_pred_max - t_obs) < right_cutoff:
-        if verbose:
-            print(f"Right side already covered ((t_pred_max - t_obs)={t_pred_max - t_obs:.3f} < cutoff={right_cutoff:.3f})")
-    else:
-        t_current = t_obs
-        iteration = 0
-        while (t_pred_max - t_current) >= right_cutoff:
-            iteration += 1
-            if verbose:
-                print(f"\n--- Right iteration {iteration}, current position: {t_current:.3f} ---")
-            
-            # Define search range
-            range_lower = t_current + search_range_lower_pct * t_max
-            range_upper = t_current + search_range_upper_pct * t_max
-            
-            # Find indices in this range that have predictions
-            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
-            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
-            
-            if len(candidate_indices) == 0:
-                if verbose:
-                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
-                break
-            
-            # Find the most trusted index (lowest std of mahalanobis distances)
-            best_idx = None
-            best_std = float('inf')
-            
-            for idx in candidate_indices:
-                _, _, std_dist = filter_outliers_mahalanobis(
-                    x_pred_more_t[idx], u_pred_more_t[idx], threshold=threshold, return_std=True
-                )
-                if std_dist < best_std:
-                    best_std = std_dist
-                    best_idx = idx
-            
-            if verbose:
-                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (std={best_std:.4f})")
-            
-            # Get final prediction for this trusted point
-            x_trusted, u_trusted = filter_outliers_mahalanobis(
-                x_pred_more_t[best_idx], u_pred_more_t[best_idx], threshold=threshold
-            )
-            t_trusted = t_np[best_idx]
-            
-            # Apply ensemble from this trusted point
-            if verbose:
-                print(f"Applying ensemble from trusted point...")
-            
-            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
-                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                                      exclude_indices=[obs_idx, best_idx])
-            
-            if verbose:
-                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-            
-            # Update current position
-            t_current = t_trusted
-            
-            # Check termination condition
-            if (t_pred_max - t_current) < right_cutoff:
-                if verbose:
-                    print(f"Right side complete ((t_pred_max - t_current)={t_pred_max - t_current:.3f} < cutoff={right_cutoff:.3f})")
-                break
-    
-    # ==================== STEP 4: Final Aggregation ====================
-    if verbose:
-        print(f"\n=== Step 4: Final aggregation ===")
-    
-    x_pred_filtered = torch.full_like(t, fill_value=0.0)
-    u_pred_filtered = torch.full_like(t, fill_value=0.0)
-    
-    for i in range(n_points):
-        if len(x_pred_more_t[i]) > 0:
-            inside_list_x_mean_np, inside_list_u_mean_np = filter_outliers_mahalanobis(
-                x_pred_more_t[i], u_pred_more_t[i], threshold=threshold
-            )
-            x_pred_filtered[i] = inside_list_x_mean_np
-            u_pred_filtered[i] = inside_list_u_mean_np
-    
-    # Verify obs_idx still has only 1 prediction
-    assert len(x_pred_more_t[obs_idx]) == 1, f"Observed point should have only 1 value, but has {len(x_pred_more_t[obs_idx])}"
-    
-    # Calculate statistics
-    coverage = sum(1 for i in range(n_points) if len(x_pred_more_t[i]) > 0)
-    total_forward_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
-    
-    stats = {
-        'coverage': coverage,
-        'coverage_pct': 100 * coverage / n_points,
-        'mapping_net_calls': forward_pass_count['mapping_net'],
-        'inverse_net_calls': forward_pass_count['inverse_net'],
-        'total_forward_passes': total_forward_passes,
-        'obs_idx': obs_idx,
-        'prediction_counts_per_point': [len(x_pred_more_t[i]) for i in range(n_points)]
-    }
-    
-    if verbose:
-        print(f"\n=== Summary ===")
-        print(f"✓ Observed point {obs_idx} correctly has only 1 value")
-        print(f"Coverage: {coverage}/{n_points} points ({stats['coverage_pct']:.1f}%)")
-        print(f"Total forward passes: {total_forward_passes}")
-        print(f"  - mapping_net calls: {forward_pass_count['mapping_net']}")
-        print(f"  - inverse_net calls: {forward_pass_count['inverse_net']}")
-        print(f"\nSample prediction counts:")
-        for i in [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]:
-            print(f"  Point {i} (t={t_np[i]:.3f}): {len(x_pred_more_t[i])} predictions")
-    
-    return x_pred_filtered, u_pred_filtered, stats
 
+        t_rel_query = torch.tensor(query_times - t_min, device=device, dtype=torch.float32)
+        Q_full = Q.expand(len(query_indices))
+        P_full = P.expand(len(query_indices))
+        x_pred_query, u_pred_query, _ = inverse_net(Q_full, P_full, t_rel_query)
+        forward_pass_count['inverse_net'] += 1
 
+        for j, idx in enumerate(query_indices):
+            pred_dict[idx] = (x_pred_query[j].item(), u_pred_query[j].item())
 
+        return pred_dict, forward_pass_count
 
-def aggregate_ensemble_predictions(x_pred_more_t, u_pred_more_t, dt, 
-                                  alpha=1.0, gamma=1.0, 
-                                  cluster_weight_threshold=0.1, 
-                                  max_n_components=4):
-    """
-    Aggregate ensemble predictions using Bayesian Gaussian Mixture Model clustering
-    and temporal consistency weighting.
-    
-    Returns:
-        x_aggregated: 1D numpy array of aggregated x predictions for each id
-        u_aggregated: 1D numpy array of aggregated u predictions for each id
-    """
-    n_ids = len(x_pred_more_t)
-    x_aggregated = np.zeros(n_ids)
-    u_aggregated = np.zeros(n_ids)
-    
-    for id_idx in range(n_ids):
-        x_preds = np.array(x_pred_more_t[id_idx])
-        u_preds = np.array(u_pred_more_t[id_idx])
-        n_preds = len(x_preds)
-        
-        # Case 1: Only one prediction
-        if n_preds == 1:
-            x_aggregated[id_idx] = x_preds[0]
-            u_aggregated[id_idx] = u_preds[0]
-            continue
-        
-        # Case 2: Few predictions (< max_n_components)
-        if n_preds < max_n_components:
-            # Calculate temporal consistency weights only
-            weights = np.ones(n_preds)
-            if id_idx > 0:  # Can calculate temporal consistency
-                for i in range(n_preds):
-                    if i < len(x_pred_more_t[id_idx-1]):  # Has previous prediction
-                        dx_dt = (x_preds[i] - x_pred_more_t[id_idx-1][i]) / dt
-                        u_mean = np.mean(u_preds)  # Use mean of current predictions as scale
-                        if u_mean != 0:
-                            weights[i] = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(u_mean))
-            
-            # Normalize weights and aggregate
-            weights = weights / np.sum(weights)
-            x_aggregated[id_idx] = np.sum(weights * x_preds)
-            u_aggregated[id_idx] = np.sum(weights * u_preds)
-            continue
-        
-        # Case 3: Enough predictions for clustering
-        # Prepare data for GMM
-        X = np.column_stack([x_preds, u_preds])
-        
-        # Fit Bayesian GMM
-        gmm = BayesianGaussianMixture(
-            n_components=max_n_components,
-            init_params="k-means++",
-            random_state=42,
-            n_init=10,
-            tol=1e-3,
-            max_iter = 500
-        )
-        gmm.fit(X)
-        
-        # Get cluster weights and filter
-        cluster_weights = gmm.weights_
-        valid_clusters = cluster_weights >= cluster_weight_threshold
-        
-        # If no clusters pass threshold, keep the highest weight one
-        if not np.any(valid_clusters):
-            valid_clusters = cluster_weights == np.max(cluster_weights)
-        
-        valid_cluster_indices = np.where(valid_clusters)[0]
-        
-        # Get cluster assignments and probabilities
-        cluster_assignments = gmm.predict(X)
-        probs = gmm.predict_proba(X)
-        
-        # If only one valid cluster, calculate its weights and use directly
-        if len(valid_cluster_indices) == 1:
-            best_cluster_idx = valid_cluster_indices[0]
-            best_cluster_mask = cluster_assignments == best_cluster_idx
-            best_cluster_indices = np.where(best_cluster_mask)[0]
-            
-            # Calculate weights for this cluster's points
-            cluster_u_mean = gmm.means_[best_cluster_idx, 1]
-            final_weights = []
-            for i in best_cluster_indices:
-                prob_weight = probs[i, best_cluster_idx] ** gamma
-                temporal_weight = 1.0
-                if id_idx > 0 and i < len(x_pred_more_t[id_idx-1]):
-                    dx_dt = (x_preds[i] - x_pred_more_t[id_idx-1][i]) / dt
-                    if cluster_u_mean != 0:
-                        temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
-                final_weights.append(temporal_weight * prob_weight)
-            final_weights = np.array(final_weights)
-        else:
-            # Calculate and store weights for each valid cluster
-            cluster_mean_weights = []
-            cluster_weights_dict = {}  # Store weights for each cluster
-            
-            for cluster_idx in valid_cluster_indices:
-                # Get points assigned to this cluster
-                cluster_mask = cluster_assignments == cluster_idx
-                cluster_point_indices = np.where(cluster_mask)[0]
-                
-                if len(cluster_point_indices) == 0:
-                    cluster_mean_weights.append(0)
-                    cluster_weights_dict[cluster_idx] = ([], [])
-                    continue
-                
-                cluster_u_mean = gmm.means_[cluster_idx, 1]
-                
-                # Calculate and store weights for points in this cluster
-                point_weights = []
-                for i in cluster_point_indices:
-                    prob_weight = probs[i, cluster_idx] ** gamma
-                    temporal_weight = 1.0
-                    if id_idx > 0 and i < len(x_pred_more_t[id_idx-1]):
-                        dx_dt = (x_preds[i] - x_pred_more_t[id_idx-1][i]) / dt
-                        if cluster_u_mean != 0:
-                            temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
-                    point_weights.append(temporal_weight * prob_weight)
-                
-                # Store weights and indices for this cluster
-                cluster_weights_dict[cluster_idx] = (cluster_point_indices, np.array(point_weights))
-                cluster_mean_weights.append(np.mean(point_weights))
-            
-            # Select cluster with highest mean weight and use its stored weights
-            best_cluster_idx = valid_cluster_indices[np.argmax(cluster_mean_weights)]
-            best_cluster_indices, final_weights = cluster_weights_dict[best_cluster_idx]
-        
-        # Normalize and aggregate using the stored weights
-        if np.sum(final_weights) > 0:
-            final_weights = final_weights / np.sum(final_weights)
-            x_aggregated[id_idx] = np.sum(final_weights * x_preds[best_cluster_indices])
-            u_aggregated[id_idx] = np.sum(final_weights * u_preds[best_cluster_indices])
-        else:
-            # Fallback to mean of cluster points if all weights are zero
-            x_aggregated[id_idx] = np.mean(x_preds[best_cluster_indices])
-            u_aggregated[id_idx] = np.mean(u_preds[best_cluster_indices])
-    
-    return x_aggregated, u_aggregated
+    # Case 2: Autoregressive Propagation
 
-def calculate_trust_score(x_pred_more_t, u_pred_more_t, idx, dt,
-                         alpha=1.0, gamma=1.0,
-                         cluster_weight_threshold=0.1,
-                         max_n_components=4):
-    """
-    Calculate trust score for a single idx as the mean weight of the best cluster.
-    
-    Returns:
-        trust_score: float, mean weight of the best cluster (higher is better)
-    """
-    x_preds = np.array(x_pred_more_t[idx])
-    u_preds = np.array(u_pred_more_t[idx])
-    n_preds = len(x_preds)
-    
-    # Single prediction - return neutral score
-    if n_preds == 1:
-        return 1.0
-    
-    # Few predictions - use mean temporal consistency only
-    if n_preds < max_n_components:
-        weights = np.ones(n_preds)
-        if idx > 0:
-            for i in range(n_preds):
-                if i < len(x_pred_more_t[idx-1]):
-                    dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
-                    u_mean = np.mean(u_preds)
-                    if u_mean != 0:
-                        weights[i] = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(u_mean))
-        return np.mean(weights)
-    
-    # Clustering case
-    X = np.column_stack([x_preds, u_preds])
-    
-    gmm = BayesianGaussianMixture(
-        n_components=max_n_components,
-        init_params="k-means++",
-        random_state=42,
-        n_init=10,
-        tol=1e-3,
-        max_iter = 500
-    )
-    gmm.fit(X)
-    
-    cluster_weights = gmm.weights_
-    valid_clusters = cluster_weights >= cluster_weight_threshold
-    
-    if not np.any(valid_clusters):
-        valid_clusters = cluster_weights == np.max(cluster_weights)
-    
-    valid_cluster_indices = np.where(valid_clusters)[0]
-    cluster_assignments = gmm.predict(X)
-    probs = gmm.predict_proba(X)
-    
-    best_mean_weight = 0.0
-    
-    for cluster_idx in valid_cluster_indices:
-        cluster_mask = cluster_assignments == cluster_idx
-        cluster_point_indices = np.where(cluster_mask)[0]
-        
-        if len(cluster_point_indices) == 0:
-            continue
-        
-        cluster_u_mean = gmm.means_[cluster_idx, 1]
-        
-        point_weights = []
-        for i in cluster_point_indices:
-            prob_weight = probs[i, cluster_idx] ** gamma
-            temporal_weight = 1.0
-            if idx > 0 and i < len(x_pred_more_t[idx-1]):
-                dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
-                if cluster_u_mean != 0:
-                    temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
-            point_weights.append(temporal_weight * prob_weight)
-        
-        mean_weight = np.mean(point_weights)
-        best_mean_weight = max(best_mean_weight, mean_weight)
-    
-    return best_mean_weight
+    # === Phase 1: Forward Propagation ===
+    fwd = [(idx, query_times[j]) for j, idx in enumerate(query_indices) if query_times[j] > t_obs]
 
+    if fwd:
+        fwd_indices, fwd_times = zip(*fwd)
+        fwd_indices = list(fwd_indices)
+        fwd_times = np.array(fwd_times)
 
+        K_fwd = int(np.ceil((t_max - t_obs) / Tmax - 1e-9))
+        K_fwd = max(K_fwd, 1)
 
-def aggregate_single_id(x_pred_more_t, u_pred_more_t, idx, dt,
-                       alpha=1.0, gamma=1.0,
-                       cluster_weight_threshold=0.1,
-                       max_n_components=4):
-    """
-    Aggregate predictions for a single id only.
-    
-    Args:
-        x_pred_more_t: Full list of lists
-        u_pred_more_t: Full list of lists
-        idx: The specific index to aggregate
-        
-    Returns:
-        x_aggregated, u_aggregated: Single aggregated values for the specified idx
-    """
-    x_preds = np.array(x_pred_more_t[idx])
-    u_preds = np.array(u_pred_more_t[idx])
-    n_preds = len(x_preds)
-    
-    # Case 1: Only one prediction
-    if n_preds == 1:
-        return x_preds[0], u_preds[0]
-    
-    # Case 2: Few predictions
-    if n_preds < max_n_components:
-        weights = np.ones(n_preds)
-        if idx > 0:  # Need access to previous idx for temporal consistency
-            for i in range(n_preds):
-                if i < len(x_pred_more_t[idx-1]):
-                    dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
-                    u_mean = np.mean(u_preds)
-                    if u_mean != 0:
-                        weights[i] = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(u_mean))
-        
-        weights = weights / np.sum(weights)
-        return np.sum(weights * x_preds), np.sum(weights * u_preds)
-    
-    # Case 3: Clustering
-    X = np.column_stack([x_preds, u_preds])
-    
-    gmm = BayesianGaussianMixture(
-        n_components=max_n_components,
-        init_params="k-means++",
-        random_state=42,
-        n_init=10,
-        tol=1e-3,
-        max_iter = 500
-    )
-    gmm.fit(X)
-    
-    cluster_weights = gmm.weights_
-    valid_clusters = cluster_weights >= cluster_weight_threshold
-    
-    if not np.any(valid_clusters):
-        valid_clusters = cluster_weights == np.max(cluster_weights)
-    
-    valid_cluster_indices = np.where(valid_clusters)[0]
-    cluster_assignments = gmm.predict(X)
-    probs = gmm.predict_proba(X)
-    
-    # Process clusters
-    if len(valid_cluster_indices) == 1:
-        best_cluster_idx = valid_cluster_indices[0]
-        best_cluster_mask = cluster_assignments == best_cluster_idx
-        best_cluster_indices = np.where(best_cluster_mask)[0]
-        
-        cluster_u_mean = gmm.means_[best_cluster_idx, 1]
-        final_weights = []
-        for i in best_cluster_indices:
-            prob_weight = probs[i, best_cluster_idx] ** gamma
-            temporal_weight = 1.0
-            if idx > 0 and i < len(x_pred_more_t[idx-1]):
-                dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
-                if cluster_u_mean != 0:
-                    temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
-            final_weights.append(temporal_weight * prob_weight)
-        final_weights = np.array(final_weights)
-    else:
-        cluster_mean_weights = []
-        cluster_weights_dict = {}
-        
-        for cluster_idx in valid_cluster_indices:
-            cluster_mask = cluster_assignments == cluster_idx
-            cluster_point_indices = np.where(cluster_mask)[0]
-            
-            if len(cluster_point_indices) == 0:
-                cluster_mean_weights.append(0)
-                cluster_weights_dict[cluster_idx] = ([], [])
+        q_curr = x_obs.clone()
+        p_curr = u_obs.clone()
+        t_curr = t_obs
+
+        for k in range(K_fwd):
+            T_start_k = t_curr
+            T_end_k = min(t_curr + Tmax, t_max)
+            if k == K_fwd - 1:
+                T_end_k = t_max
+
+            if k < K_fwd - 1:
+                I_k_query = [(idx, ft) for idx, ft in zip(fwd_indices, fwd_times) if T_start_k <= ft < T_end_k]
+            else:
+                I_k_query = [(idx, ft) for idx, ft in zip(fwd_indices, fwd_times) if T_start_k <= ft <= T_end_k]
+
+            need_boundary = (k < K_fwd - 1)
+
+            t_rel_list = [ft - T_start_k for _, ft in I_k_query]
+            if need_boundary:
+                t_rel_list.append(T_end_k - T_start_k)
+
+            if len(t_rel_list) == 0:
                 continue
-            
-            cluster_u_mean = gmm.means_[cluster_idx, 1]
-            
-            point_weights = []
-            for i in cluster_point_indices:
-                prob_weight = probs[i, cluster_idx] ** gamma
-                temporal_weight = 1.0
-                if idx > 0 and i < len(x_pred_more_t[idx-1]):
-                    dx_dt = (x_preds[i] - x_pred_more_t[idx-1][i]) / dt
-                    if cluster_u_mean != 0:
-                        temporal_weight = np.exp(-alpha * np.abs(dx_dt - u_preds[i]) / np.abs(cluster_u_mean))
-                point_weights.append(temporal_weight * prob_weight)
-            
-            cluster_weights_dict[cluster_idx] = (cluster_point_indices, np.array(point_weights))
-            cluster_mean_weights.append(np.mean(point_weights))
-        
-        best_cluster_idx = valid_cluster_indices[np.argmax(cluster_mean_weights)]
-        best_cluster_indices, final_weights = cluster_weights_dict[best_cluster_idx]
-    
-    # Aggregate
-    if np.sum(final_weights) > 0:
-        final_weights = final_weights / np.sum(final_weights)
-        x_aggregated = np.sum(final_weights * x_preds[best_cluster_indices])
-        u_aggregated = np.sum(final_weights * u_preds[best_cluster_indices])
-    else:
-        x_aggregated = np.mean(x_preds[best_cluster_indices])
-        u_aggregated = np.mean(u_preds[best_cluster_indices])
-    
-    return x_aggregated, u_aggregated
 
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32)
 
+            Q_k, P_k, _ = mapping_net(q_curr.unsqueeze(0), p_curr.unsqueeze(0),
+                                      torch.tensor([0.0], device=device, dtype=torch.float32))
+            forward_pass_count['mapping_net'] += 1
 
-def ensemble_autoregressive_prediction_gaussian_mixture(
-    x, 
-    u, 
-    t, 
-    point_indexes_observed,
+            Q_full_k = Q_k.expand(len(t_rel_k))
+            P_full_k = P_k.expand(len(t_rel_k))
+
+            q_hat_k, p_hat_k, _ = inverse_net(Q_full_k, P_full_k, t_rel_k)
+            forward_pass_count['inverse_net'] += 1
+
+            for j, (idx, _) in enumerate(I_k_query):
+                pred_dict[idx] = (q_hat_k[j].item(), p_hat_k[j].item())
+
+            if need_boundary:
+                q_curr = q_hat_k[-1].detach()
+                p_curr = p_hat_k[-1].detach()
+                t_curr = T_end_k
+
+    # === Phase 2: Backward Propagation ===
+    bwd = [(idx, query_times[j]) for j, idx in enumerate(query_indices) if query_times[j] < t_obs]
+
+    if bwd:
+        bwd_indices, bwd_times = zip(*bwd)
+        bwd_indices = list(bwd_indices)
+        bwd_times = np.array(bwd_times)
+
+        K_bwd = int(np.ceil((t_obs - t_min) / Tmax - 1e-9))
+        K_bwd = max(K_bwd, 1)
+
+        q_curr = x_obs.clone()
+        p_curr = u_obs.clone()
+        t_curr = t_obs
+
+        for k in range(K_bwd):
+            T_start_k = max(t_curr - Tmax, t_min)
+            T_end_k = t_curr
+            if k == K_bwd - 1:
+                T_start_k = t_min
+
+            if k < K_bwd - 1:
+                I_k_query = [(idx, bt) for idx, bt in zip(bwd_indices, bwd_times) if T_start_k < bt <= T_end_k]
+            else:
+                I_k_query = [(idx, bt) for idx, bt in zip(bwd_indices, bwd_times) if T_start_k <= bt <= T_end_k]
+
+            need_boundary = (k < K_bwd - 1)
+
+            t_rel_list = []
+            if need_boundary:
+                t_rel_list.append(0.0)
+            t_rel_list.extend([bt - T_start_k for _, bt in I_k_query])
+
+            if len(t_rel_list) == 0:
+                continue
+
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32)
+
+            t_rel_obs_in_window = T_end_k - T_start_k
+            Q_k, P_k, _ = mapping_net(q_curr.unsqueeze(0), p_curr.unsqueeze(0),
+                                      torch.tensor([t_rel_obs_in_window], device=device, dtype=torch.float32))
+            forward_pass_count['mapping_net'] += 1
+
+            Q_full_k = Q_k.expand(len(t_rel_k))
+            P_full_k = P_k.expand(len(t_rel_k))
+
+            q_hat_k, p_hat_k, _ = inverse_net(Q_full_k, P_full_k, t_rel_k)
+            forward_pass_count['inverse_net'] += 1
+
+            offset = 1 if need_boundary else 0
+            for j, (idx, _) in enumerate(I_k_query):
+                pred_dict[idx] = (q_hat_k[offset + j].item(), p_hat_k[offset + j].item())
+
+            if need_boundary:
+                q_curr = q_hat_k[0].detach()
+                p_curr = p_hat_k[0].detach()
+                t_curr = T_start_k
+
+    missing = [idx for idx in query_indices if idx not in pred_dict]
+    if missing:
+        raise RuntimeError(
+            f"Autoregressive_Handoff_Inference_Protocol failed to produce predictions for indices {missing}. "
+            f"This is likely a floating point boundary issue. "
+            f"t_obs={t_obs}, t_min={t_min}, t_max={t_max}, Tmax={Tmax}"
+    )
+    return pred_dict, forward_pass_count
+
+def Batched_Autoregressive_Handoff_Inference_Protocol(
     mapping_net,
     inverse_net,
+    x_obs,
+    u_obs,
+    t_obs,
+    t_min,
+    t_max,
+    Tmax,
+    query_times,
+    query_indices,
     device,
-    max_t_training,
-    dt,
-    alpha=1.0, 
-    gamma=1.0,
-    cluster_weight_threshold=0.1,
-    max_n_components=4,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
-    verbose=False
 ):
     """
-    Make predictions using ensemble method with autoregressive extension for long trajectories.
+    Batched Autoregressive Handoff Inference Protocol.
+    
+    All trajectories must share the same time structure (same t values, same obs index).
     
     Args:
-        x: Ground truth x values (torch tensor)
-        u: Ground truth u values (torch tensor)
-        t: Time values (torch tensor)
-        point_indexes_observed: List with single index of observed point
-        mapping_net: Neural network for forward mapping
-        inverse_net: Neural network for inverse mapping
-        device: Device for computation (cuda/cpu)
-        max_t_training: Maximum time value the model was trained on
-        threshold: Mahalanobis distance threshold for outlier filtering
-        search_range_lower_pct: Lower bound of search range as fraction of tmax (closer to current)
-        search_range_upper_pct: Upper bound of search range as fraction of tmax (farther from current)
-        verbose: If True, print progress and count forward passes
+        mapping_net: trained MappingNet
+        inverse_net: trained InverseNet
+        x_obs: (N_traj,) tensor, observed q values
+        u_obs: (N_traj,) tensor, observed p values
+        t_obs: float, shared observation time
+        t_min: float, shared start of prediction interval
+        t_max: float, shared end of prediction interval
+        Tmax: float, maximum normalized temporal horizon
+        query_times: 1D numpy array of shared query times (excluding t_obs)
+        query_indices: list of ints, shared original indices corresponding to query_times
+        device: torch device
     
     Returns:
-        x_pred_filtered: Filtered x predictions (torch tensor)
-        u_pred_filtered: Filtered u predictions (torch tensor)
-        stats: Dictionary with statistics (num_forward_passes, coverage, etc.)
+        x_pred_all: (N_traj, N_query) tensor of x predictions at query times
+        u_pred_all: (N_traj, N_query) tensor of u predictions at query times
+        forward_pass_count: dict with 'mapping_net' and 'inverse_net' counts
     """
-    
-    # Forward pass counter
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if not isinstance(query_indices, list):
+        raise ValueError(f"query_indices must be a list, got {type(query_indices)}")
+    if len(query_indices) != len(query_times):
+        raise ValueError(f"query_indices and query_times must have the same length, got {len(query_indices)} and {len(query_times)}")
+    if x_obs.dim() != 1 or u_obs.dim() != 1:
+        raise ValueError(f"x_obs and u_obs must be 1D tensors, got dims {x_obs.dim()} and {u_obs.dim()}")
+    if x_obs.shape[0] != u_obs.shape[0]:
+        raise ValueError(f"x_obs and u_obs must have the same length, got {x_obs.shape[0]} and {u_obs.shape[0]}")
+
+    N_traj = x_obs.shape[0]
+    N_query = len(query_indices)
     forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
-    
-    def apply_ensemble_prediction(x_obs_val, u_obs_val, t_obs_val, t, t_max, x_pred_more_t, u_pred_more_t, 
-                                   mapping_net, inverse_net, device, n_points, t_np, indices_array, exclude_indices):
-        """
-        Apply full ensemble method from a single observation point.
-        Adds predictions to the existing x_pred_more_t and u_pred_more_t lists.
-        """
-        # Create all latent representations (pretending observation is at each time t[i])
-        X_observed_full_shape = torch.full_like(t, fill_value=x_obs_val)
-        U_observed_full_shape = torch.full_like(t, fill_value=u_obs_val)
-        X_final_more_t, U_final_more_t, _ = mapping_net(X_observed_full_shape, U_observed_full_shape, t)
+
+    # Map from query list position to original index
+    query_pos_to_idx = {j: idx for j, idx in enumerate(query_indices)}
+    # Map from original index to query list position
+    idx_to_query_pos = {idx: j for j, idx in enumerate(query_indices)}
+
+    x_pred_all = torch.empty(N_traj, N_query, device=device, dtype=torch.float32)
+    u_pred_all = torch.empty(N_traj, N_query, device=device, dtype=torch.float32)
+
+    if N_query == 0:
+        return x_pred_all, u_pred_all, forward_pass_count
+
+    # Case 1: Direct Prediction
+    if (t_max - t_min) <= Tmax:
+        t_rel_obs = torch.tensor([t_obs - t_min], device=device, dtype=torch.float32).expand(N_traj)
+        Q, P, _ = mapping_net(x_obs, u_obs, t_rel_obs)
         forward_pass_count['mapping_net'] += 1
-        
-        # Define prediction window around this observation
-        abs_time_lower = max(0, t_obs_val - t_max)
-        abs_time_upper = min(t_np[-1], t_obs_val + t_max)
-        in_prediction_window = (t_np >= abs_time_lower) & (t_np <= abs_time_upper)
-        
-        # Create exclusion mask for all indices to exclude
-        exclude_mask = np.ones(n_points, dtype=bool)
-        for idx in exclude_indices:
-            exclude_mask[idx] = False
-        
-        # For each perspective i
-        for i in range(n_points):
-            # From perspective i, calculate relative times for all points
-            t_rel_all = t_np - t_obs_val + t_np[i]
-            
-            # Find valid points within the prediction window (excluding specified indices)
-            valid_mask = (t_rel_all >= 0) & (t_rel_all <= t_max) & in_prediction_window & exclude_mask
-            valid_indices = np.where(valid_mask)[0]
-            
-            if len(valid_indices) > 0:
-                # Get relative times for valid points
-                t_rel_valid = torch.tensor(t_rel_all[valid_indices], device=device, dtype=torch.float32)
-                
-                # Create full-shape tensors filled with the latent values from perspective i
-                X_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=X_final_more_t[i].item())
-                U_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=U_final_more_t[i].item())
-                
-                # Batch predict for all valid points from this perspective
-                x_pred_batch, u_pred_batch, _ = inverse_net(X_final_i_full_shape, U_final_i_full_shape, t_rel_valid)
-                forward_pass_count['inverse_net'] += 1
-                
-                # Convert predictions to CPU once for the entire batch
-                x_pred_batch_cpu = x_pred_batch.detach().cpu()
-                u_pred_batch_cpu = u_pred_batch.detach().cpu()
-                
-                # Store predictions (ADD to existing lists)
-                for idx, j in enumerate(valid_indices):
-                    x_pred_more_t[j].append(x_pred_batch_cpu[idx].item())
-                    u_pred_more_t[j].append(u_pred_batch_cpu[idx].item())
-    
-    # ==================== MAIN ALGORITHM ====================
-    
-    # Validate inputs
-    assert len(point_indexes_observed) == 1, "This function only works with exactly one observation"
-    
-    obs_idx = point_indexes_observed[0]
-    t_max = max_t_training
-    t_np = t.detach().cpu().numpy()
-    t_obs = t_np[obs_idx]
-    t_pred_max = t_np[-1]
-    n_points = len(t)
-    
-    if verbose:
-        print(f"=== Ensemble Autoregressive Prediction ===")
-        print(f"Observation at index {obs_idx}, absolute time {t_obs:.3f}")
-        print(f"Full trajectory time range: [0, {t_pred_max:.3f}]")
-        print(f"Training time max: {t_max:.3f}")
-        print(f"Search range: [{search_range_lower_pct*100}%, {search_range_upper_pct*100}%] of tmax")
-    
-    # Initialize prediction lists for each time point
-    x_pred_more_t = [[] for _ in range(n_points)]
-    u_pred_more_t = [[] for _ in range(n_points)]
-    
-    # The observed point gets its true value (and ONLY this value)
-    x_pred_more_t[obs_idx].append(x[obs_idx].item())
-    u_pred_more_t[obs_idx].append(u[obs_idx].item())
-    
-    # Get observed values
-    x_obs = x[obs_idx].item()
-    u_obs = u[obs_idx].item()
-    
-    # Pre-compute index array
-    indices_array = np.arange(n_points)
-    
-    # ==================== STEP 1: Initial Ensemble from True Observation ====================
-    if verbose:
-        print(f"\n=== Step 1: Initial ensemble from true observation ===")
-    
-    apply_ensemble_prediction(x_obs, u_obs, t_obs, t, t_max, x_pred_more_t, u_pred_more_t,
-                              mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                              exclude_indices=[obs_idx])
-    
-    if verbose:
-        print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-    
-    # ==================== STEP 2: Fill Left Side (toward t=0) ====================
-    if verbose:
-        print(f"\n=== Step 2: Filling left side ===")
-    
-    left_cutoff = (1 - search_range_upper_pct) * t_max
-    
-    if verbose:
-        print(f"Left cutoff: {left_cutoff:.3f} (will continue while t_current >= {left_cutoff:.3f})")
-    
-    if t_obs < left_cutoff:
-        if verbose:
-            print(f"Left side already covered (t_obs={t_obs:.3f} < cutoff={left_cutoff:.3f})")
-    else:
-        t_current = t_obs
-        iteration = 0
-        while t_current >= left_cutoff:
-            iteration += 1
-            if verbose:
-                print(f"\n--- Left iteration {iteration}, current position: {t_current:.3f} ---")
-            
-            # Define search range
-            range_lower = t_current - search_range_upper_pct * t_max
-            range_upper = t_current - search_range_lower_pct * t_max
-            
-            # Find indices in this range that have predictions
-            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
-            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
-            
-            if len(candidate_indices) == 0:
-                if verbose:
-                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
-                break
-            
-            # Find the most trusted index (lowest std of mahalanobis distances)
-            best_idx = None
-            best_mean_weight = 0.0
-            
-            for idx in candidate_indices:
-                mean_weight = calculate_trust_score(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, dt=dt,
-                                        alpha=alpha, gamma=gamma,
-                                        cluster_weight_threshold=cluster_weight_threshold,
-                                        max_n_components=max_n_components)
-                if mean_weight > best_mean_weight:
-                    best_mean_weight = mean_weight
-                    best_idx = idx
-            
-            if verbose:
-                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
-            
-            # Get final prediction for this trusted point
-            x_trusted, u_trusted = aggregate_single_id(
-                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx, dt=dt,
-                alpha=alpha, gamma=gamma, cluster_weight_threshold=cluster_weight_threshold, max_n_components=max_n_components
-            )
-            t_trusted = t_np[best_idx]
-            
-            # Apply ensemble from this trusted point
-            if verbose:
-                print(f"Applying ensemble from trusted point...")
-            
-            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
-                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                                      exclude_indices=[obs_idx, best_idx])
-            
-            if verbose:
-                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-            
-            # Update current position
-            t_current = t_trusted
-            
-            # Check termination condition
-            if t_current < left_cutoff:
-                if verbose:
-                    print(f"Left side complete (t_current={t_current:.3f} < cutoff={left_cutoff:.3f})")
-                break
-    
-    # ==================== STEP 3: Fill Right Side (toward t_pred_max) ====================
-    if verbose:
-        print(f"\n=== Step 3: Filling right side ===")
-    
-    right_cutoff = (1 - search_range_upper_pct) * t_max
-    
-    if verbose:
-        print(f"Right cutoff: {right_cutoff:.3f} (will continue while (t_pred_max - t_current) >= {right_cutoff:.3f})")
-    
-    if (t_pred_max - t_obs) < right_cutoff:
-        if verbose:
-            print(f"Right side already covered ((t_pred_max - t_obs)={t_pred_max - t_obs:.3f} < cutoff={right_cutoff:.3f})")
-    else:
-        t_current = t_obs
-        iteration = 0
-        while (t_pred_max - t_current) >= right_cutoff:
-            iteration += 1
-            if verbose:
-                print(f"\n--- Right iteration {iteration}, current position: {t_current:.3f} ---")
-            
-            # Define search range
-            range_lower = t_current + search_range_lower_pct * t_max
-            range_upper = t_current + search_range_upper_pct * t_max
-            
-            # Find indices in this range that have predictions
-            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
-            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
-            
-            if len(candidate_indices) == 0:
-                if verbose:
-                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
-                break
-            
-            # Find the most trusted index (lowest std of mahalanobis distances)
-            best_idx = None
-            best_mean_weight = 0.0
-            
-            for idx in candidate_indices:
-                mean_weight = calculate_trust_score(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, dt=dt,
-                                        alpha=alpha, gamma=gamma,
-                                        cluster_weight_threshold=cluster_weight_threshold,
-                                        max_n_components=max_n_components)
-                if mean_weight > best_mean_weight:
-                    best_mean_weight = mean_weight
-                    best_idx = idx
-            
-            if verbose:
-                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
-            
-            # Get final prediction for this trusted point
-            x_trusted, u_trusted = aggregate_single_id(
-                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx, dt=dt,
-                alpha=alpha, gamma=gamma, cluster_weight_threshold=cluster_weight_threshold, max_n_components=max_n_components
-            )
-            t_trusted = t_np[best_idx]
-            
-            # Apply ensemble from this trusted point
-            if verbose:
-                print(f"Applying ensemble from trusted point...")
-            
-            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
-                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                                      exclude_indices=[obs_idx, best_idx])
-            
-            if verbose:
-                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-            
-            # Update current position
-            t_current = t_trusted
-            
-            # Check termination condition
-            if (t_pred_max - t_current) < right_cutoff:
-                if verbose:
-                    print(f"Right side complete ((t_pred_max - t_current)={t_pred_max - t_current:.3f} < cutoff={right_cutoff:.3f})")
-                break
-    
-    # ==================== STEP 4: Final Aggregation ====================
-    if verbose:
-        print(f"\n=== Step 4: Final aggregation ===")
-    
 
-    
-    x_aggregated, u_aggregated = aggregate_ensemble_predictions(x_pred_more_t, u_pred_more_t, dt, 
-                                    alpha=alpha, gamma=gamma, 
-                                    cluster_weight_threshold=cluster_weight_threshold, 
-                                    max_n_components=max_n_components)
-    
-    x_pred_filtered =  torch.as_tensor(x_aggregated, device=x.device, dtype=x.dtype)
-    u_pred_filtered =  torch.as_tensor(u_aggregated, device=u.device, dtype=u.dtype)
-    
-    # Verify obs_idx still has only 1 prediction
-    assert len(x_pred_more_t[obs_idx]) == 1, f"Observed point should have only 1 value, but has {len(x_pred_more_t[obs_idx])}"
-    
-    # Calculate statistics
-    coverage = sum(1 for i in range(n_points) if len(x_pred_more_t[i]) > 0)
-    total_forward_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
-    
-    stats = {
-        'coverage': coverage,
-        'coverage_pct': 100 * coverage / n_points,
-        'mapping_net_calls': forward_pass_count['mapping_net'],
-        'inverse_net_calls': forward_pass_count['inverse_net'],
-        'total_forward_passes': total_forward_passes,
-        'obs_idx': obs_idx,
-        'prediction_counts_per_point': [len(x_pred_more_t[i]) for i in range(n_points)]
-    }
-    
-    if verbose:
-        print(f"\n=== Summary ===")
-        print(f"✓ Observed point {obs_idx} correctly has only 1 value")
-        print(f"Coverage: {coverage}/{n_points} points ({stats['coverage_pct']:.1f}%)")
-        print(f"Total forward passes: {total_forward_passes}")
-        print(f"  - mapping_net calls: {forward_pass_count['mapping_net']}")
-        print(f"  - inverse_net calls: {forward_pass_count['inverse_net']}")
-        print(f"\nSample prediction counts:")
-        for i in [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]:
-            print(f"  Point {i} (t={t_np[i]:.3f}): {len(x_pred_more_t[i])} predictions")
-    
-    return x_pred_filtered, u_pred_filtered, stats
+        # Replicate Q, P: each trajectory's Q/P repeated N_query times
+        # Q shape: (N_traj,) -> (N_traj * N_query,)
+        Q_full = Q.repeat_interleave(N_query)
+        P_full = P.repeat_interleave(N_query)
 
+        # Shared relative times tiled for all trajectories
+        t_rel_query = torch.tensor(query_times - t_min, device=device, dtype=torch.float32)
+        t_rel_full = t_rel_query.repeat(N_traj)
 
+        x_pred_flat, u_pred_flat, _ = inverse_net(Q_full, P_full, t_rel_full)
+        forward_pass_count['inverse_net'] += 1
 
+        x_pred_all = x_pred_flat.view(N_traj, N_query)
+        u_pred_all = u_pred_flat.view(N_traj, N_query)
 
+        return x_pred_all, u_pred_all, forward_pass_count
 
+    # Case 2: Autoregressive Propagation
 
+    # === Phase 1: Forward Propagation ===
+    fwd_positions = [j for j, idx in enumerate(query_indices) if query_times[j] > t_obs]
+    fwd_times_local = np.array([query_times[j] for j in fwd_positions]) if fwd_positions else np.array([])
 
-def aggregate_ensemble_predictions_simple(x_pred_more_t, u_pred_more_t,  max_n_components=4):
-    """
-    Simplified aggregation using only cluster weights - returns cluster mean directly.
-    
-    Returns:
-        x_aggregated: 1D numpy array of aggregated x predictions for each id
-        u_aggregated: 1D numpy array of aggregated u predictions for each id
-    """
-    n_ids = len(x_pred_more_t)
-    x_aggregated = np.zeros(n_ids)
-    u_aggregated = np.zeros(n_ids)
-    
-    for id_idx in range(n_ids):
-        x_preds = np.array(x_pred_more_t[id_idx])
-        u_preds = np.array(u_pred_more_t[id_idx])
-        n_preds = len(x_preds)
-        
-        # Case 1: Only one prediction
-        if n_preds == 1:
-            x_aggregated[id_idx] = x_preds[0]
-            u_aggregated[id_idx] = u_preds[0]
-            continue
-        
-        # Case 2: Few predictions - simple mean
-        if n_preds < max_n_components:
-            x_aggregated[id_idx] = np.mean(x_preds)
-            u_aggregated[id_idx] = np.mean(u_preds)
-            continue
-        
-        # Case 3: Clustering
-        X = np.column_stack([x_preds, u_preds])
-        
-        gmm = BayesianGaussianMixture(
-            n_components=max_n_components,
-            init_params="k-means++",
-            random_state=42,
-            n_init=10,
-            tol=1e-3,
-            max_iter=500
-        )
-        gmm.fit(X)
-        
-        # Find cluster with highest weight
-        cluster_weights = gmm.weights_
-        best_cluster_idx = np.argmax(cluster_weights)
-        
-        # Use the cluster mean directly
-        x_aggregated[id_idx] = gmm.means_[best_cluster_idx, 0]  # x component
-        u_aggregated[id_idx] = gmm.means_[best_cluster_idx, 1]  # u component
-    
-    return x_aggregated, u_aggregated
+    if len(fwd_positions) > 0:
+        K_fwd = int(np.ceil((t_max - t_obs) / Tmax - 1e-9))
+        K_fwd = max(K_fwd, 1)
+        q_curr = x_obs.clone()  # (N_traj,)
+        p_curr = u_obs.clone()  # (N_traj,)
+        t_curr = t_obs
 
+        for k in range(K_fwd):
+            T_start_k = t_curr
+            T_end_k = min(t_curr + Tmax, t_max)
+            if k == K_fwd - 1:
+                T_end_k = t_max
+            if k < K_fwd - 1:
+                seg_query_positions = [j for j in fwd_positions if T_start_k <= query_times[j] < T_end_k]
+            else:
+                seg_query_positions = [j for j in fwd_positions if T_start_k <= query_times[j] <= T_end_k]
 
-def calculate_trust_score_simple(x_pred_more_t, u_pred_more_t, idx, max_n_components=4):
-    """
-    Calculate trust score as the weight of the highest weight cluster.
-    
-    Returns:
-        trust_score: float, weight of the highest weight cluster
-    """
-    x_preds = np.array(x_pred_more_t[idx])
-    u_preds = np.array(u_pred_more_t[idx])
-    n_preds = len(x_preds)
-    
-    # Single prediction - return neutral score
-    if n_preds == 1:
-        return 1.0
-    
-    # Few predictions - return 1/n_preds as proxy for uncertainty
-    if n_preds < max_n_components:
-        return 1.0 / n_preds  # More predictions = lower individual weight
-    
-    # Clustering case
-    X = np.column_stack([x_preds, u_preds])
-    
-    gmm = BayesianGaussianMixture(
-        n_components=max_n_components,
-        init_params="k-means++",
-        random_state=42,
-        n_init=10,
-        tol=1e-3,
-        max_iter=500
-    )
-    gmm.fit(X)
-    
-    # Return the highest cluster weight
-    return np.max(gmm.weights_)
+            need_boundary = (k < K_fwd - 1)
 
+            t_rel_list = [query_times[j] - T_start_k for j in seg_query_positions]
+            if need_boundary:
+                t_rel_list.append(T_end_k - T_start_k)
 
-def aggregate_single_id_simple(x_pred_more_t, u_pred_more_t, idx, max_n_components=4):
-    """
-    Aggregate predictions for a single id using cluster mean directly.
-    
-    Returns:
-        x_aggregated, u_aggregated: Single aggregated values for the specified idx
-    """
-    x_preds = np.array(x_pred_more_t[idx])
-    u_preds = np.array(u_pred_more_t[idx])
-    n_preds = len(x_preds)
-    
-    # Case 1: Only one prediction
-    if n_preds == 1:
-        return x_preds[0], u_preds[0]
-    
-    # Case 2: Few predictions - simple mean
-    if n_preds < max_n_components:
-        return np.mean(x_preds), np.mean(u_preds)
-    
-    # Case 3: Clustering
-    X = np.column_stack([x_preds, u_preds])
-    
-    gmm = BayesianGaussianMixture(
-        n_components=max_n_components,
-        init_params="k-means++",
-        random_state=42,
-        n_init=10,
-        tol=1e-3,
-        max_iter=500
-    )
-    gmm.fit(X)
-    
-    # Find cluster with highest weight
-    cluster_weights = gmm.weights_
-    best_cluster_idx = np.argmax(cluster_weights)
-    
-    # Return the cluster mean directly
-    return gmm.means_[best_cluster_idx, 0], gmm.means_[best_cluster_idx, 1]
+            N_times = len(t_rel_list)
+            if N_times == 0:
+                continue
 
-def ensemble_autoregressive_prediction_gaussian_mixture_simple(
-    x, 
-    u, 
-    t, 
-    point_indexes_observed,
-    mapping_net,
-    inverse_net,
-    device,
-    max_t_training,
-    max_n_components=4,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
-    verbose=False
-):
-    """
-    Make predictions using ensemble method with autoregressive extension for long trajectories.
-    
-    Args:
-        x: Ground truth x values (torch tensor)
-        u: Ground truth u values (torch tensor)
-        t: Time values (torch tensor)
-        point_indexes_observed: List with single index of observed point
-        mapping_net: Neural network for forward mapping
-        inverse_net: Neural network for inverse mapping
-        device: Device for computation (cuda/cpu)
-        max_t_training: Maximum time value the model was trained on
-        threshold: Mahalanobis distance threshold for outlier filtering
-        search_range_lower_pct: Lower bound of search range as fraction of tmax (closer to current)
-        search_range_upper_pct: Upper bound of search range as fraction of tmax (farther from current)
-        verbose: If True, print progress and count forward passes
-    
-    Returns:
-        x_pred_filtered: Filtered x predictions (torch tensor)
-        u_pred_filtered: Filtered u predictions (torch tensor)
-        stats: Dictionary with statistics (num_forward_passes, coverage, etc.)
-    """
-    
-    # Forward pass counter
-    forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
-    
-    def apply_ensemble_prediction(x_obs_val, u_obs_val, t_obs_val, t, t_max, x_pred_more_t, u_pred_more_t, 
-                                   mapping_net, inverse_net, device, n_points, t_np, indices_array, exclude_indices):
-        """
-        Apply full ensemble method from a single observation point.
-        Adds predictions to the existing x_pred_more_t and u_pred_more_t lists.
-        """
-        # Create all latent representations (pretending observation is at each time t[i])
-        X_observed_full_shape = torch.full_like(t, fill_value=x_obs_val)
-        U_observed_full_shape = torch.full_like(t, fill_value=u_obs_val)
-        X_final_more_t, U_final_more_t, _ = mapping_net(X_observed_full_shape, U_observed_full_shape, t)
-        forward_pass_count['mapping_net'] += 1
-        
-        # Define prediction window around this observation
-        abs_time_lower = max(0, t_obs_val - t_max)
-        abs_time_upper = min(t_np[-1], t_obs_val + t_max)
-        in_prediction_window = (t_np >= abs_time_lower) & (t_np <= abs_time_upper)
-        
-        # Create exclusion mask for all indices to exclude
-        exclude_mask = np.ones(n_points, dtype=bool)
-        for idx in exclude_indices:
-            exclude_mask[idx] = False
-        
-        # For each perspective i
-        for i in range(n_points):
-            # From perspective i, calculate relative times for all points
-            t_rel_all = t_np - t_obs_val + t_np[i]
-            
-            # Find valid points within the prediction window (excluding specified indices)
-            valid_mask = (t_rel_all >= 0) & (t_rel_all <= t_max) & in_prediction_window & exclude_mask
-            valid_indices = np.where(valid_mask)[0]
-            
-            if len(valid_indices) > 0:
-                # Get relative times for valid points
-                t_rel_valid = torch.tensor(t_rel_all[valid_indices], device=device, dtype=torch.float32)
-                
-                # Create full-shape tensors filled with the latent values from perspective i
-                X_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=X_final_more_t[i].item())
-                U_final_i_full_shape = torch.full_like(t_rel_valid, fill_value=U_final_more_t[i].item())
-                
-                # Batch predict for all valid points from this perspective
-                x_pred_batch, u_pred_batch, _ = inverse_net(X_final_i_full_shape, U_final_i_full_shape, t_rel_valid)
-                forward_pass_count['inverse_net'] += 1
-                
-                # Convert predictions to CPU once for the entire batch
-                x_pred_batch_cpu = x_pred_batch.detach().cpu()
-                u_pred_batch_cpu = u_pred_batch.detach().cpu()
-                
-                # Store predictions (ADD to existing lists)
-                for idx, j in enumerate(valid_indices):
-                    x_pred_more_t[j].append(x_pred_batch_cpu[idx].item())
-                    u_pred_more_t[j].append(u_pred_batch_cpu[idx].item())
-    
-    # ==================== MAIN ALGORITHM ====================
-    
-    # Validate inputs
-    assert len(point_indexes_observed) == 1, "This function only works with exactly one observation"
-    
-    obs_idx = point_indexes_observed[0]
-    t_max = max_t_training
-    t_np = t.detach().cpu().numpy()
-    t_obs = t_np[obs_idx]
-    t_pred_max = t_np[-1]
-    n_points = len(t)
-    
-    if verbose:
-        print(f"=== Ensemble Autoregressive Prediction ===")
-        print(f"Observation at index {obs_idx}, absolute time {t_obs:.3f}")
-        print(f"Full trajectory time range: [0, {t_pred_max:.3f}]")
-        print(f"Training time max: {t_max:.3f}")
-        print(f"Search range: [{search_range_lower_pct*100}%, {search_range_upper_pct*100}%] of tmax")
-    
-    # Initialize prediction lists for each time point
-    x_pred_more_t = [[] for _ in range(n_points)]
-    u_pred_more_t = [[] for _ in range(n_points)]
-    
-    # The observed point gets its true value (and ONLY this value)
-    x_pred_more_t[obs_idx].append(x[obs_idx].item())
-    u_pred_more_t[obs_idx].append(u[obs_idx].item())
-    
-    # Get observed values
-    x_obs = x[obs_idx].item()
-    u_obs = u[obs_idx].item()
-    
-    # Pre-compute index array
-    indices_array = np.arange(n_points)
-    
-    # ==================== STEP 1: Initial Ensemble from True Observation ====================
-    if verbose:
-        print(f"\n=== Step 1: Initial ensemble from true observation ===")
-    
-    apply_ensemble_prediction(x_obs, u_obs, t_obs, t, t_max, x_pred_more_t, u_pred_more_t,
-                              mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                              exclude_indices=[obs_idx])
-    
-    if verbose:
-        print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-    
-    # ==================== STEP 2: Fill Left Side (toward t=0) ====================
-    if verbose:
-        print(f"\n=== Step 2: Filling left side ===")
-    
-    left_cutoff = (1 - search_range_upper_pct) * t_max
-    
-    if verbose:
-        print(f"Left cutoff: {left_cutoff:.3f} (will continue while t_current >= {left_cutoff:.3f})")
-    
-    if t_obs < left_cutoff:
-        if verbose:
-            print(f"Left side already covered (t_obs={t_obs:.3f} < cutoff={left_cutoff:.3f})")
-    else:
-        t_current = t_obs
-        iteration = 0
-        while t_current >= left_cutoff:
-            iteration += 1
-            if verbose:
-                print(f"\n--- Left iteration {iteration}, current position: {t_current:.3f} ---")
-            
-            # Define search range
-            range_lower = t_current - search_range_upper_pct * t_max
-            range_upper = t_current - search_range_lower_pct * t_max
-            
-            # Find indices in this range that have predictions
-            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
-            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
-            
-            if len(candidate_indices) == 0:
-                if verbose:
-                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
-                break
-            
-            # Find the most trusted index (lowest std of mahalanobis distances)
-            best_idx = None
-            best_mean_weight = 0.0
-            
-            for idx in candidate_indices:
-                mean_weight = calculate_trust_score_simple(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, max_n_components=max_n_components)
-                if mean_weight > best_mean_weight:
-                    best_mean_weight = mean_weight
-                    best_idx = idx
-            
-            if verbose:
-                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
-            
-            # Get final prediction for this trusted point
-            x_trusted, u_trusted = aggregate_single_id_simple(
-                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx, max_n_components=max_n_components)
-            t_trusted = t_np[best_idx]
-            
-            # Apply ensemble from this trusted point
-            if verbose:
-                print(f"Applying ensemble from trusted point...")
-            
-            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
-                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                                      exclude_indices=[obs_idx, best_idx])
-            
-            if verbose:
-                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-            
-            # Update current position
-            t_current = t_trusted
-            
-            # Check termination condition
-            if t_current < left_cutoff:
-                if verbose:
-                    print(f"Left side complete (t_current={t_current:.3f} < cutoff={left_cutoff:.3f})")
-                break
-    
-    # ==================== STEP 3: Fill Right Side (toward t_pred_max) ====================
-    if verbose:
-        print(f"\n=== Step 3: Filling right side ===")
-    
-    right_cutoff = (1 - search_range_upper_pct) * t_max
-    
-    if verbose:
-        print(f"Right cutoff: {right_cutoff:.3f} (will continue while (t_pred_max - t_current) >= {right_cutoff:.3f})")
-    
-    if (t_pred_max - t_obs) < right_cutoff:
-        if verbose:
-            print(f"Right side already covered ((t_pred_max - t_obs)={t_pred_max - t_obs:.3f} < cutoff={right_cutoff:.3f})")
-    else:
-        t_current = t_obs
-        iteration = 0
-        while (t_pred_max - t_current) >= right_cutoff:
-            iteration += 1
-            if verbose:
-                print(f"\n--- Right iteration {iteration}, current position: {t_current:.3f} ---")
-            
-            # Define search range
-            range_lower = t_current + search_range_lower_pct * t_max
-            range_upper = t_current + search_range_upper_pct * t_max
-            
-            # Find indices in this range that have predictions
-            in_range_mask = (t_np >= range_lower) & (t_np <= range_upper)
-            candidate_indices = [i for i in range(n_points) if in_range_mask[i] and len(x_pred_more_t[i]) > 0]
-            
-            if len(candidate_indices) == 0:
-                if verbose:
-                    print(f"No candidates found in range [{range_lower:.3f}, {range_upper:.3f}]")
-                break
-            
-            # Find the most trusted index (lowest std of mahalanobis distances)
-            best_idx = None
-            best_mean_weight = 0.0
-            
-            for idx in candidate_indices:
-                mean_weight = calculate_trust_score_simple(x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=idx, max_n_components=max_n_components)
-                if mean_weight > best_mean_weight:
-                    best_mean_weight = mean_weight
-                    best_idx = idx
-            
-            if verbose:
-                print(f"Most trusted point: index {best_idx} at time {t_np[best_idx]:.3f} (best_mean_weight={best_mean_weight:.4f})")
-            
-            # Get final prediction for this trusted point
-            x_trusted, u_trusted = aggregate_single_id_simple(
-                x_pred_more_t=x_pred_more_t, u_pred_more_t=u_pred_more_t, idx=best_idx,max_n_components=max_n_components)
-            t_trusted = t_np[best_idx]
-            
-            # Apply ensemble from this trusted point
-            if verbose:
-                print(f"Applying ensemble from trusted point...")
-            
-            apply_ensemble_prediction(x_trusted, u_trusted, t_trusted, t, t_max, x_pred_more_t, u_pred_more_t,
-                                      mapping_net, inverse_net, device, n_points, t_np, indices_array, 
-                                      exclude_indices=[obs_idx, best_idx])
-            
-            if verbose:
-                print(f"Forward passes so far - mapping_net: {forward_pass_count['mapping_net']}, inverse_net: {forward_pass_count['inverse_net']}")
-            
-            # Update current position
-            t_current = t_trusted
-            
-            # Check termination condition
-            if (t_pred_max - t_current) < right_cutoff:
-                if verbose:
-                    print(f"Right side complete ((t_pred_max - t_current)={t_pred_max - t_current:.3f} < cutoff={right_cutoff:.3f})")
-                break
-    
-    # ==================== STEP 4: Final Aggregation ====================
-    if verbose:
-        print(f"\n=== Step 4: Final aggregation ===")
-    
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32)
 
-    
-    x_aggregated, u_aggregated = aggregate_ensemble_predictions_simple(x_pred_more_t, u_pred_more_t, max_n_components=max_n_components)
-    
-    x_pred_filtered =  torch.as_tensor(x_aggregated, device=x.device, dtype=x.dtype)
-    u_pred_filtered =  torch.as_tensor(u_aggregated, device=u.device, dtype=u.dtype)
-    
-    # Verify obs_idx still has only 1 prediction
-    assert len(x_pred_more_t[obs_idx]) == 1, f"Observed point should have only 1 value, but has {len(x_pred_more_t[obs_idx])}"
-    
-    # Calculate statistics
-    coverage = sum(1 for i in range(n_points) if len(x_pred_more_t[i]) > 0)
-    total_forward_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
-    
-    stats = {
-        'coverage': coverage,
-        'coverage_pct': 100 * coverage / n_points,
-        'mapping_net_calls': forward_pass_count['mapping_net'],
-        'inverse_net_calls': forward_pass_count['inverse_net'],
-        'total_forward_passes': total_forward_passes,
-        'obs_idx': obs_idx,
-        'prediction_counts_per_point': [len(x_pred_more_t[i]) for i in range(n_points)]
-    }
-    
-    if verbose:
-        print(f"\n=== Summary ===")
-        print(f"✓ Observed point {obs_idx} correctly has only 1 value")
-        print(f"Coverage: {coverage}/{n_points} points ({stats['coverage_pct']:.1f}%)")
-        print(f"Total forward passes: {total_forward_passes}")
-        print(f"  - mapping_net calls: {forward_pass_count['mapping_net']}")
-        print(f"  - inverse_net calls: {forward_pass_count['inverse_net']}")
-        print(f"\nSample prediction counts:")
-        for i in [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]:
-            print(f"  Point {i} (t={t_np[i]:.3f}): {len(x_pred_more_t[i])} predictions")
-    
-    return x_pred_filtered, u_pred_filtered, stats
+            # MappingNet: all trajectories at relative time 0
+            t_zero = torch.zeros(N_traj, device=device, dtype=torch.float32)
+            Q_k, P_k, _ = mapping_net(q_curr, p_curr, t_zero)
+            forward_pass_count['mapping_net'] += 1
+
+            # Replicate: (N_traj,) -> (N_traj * N_times,)
+            Q_full_k = Q_k.repeat_interleave(N_times)
+            P_full_k = P_k.repeat_interleave(N_times)
+            t_rel_full_k = t_rel_k.repeat(N_traj)
+
+            q_hat_flat, p_hat_flat, _ = inverse_net(Q_full_k, P_full_k, t_rel_full_k)
+            forward_pass_count['inverse_net'] += 1
+
+            # Reshape: (N_traj * N_times,) -> (N_traj, N_times)
+            q_hat_k = q_hat_flat.view(N_traj, N_times)
+            p_hat_k = p_hat_flat.view(N_traj, N_times)
+
+            # Store predictions for real query positions
+            for local_j, global_j in enumerate(seg_query_positions):
+                x_pred_all[:, global_j] = q_hat_k[:, local_j]
+                u_pred_all[:, global_j] = p_hat_k[:, local_j]
+
+            # Handoff
+            if need_boundary:
+                q_curr = q_hat_k[:, -1].detach()
+                p_curr = p_hat_k[:, -1].detach()
+                t_curr = T_end_k
+
+    # === Phase 2: Backward Propagation ===
+    bwd_positions = [j for j, idx in enumerate(query_indices) if query_times[j] < t_obs]
+    bwd_times_local = np.array([query_times[j] for j in bwd_positions]) if bwd_positions else np.array([])
+
+    if len(bwd_positions) > 0:
+        K_bwd = int(np.ceil((t_obs - t_min) / Tmax - 1e-9))
+        K_bwd = max(K_bwd, 1)
+        q_curr = x_obs.clone()  # (N_traj,)
+        p_curr = u_obs.clone()  # (N_traj,)
+        t_curr = t_obs
+
+        for k in range(K_bwd):
+            T_start_k = max(t_curr - Tmax, t_min)
+            T_end_k = t_curr
+            if k == K_bwd - 1:
+                T_start_k = t_min
+
+            if k < K_bwd - 1:
+                seg_query_positions = [j for j in bwd_positions if T_start_k < query_times[j] <= T_end_k]
+            else:
+                seg_query_positions = [j for j in bwd_positions if T_start_k <= query_times[j] <= T_end_k]
+
+            need_boundary = (k < K_bwd - 1)
+
+            t_rel_list = []
+            if need_boundary:
+                t_rel_list.append(0.0)
+            t_rel_list.extend([query_times[j] - T_start_k for j in seg_query_positions])
+
+            N_times = len(t_rel_list)
+            if N_times == 0:
+                continue
+
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32)
+
+            # MappingNet: all trajectories at end of window
+            t_rel_obs_in_window = T_end_k - T_start_k
+            t_obs_window = torch.full((N_traj,), t_rel_obs_in_window, device=device, dtype=torch.float32)
+            Q_k, P_k, _ = mapping_net(q_curr, p_curr, t_obs_window)
+            forward_pass_count['mapping_net'] += 1
+
+            # Replicate
+            Q_full_k = Q_k.repeat_interleave(N_times)
+            P_full_k = P_k.repeat_interleave(N_times)
+            t_rel_full_k = t_rel_k.repeat(N_traj)
+
+            q_hat_flat, p_hat_flat, _ = inverse_net(Q_full_k, P_full_k, t_rel_full_k)
+            forward_pass_count['inverse_net'] += 1
+
+            q_hat_k = q_hat_flat.view(N_traj, N_times)
+            p_hat_k = p_hat_flat.view(N_traj, N_times)
+
+            # Store predictions, skipping boundary
+            offset = 1 if need_boundary else 0
+            for local_j, global_j in enumerate(seg_query_positions):
+                x_pred_all[:, global_j] = q_hat_k[:, offset + local_j]
+                u_pred_all[:, global_j] = p_hat_k[:, offset + local_j]
+
+            # Handoff
+            if need_boundary:
+                q_curr = q_hat_k[:, 0].detach()
+                p_curr = p_hat_k[:, 0].detach()
+                t_curr = T_start_k
+
+    return x_pred_all, u_pred_all, forward_pass_count
 
 
 def test_model_in_single_trajectory(
@@ -8875,251 +5456,2030 @@ def test_model_in_single_trajectory(
     inverse_net, 
     device, 
     point_indexes_observed, 
-    show_zeroings, 
-    show_period=False, 
-    period=None, 
-    connect_points=False, 
-    portion_to_visualize=None, 
-    max_t_training=None,
-    efficiently=True,
-    method = "mahalanobis",
-    threshold=1.0,
-    dt=0.1,
-    alpha=1.0,
-    gamma=1.0,
-    cluster_weight_threshold=0.4,
-    max_n_components=5,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
+    Tmax,
     verbose=False,
-    plot=True,
 ):
     """
     Test model on a single trajectory.
-    
-    Args:
-        efficiently: If True, use standard prediction method. If False, use ensemble method.
-        max_t_training: If not None, use autoregressive prediction for trajectories exceeding this time value
-        threshold: Mahalanobis distance threshold (only used when efficiently=False)
-        search_range_lower_pct: Search range lower bound (only used when efficiently=False)
-        search_range_upper_pct: Search range upper bound (only used when efficiently=False)
-        verbose: If True, print forward pass counts
     """
+    if not isinstance(point_indexes_observed, list) or len(point_indexes_observed) != 1:
+        raise ValueError(f"point_indexes_observed must be a list with exactly one integer, got {point_indexes_observed}")
+    
+    if not isinstance(point_indexes_observed[0], (int, np.integer)):
+        raise ValueError(f"point_indexes_observed[0] must be an integer, got {type(point_indexes_observed[0])}")
+
+    if loss_type not in ("euclidean", "mae", "mse"):
+        raise ValueError(f"Unknown loss_type '{loss_type}'. Must be 'euclidean', 'mae', or 'mse'.")
+
     test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
     x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
     u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
     t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
 
-    if point_indexes_observed:
-        if efficiently:
-            # ==================== EFFICIENT METHOD ====================
-            forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
-            
-            # Check if we need segmented prediction
-            if max_t_training is not None and t[-1].item() > max_t_training:
-                # Autoregressive prediction for long trajectories
-                t_np = t.detach().cpu().numpy()
-                t_max = t_np[-1]
-                
-                x_pred_segments = []
-                u_pred_segments = []
-                
-                # Determine number of segments
-                num_segments = int(np.ceil(t_max / max_t_training))
-                
-                for seg_idx in range(num_segments):
-                    # Determine time range for this segment
-                    t_start = seg_idx * max_t_training
-                    t_end = min((seg_idx + 1) * max_t_training, t_max)
-                    
-                    # Find indices in this time range
-                    # Avoid overlap: use > for subsequent segments, >= for first segment
-                    if seg_idx == 0:
-                        seg_mask = (t_np >= t_start) & (t_np <= t_end)
-                    else:
-                        seg_mask = (t_np > t_start) & (t_np <= t_end)
-                    
-                    seg_indices = np.where(seg_mask)[0]
-                    
-                    if len(seg_indices) == 0:
-                        continue
-                    
-                    # Get data for this segment
-                    t_seg = t[seg_indices]
-                    t_seg_relative = t_seg - t_start
-                    
-                    if seg_idx == 0:
-                        # First segment: use actual observed points
-                        # Filter observed indices to only those in this segment
-                        obs_in_seg = [i for i in point_indexes_observed if i in seg_indices]
-                        
-                        if len(obs_in_seg) > 0:
-                            # Get relative positions within the segment
-                            obs_indices_relative = [np.where(seg_indices == i)[0][0] for i in obs_in_seg]
-                            
-                            X_final, U_final, t_final = mapping_net(
-                                x[obs_in_seg], 
-                                u[obs_in_seg], 
-                                t_seg_relative[obs_indices_relative]
-                            )
-                            forward_pass_count['mapping_net'] += 1
-                            
-                            X_final_mean = X_final.mean()
-                            U_final_mean = U_final.mean()
-                            
-                            # Create full shape tensors for this segment
-                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                            
-                            # Place observed values at their relative positions
-                            for i, rel_idx in enumerate(obs_indices_relative):
-                                X_final_full_shape_seg[rel_idx] = X_final[i]
-                                U_final_full_shape_seg[rel_idx] = U_final[i]
-                        else:
-                            # No observations in first segment - use original observations with t=0
-                            X_final, U_final, t_final = mapping_net(
-                                x[point_indexes_observed], 
-                                u[point_indexes_observed], 
-                                torch.zeros(len(point_indexes_observed), device=device, dtype=torch.float32)
-                            )
-                            forward_pass_count['mapping_net'] += 1
-                            
-                            X_final_mean = X_final.mean()
-                            U_final_mean = U_final.mean()
-                            
-                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                            X_final_full_shape_seg[0] = X_final[0]
-                            U_final_full_shape_seg[0] = U_final[0]
-                    else:
-                        # Subsequent segments: use last prediction from previous segment as observation at t=0
-                        x_obs = x_pred_segments[-1][-1].unsqueeze(0)
-                        u_obs = u_pred_segments[-1][-1].unsqueeze(0)
-                        t_obs = torch.tensor([0.0], device=device, dtype=torch.float32)
-                        
-                        X_final, U_final, t_final = mapping_net(x_obs, u_obs, t_obs)
-                        forward_pass_count['mapping_net'] += 1
-                        
-                        X_final_mean = X_final.mean()
-                        U_final_mean = U_final.mean()
-                        
-                        # Create full shape tensors for this segment
-                        X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                        U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                        
-                        # Place the observation at index 0 (t=0 in relative time)
-                        X_final_full_shape_seg[0] = X_final[0]
-                        U_final_full_shape_seg[0] = U_final[0]
-                    
-                    # Predict for this segment using relative times
-                    x_pred_seg, u_pred_seg, _ = inverse_net(X_final_full_shape_seg, U_final_full_shape_seg, t_seg_relative)
-                    forward_pass_count['inverse_net'] += 1
-                    
-                    x_pred_segments.append(x_pred_seg)
-                    u_pred_segments.append(u_pred_seg)
-                
-                # Concatenate all segments
-                x_pred = torch.cat(x_pred_segments, dim=0)
-                u_pred = torch.cat(u_pred_segments, dim=0)
-            else:
-                # Original logic for trajectories within max_t_training
-                X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-                forward_pass_count['mapping_net'] += 1
-                
-                X_final_mean = X_final.mean()
-                U_final_mean = U_final.mean()
-                X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-                U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-                # Replace values at observed indices with actual mapped values
-                X_final_full_shape[point_indexes_observed] = X_final
-                U_final_full_shape[point_indexes_observed] = U_final
-                x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
-                forward_pass_count['inverse_net'] += 1
-            
-            if verbose:
-                total_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
-                print(f"\n=== Efficient Method - Forward Pass Count ===")
-                print(f"mapping_net calls: {forward_pass_count['mapping_net']}")
-                print(f"inverse_net calls: {forward_pass_count['inverse_net']}")
-                print(f"Total forward passes: {total_passes}")
-        
+    if x.dim() != 1 or u.dim() != 1 or t.dim() != 1:
+        raise ValueError(f"x, u, t must be 1-dimensional tensors, got dims {x.dim()}, {u.dim()}, {t.dim()}")
+
+    obs_idx = point_indexes_observed[0]
+    
+    if obs_idx < 0 or obs_idx >= len(t):
+        raise ValueError(f"point_indexes_observed[0]={obs_idx} is out of bounds for trajectory of length {len(t)}")
+
+    t_np = t.detach().cpu().numpy()
+    query_indices = [i for i in range(len(t)) if i != obs_idx]
+    query_times = t_np[query_indices]
+
+    pred_dict, forward_pass_count = Autoregressive_Handoff_Inference_Protocol(
+        mapping_net=mapping_net,
+        inverse_net=inverse_net,
+        x_obs=x[obs_idx],
+        u_obs=u[obs_idx],
+        t_obs=t_np[obs_idx],
+        t_min=t_np[0],
+        t_max=t_np[-1],
+        Tmax=Tmax,
+        query_times=query_times,
+        query_indices=query_indices,
+        device=device,
+    )
+
+    # Assemble predictions
+    x_pred = torch.empty_like(t)
+    u_pred = torch.empty_like(t)
+    x_pred[obs_idx] = x[obs_idx]
+    u_pred[obs_idx] = u[obs_idx]
+    for idx in query_indices:
+        x_pred[idx] = pred_dict[idx][0]
+        u_pred[idx] = pred_dict[idx][1]
+
+    if verbose:
+        total_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+        print(f"\n=== Forward Pass Count ===")
+        print(f"mapping_net calls: {forward_pass_count['mapping_net']}")
+        print(f"inverse_net calls: {forward_pass_count['inverse_net']}")
+        print(f"Total forward passes: {total_passes}")
+
+    if loss_type == "euclidean":
+        pred_loss_full_trajectory = prediction_loss_euclidean(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
+    elif loss_type == "mae":
+        pred_loss_full_trajectory = prediction_loss(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, loss_type=loss_type)
+    elif loss_type == "mse":
+        pred_loss_full_trajectory = prediction_loss(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, loss_type=loss_type)
+
+    return pred_loss_full_trajectory, x_pred, u_pred, x, u, t, forward_pass_count
+    
+
+def time_inference_gpu(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    Batched_Autoregressive_Handoff_Inference_Protocol,
+    n_warmup=5,
+    n_repeats=20,
+    method_name="HJN",
+    task_name=None,
+    save_path=None,
+    verbose=True,
+):
+    """
+    End-to-end wall-clock timing for the batched multi-trajectory inference
+    protocol, with peak-memory tracking, fairness flags, and pickle output
+    for cross-method comparison.
+ 
+    Args:
+        get_data_from_trajectory_id_function: callable to retrieve trajectory data.
+        test_id_df: DataFrame with trajectory metadata.
+        test_df: DataFrame with trajectory data.
+        mapping_net: trained MappingNet (already on device).
+        inverse_net: trained InverseNet (already on device).
+        device: torch device (must be a CUDA device for memory tracking).
+        Tmax: maximum normalized temporal horizon (must be positive).
+        Batched_Autoregressive_Handoff_Inference_Protocol: the inference function.
+        n_warmup: number of warmup sweeps (not timed).
+        n_repeats: number of timed sweeps.
+        method_name: label for results (e.g. "HJN"); written into the saved pickle.
+        task_name: task identifier (e.g. "task_1_low_samples"); written into pickle.
+        save_path: if provided, save full results dict here as pickle.
+        verbose: if True, print full setup, progress, and methods-section text.
+ 
+    Returns:
+        results: dict with keys:
+            'method_name', 'task_name', 'timestamp'
+            'hardware': dict (gpu, cuda, pytorch versions)
+            'fairness_settings': dict (precision flags as actually set)
+            'protocol': dict (n_warmup, n_repeats, timing_method)
+            'data': dict (N_traj, N_obs, t_range, Tmax)
+            'timing_stats': dict (full statistics — see below)
+            'memory_stats': dict (peak bytes during timed region)
+ 
+        'timing_stats' contains:
+            'time_matrix': (n_repeats, N_obs) array, seconds per obs per run
+            'per_obs_mean': (N_obs,) mean time per obs point across repeats
+            'per_obs_std':  (N_obs,) std across repeats per obs point
+                            ^ this is MEASUREMENT NOISE for each obs point
+            'mean_s', 'std_s': mean ± std of per_obs_mean across obs choices
+                              ^ std here is STRUCTURAL variation across obs
+                                positions (different K_fwd + K_bwd counts), NOT
+                                independent experimental uncertainty
+            'measurement_noise_mean_ms': mean of per_obs_std across obs
+                                         ^ this IS measurement uncertainty
+            'median_s', 'min_s', 'max_s': across obs choices
+            'total_sweep_mean_s', 'total_sweep_std_s': summed across obs per repeat
+    """
+    # =========================================================================
+    # Validation
+    # =========================================================================
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if device.type != "cuda":
+        raise ValueError(
+            f"This benchmark requires a CUDA device for memory tracking; got {device}"
+        )
+ 
+    # =========================================================================
+    # Fairness flags — set explicitly so the methods section can cite them.
+    # We mirror these on the JAX side (matmul_precision='highest') so neither
+    # method gets a precision-driven speedup the other lacks.
+    # =========================================================================
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = True       # autotune cuDNN algos (no-op for HJN; harmless)
+    torch.backends.cudnn.deterministic = True   # reproducible kernels for NCU later
+ 
+    fairness_settings = {
+        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "precision": "FP32 (TF32 disabled)",
+    }
+ 
+    # Defensive eval mode (no BN/dropout in HJN, but standard practice)
+    mapping_net.eval()
+    inverse_net.eval()
+ 
+    # =========================================================================
+    # Load trajectories and validate shared time structure
+    # =========================================================================
+    trajectory_ids = test_id_df['trajectory_id'].values.astype(int)
+    all_x, all_u = [], []
+    ref_t = None
+ 
+    for _, row_data in test_id_df.iterrows():
+        trajectory_id = int(row_data['trajectory_id'])
+        test_trajectory_data = get_data_from_trajectory_id_function(
+            test_id_df, test_df, trajectory_ids=trajectory_id
+        )
+        x_i = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+        u_i = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+        t_i = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+ 
+        if x_i.dim() != 1 or u_i.dim() != 1 or t_i.dim() != 1:
+            raise ValueError(f"Trajectory {trajectory_id}: x, u, t must be 1D")
+ 
+        if ref_t is None:
+            ref_t = t_i
         else:
-            # ==================== ENSEMBLE METHOD ====================
-            if max_t_training is None:
-                raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
-        
-            if method == "mahalanobis":
-                x_pred, u_pred, stats = ensemble_autoregressive_prediction_mahalanobis(
-                    x=x,
-                    u=u,
-                    t=t,
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    threshold=threshold,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False  # Don't print ensemble internal details
+            if len(t_i) != len(ref_t):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t_i)} points, expected {len(ref_t)}."
+                )
+            if not torch.allclose(t_i, ref_t, atol=1e-6):
+                raise ValueError(f"Trajectory {trajectory_id} has different time values.")
+ 
+        all_x.append(x_i)
+        all_u.append(u_i)
+ 
+    x_batch = torch.stack(all_x, dim=0)  # (N_traj, N_obs)
+    u_batch = torch.stack(all_u, dim=0)
+    t_np = ref_t.detach().cpu().numpy()
+    N_obs = len(t_np)
+    N_traj = len(trajectory_ids)
+ 
+    # =========================================================================
+    # Precompute per-obs query data (hoisted out of timed region)
+    # The original code built these lists inside run_single_obs every call,
+    # adding Python overhead to every timed measurement. They're deterministic
+    # per obs_idx, so we precompute once.
+    # =========================================================================
+    query_indices_per_obs = []
+    query_times_per_obs = []
+    for obs_idx in range(N_obs):
+        q_idx = [i for i in range(N_obs) if i != obs_idx]
+        q_t = t_np[q_idx]
+        query_indices_per_obs.append(q_idx)
+        query_times_per_obs.append(q_t)
+ 
+    # =========================================================================
+    # Single-obs inference call (no list comprehensions inside; just dispatch)
+    # =========================================================================
+    def run_single_obs(obs_idx):
+        Batched_Autoregressive_Handoff_Inference_Protocol(
+            mapping_net=mapping_net,
+            inverse_net=inverse_net,
+            x_obs=x_batch[:, obs_idx],
+            u_obs=u_batch[:, obs_idx],
+            t_obs=t_np[obs_idx],
+            t_min=t_np[0],
+            t_max=t_np[-1],
+            Tmax=Tmax,
+            query_times=query_times_per_obs[obs_idx],
+            query_indices=query_indices_per_obs[obs_idx],
+            device=device,
+        )
+ 
+    # =========================================================================
+    # Header (verbose)
+    # =========================================================================
+    gpu_name = torch.cuda.get_device_name(device)
+    if verbose:
+        print(f"\nTiming benchmark — method={method_name}, task={task_name}")
+        print(f"  N_traj={N_traj}, N_obs={N_obs}, device={gpu_name}")
+ 
+    # =========================================================================
+    # Warmup
+    # =========================================================================
+    if verbose:
+        print(f"  Running {n_warmup} warmup sweeps ({n_warmup * N_obs} calls)...")
+    for _ in range(n_warmup):
+        for obs_idx in range(N_obs):
+            run_single_obs(obs_idx)
+ 
+    # =========================================================================
+    # Reset peak memory stats AFTER warmup, BEFORE timed sweeps.
+    # This way we capture peak memory used during actual inference, not during
+    # cuDNN autotuning, allocator warmup, or other one-time effects.
+    # =========================================================================
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    mem_baseline_bytes = torch.cuda.memory_allocated(device)
+ 
+    # =========================================================================
+    # Timed runs
+    # =========================================================================
+    if verbose:
+        print(f"  Running {n_repeats} timed sweeps...")
+    time_matrix = np.empty((n_repeats, N_obs))
+ 
+    for r in range(n_repeats):
+        for obs_idx in range(N_obs):
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+ 
+            run_single_obs(obs_idx)
+ 
+            torch.cuda.synchronize(device)
+            elapsed_s = time.perf_counter() - start
+            time_matrix[r, obs_idx] = elapsed_s
+ 
+    # =========================================================================
+    # Capture peak memory across the entire timed region
+    # =========================================================================
+    torch.cuda.synchronize(device)
+    peak_bytes = torch.cuda.max_memory_allocated(device)
+    peak_bytes_above_baseline = peak_bytes - mem_baseline_bytes
+ 
+    memory_stats = {
+        "baseline_bytes_before_timing": int(mem_baseline_bytes),
+        "peak_bytes_during_timing": int(peak_bytes),
+        "peak_bytes_above_baseline": int(peak_bytes_above_baseline),
+        "peak_MB_during_timing": peak_bytes / 1024 ** 2,
+        "peak_MB_above_baseline": peak_bytes_above_baseline / 1024 ** 2,
+    }
+ 
+    # =========================================================================
+    # Statistics
+    # =========================================================================
+    per_obs_mean = np.mean(time_matrix, axis=0)        # (N_obs,) repeats-averaged
+    per_obs_std = np.std(time_matrix, axis=0, ddof=1)  # (N_obs,) measurement noise
+ 
+    mean_s = np.mean(per_obs_mean)
+    std_s = np.std(per_obs_mean, ddof=1)               # STRUCTURAL variation
+    median_s = np.median(per_obs_mean)
+    min_s = np.min(per_obs_mean)
+    max_s = np.max(per_obs_mean)
+    measurement_noise_mean_ms = np.mean(per_obs_std) * 1000.0  # MEASUREMENT noise
+ 
+    sweep_totals = np.sum(time_matrix, axis=1)
+    total_sweep_mean_s = np.mean(sweep_totals)
+    total_sweep_std_s = np.std(sweep_totals, ddof=1)
+ 
+    timing_stats = {
+        "time_matrix": time_matrix,
+        "per_obs_mean": per_obs_mean,
+        "per_obs_std": per_obs_std,
+        "mean_s": mean_s,
+        "std_s": std_s,
+        "measurement_noise_mean_ms": measurement_noise_mean_ms,
+        "median_s": median_s,
+        "min_s": min_s,
+        "max_s": max_s,
+        "total_sweep_mean_s": total_sweep_mean_s,
+        "total_sweep_std_s": total_sweep_std_s,
+        # Legacy fields — kept here so downstream consumers (e.g. existing
+        # plot_summary_statistics) can read everything from timing_stats alone
+        # without knowing about the new nested results structure.
+        "n_warmup": n_warmup,
+        "n_repeats": n_repeats,
+        "N_obs": N_obs,
+        "N_traj": N_traj,
+        "Tmax": float(Tmax),
+        "device_name": gpu_name,
+        "cuda_version": torch.version.cuda,
+        "pytorch_version": torch.__version__,
+        "timing_method": "perf_counter_with_cuda_synchronize",
+    }
+ 
+    # =========================================================================
+    # Assemble full results dict
+    # =========================================================================
+    results = {
+        "method_name": method_name,
+        "task_name": task_name,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "hardware": {
+            "gpu_name": gpu_name,
+            "cuda_version": torch.version.cuda,
+            "pytorch_version": torch.__version__,
+        },
+        "fairness_settings": fairness_settings,
+        "protocol": {
+            "n_warmup": n_warmup,
+            "n_repeats": n_repeats,
+            "timing_method": "time.perf_counter() with torch.cuda.synchronize()",
+            "warmup_sweeps_each_full_N_obs": True,
+        },
+        "data": {
+            "N_traj": N_traj,
+            "N_obs": N_obs,
+            "t_min": float(t_np[0]),
+            "t_max": float(t_np[-1]),
+            "Tmax": float(Tmax),
+        },
+        "timing_stats": timing_stats,
+        "memory_stats": memory_stats,
+    }
+ 
+    # =========================================================================
+    # Verbose summary + methods-section-ready text
+    # =========================================================================
+    if verbose:
+        print(f"\n{'=' * 78}")
+        print(f"RESULTS — {method_name}" + (f" / {task_name}" if task_name else ""))
+        print(f"{'=' * 78}")
+        print(f"\n--- Hardware & Software ---")
+        print(f"  GPU:             {gpu_name}")
+        print(f"  CUDA:            {torch.version.cuda}")
+        print(f"  PyTorch:         {torch.__version__}")
+        print(f"\n--- Fairness settings ---")
+        print(f"  matmul TF32:     {torch.backends.cuda.matmul.allow_tf32}")
+        print(f"  cuDNN TF32:      {torch.backends.cudnn.allow_tf32}")
+        print(f"  cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+        print(f"  cuDNN determ.:   {torch.backends.cudnn.deterministic}")
+        print(f"  Precision:       FP32 (TF32 disabled)")
+        print(f"\n--- Protocol ---")
+        print(f"  Timing method:   perf_counter + cuda.synchronize")
+        print(f"  Warmup sweeps:   {n_warmup} ({n_warmup * N_obs} calls)")
+        print(f"  Timed sweeps:    {n_repeats} ({n_repeats * N_obs} calls)")
+        print(f"\n--- Data ---")
+        print(f"  N_traj:          {N_traj}")
+        print(f"  N_obs:           {N_obs}")
+        print(f"  t range:         [{t_np[0]:.6f}, {t_np[-1]:.6f}]")
+        print(f"  Tmax:            {Tmax}")
+        print(f"\n--- Wall-clock results ---")
+        print(f"  Per observation point:")
+        print(f"    mean ± std across {N_obs} obs choices: "
+              f"{mean_s * 1000:.3f} ± {std_s * 1000:.3f} ms  (STRUCTURAL variation)")
+        print(f"    measurement noise (mean of per-obs std over {n_repeats} repeats): "
+              f"{measurement_noise_mean_ms:.3f} ms")
+        print(f"    median:  {median_s * 1000:.3f} ms")
+        print(f"    range:   [{min_s * 1000:.3f}, {max_s * 1000:.3f}] ms")
+        print(f"  Total sweep (across {N_obs} obs points):")
+        print(f"    {total_sweep_mean_s:.4f} ± {total_sweep_std_s:.4f} s "
+              f"(mean ± std over {n_repeats} repeats)")
+        print(f"\n--- Peak GPU memory (during timed region) ---")
+        print(f"  Total peak:                 {memory_stats['peak_MB_during_timing']:.2f} MB")
+        print(f"  Above pre-timing baseline:  {memory_stats['peak_MB_above_baseline']:.2f} MB")
+ 
+        print(f"\n{'-' * 78}")
+        print("METHODS-SECTION-READY TEXT (paste into paper, edit as needed):")
+        print(f"{'-' * 78}")
+        print(
+            f'Wall-clock inference latency was measured on a {gpu_name} '
+            f'(CUDA {torch.version.cuda}, PyTorch {torch.__version__}). All '
+            f'computations ran in strict FP32 with TF32 disabled '
+            f'(torch.backends.cuda.matmul.allow_tf32 = False, '
+            f'torch.backends.cudnn.allow_tf32 = False). For each of {N_obs} '
+            f'observation choices over {N_traj} trajectories (batched), latency '
+            f'was timed with time.perf_counter() bracketed by '
+            f'torch.cuda.synchronize(), averaged over {n_repeats} sweeps after '
+            f'{n_warmup} warmup sweeps that covered every observation choice. '
+            f'We report the mean across observation choices ± the standard '
+            f'deviation across observation choices, where the latter reflects '
+            f'structural cost variation arising from the autoregressive segment '
+            f'count (K_fwd + K_bwd) depending on the position of the observation '
+            f'point relative to t_min and t_max; the per-observation measurement '
+            f'noise (mean of per-obs standard deviation across repeats) was '
+            f'{measurement_noise_mean_ms:.3f} ms, an order of magnitude below '
+            f'the structural variation, indicating that the reported standard '
+            f'deviation reflects genuine structural cost differences rather than '
+            f'measurement noise. '
+            f'{method_name} achieved {mean_s * 1000:.3f} ± {std_s * 1000:.3f} ms '
+            f'per observation point. Peak GPU memory above pre-timing baseline '
+            f'was {memory_stats["peak_MB_above_baseline"]:.2f} MB.'
+        )
+        print(f"{'=' * 78}")
+ 
+    # =========================================================================
+    # Save to pickle if requested
+    # =========================================================================
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, "wb") as f:
+            pickle.dump(results, f)
+        if verbose:
+            print(f"\nSaved full results to: {save_path}")
+ 
+    return results
+
+
+
+def test_model_all_observations_all_trajectories(
+    get_data_from_trajectory_id_function,
+    prediction_loss_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    bootstrap_B=10000,
+    confidence_level=0.95,
+    normalize_by_energy=True,
+    verbose=True,
+):
+    """
+    Evaluate all test trajectories using every possible single observation point.
+
+    For each trajectory, losses are summarized by their median over observation
+    choices to obtain one trajectory-level median loss. Cross-trajectory descriptive
+    statistics and a BCa bootstrap confidence interval for the mean of these
+    trajectory-level medians are then computed.
+
+    This treats trajectory as the primary independent evaluation unit and observation
+    choice as a within-trajectory nuisance factor to be robustly summarized via median.
+
+    Args:
+        get_data_from_trajectory_id_function: function to retrieve trajectory data
+        prediction_loss_function: loss function taking x_pred, u_pred, X_labels, U_labels
+        test_id_df: DataFrame with trajectory metadata (must include 'energy' if normalize_by_energy=True)
+        test_df: DataFrame with trajectory data
+        mapping_net: trained MappingNet
+        inverse_net: trained InverseNet
+        device: torch device
+        Tmax: maximum normalized temporal horizon (must be positive)
+        bootstrap_B: number of bootstrap resamples for BCa CI
+        confidence_level: confidence level for CI (e.g. 0.95)
+        normalize_by_energy: if True, divide each trajectory's loss by sqrt(energy)
+        verbose: if True, print progress and summary
+
+    Returns:
+        results: dict containing:
+            - 'loss_matrix': (N_obs, N_traj) array of per-run losses (raw)
+            - 'loss_matrix_normalized': (N_obs, N_traj) array of normalized losses (if normalize_by_energy)
+            - 'per_trajectory_median_loss': (N_traj,) array used for statistics
+            - 'per_obs_mean_loss': (N_obs,) array, mean loss per obs index across trajectories
+            - 'summary_stats': dict with mean, std, median, q1, q3, iqr, ci_lower, ci_upper
+            - 'trajectory_ids': array of trajectory ids
+            - 'energies': (N_traj,) array of energy values
+            - 'N_obs': number of observation points
+            - 'N_traj': number of trajectories
+            - 'confidence_level': confidence level used
+            - 'normalized': whether energy normalization was applied
+    """
+    from scipy.stats import bootstrap
+
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
+    if normalize_by_energy and 'energy' not in test_id_df.columns:
+        raise ValueError("test_id_df must contain an 'energy' column when normalize_by_energy=True")
+
+    trajectory_ids = test_id_df['trajectory_id'].values.astype(int)
+    N_traj = len(trajectory_ids)
+
+    if normalize_by_energy:
+        energies = test_id_df.set_index('trajectory_id').loc[trajectory_ids, 'energy'].values.astype(np.float64)
+        if np.any(energies <= 1e-12):
+            raise ValueError("Energy normalization by sqrt(E) requires positive nonzero energies.")
+        sqrt_energies = np.sqrt(energies)
+    else:
+        energies = test_id_df.set_index('trajectory_id').loc[trajectory_ids, 'energy'].values.astype(np.float64) if 'energy' in test_id_df.columns else np.full(N_traj, np.nan)
+        sqrt_energies = None
+
+    # Load all trajectories and validate shared time structure
+    all_x = []
+    all_u = []
+    ref_t = None
+
+    for idx, row_data in test_id_df.iterrows():
+        trajectory_id = int(row_data['trajectory_id'])
+        test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+        x_i = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+        u_i = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+        t_i = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+        if x_i.dim() != 1 or u_i.dim() != 1 or t_i.dim() != 1:
+            raise ValueError(f"Trajectory {trajectory_id}: x, u, t must be 1D, got dims {x_i.dim()}, {u_i.dim()}, {t_i.dim()}")
+
+        if ref_t is None:
+            ref_t = t_i
+        else:
+            if len(t_i) != len(ref_t):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t_i)} points, expected {len(ref_t)}. "
+                    f"All trajectories must have the same number of points for batched inference."
+                )
+            if not torch.allclose(t_i, ref_t, atol=1e-6):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has different time values. "
+                    f"All trajectories must share the same time values for batched inference."
                 )
 
-            elif method == "gaussian_mixture":
-                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture(
-                    x=x, 
-                    u=u, 
-                    t=t, 
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    dt=dt,
-                    alpha=alpha, 
-                    gamma=gamma,
-                    cluster_weight_threshold=cluster_weight_threshold,
-                    max_n_components=max_n_components,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False
-                )
-            elif method == "gaussian_mixture_simple":
-                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture_simple(
-                    x=x, 
-                    u=u, 
-                    t=t, 
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    max_n_components=max_n_components,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False
-                )
-            else:
-                raise ValueError("Not correctly specified method, try one of: mahalanobis, gaussian_mixture, gaussian_mixture_simple")
-                                
+        all_x.append(x_i)
+        all_u.append(u_i)
 
-            if verbose:
-                print(f"\n=== Ensemble Method - Forward Pass Count ===")
-                print(f"mapping_net calls: {stats['mapping_net_calls']}")
-                print(f"inverse_net calls: {stats['inverse_net_calls']}")
-                print(f"Total forward passes: {stats['total_forward_passes']}")
-                print(f"Coverage: {stats['coverage_pct']:.1f}%")
-        
-        if loss_type=="euclidean":
-            pred_loss_full_trajectory = prediction_loss_euclidean(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
-        elif loss_type=="mae":
-            pred_loss_full_trajectory = prediction_loss(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, loss_type=loss_type)
-        elif loss_type=="mse":
-            pred_loss_full_trajectory = prediction_loss(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, loss_type=loss_type)
-        if plot==False:
-            return pred_loss_full_trajectory
-        
-        plot_prediction_vs_ground_truth(x=x, u=u, x_pred=x_pred, u_pred=u_pred, pred_loss_full_trajectory=pred_loss_full_trajectory, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, figsize=(12, 7), connect_points=connect_points, portion_to_visualize=portion_to_visualize)
-        plot_distance_over_time(x=x, u=u, x_pred=x_pred, u_pred=u_pred, t=t, trajectory_id=trajectory_id, point_indexes_observed=point_indexes_observed, show_zeroings=show_zeroings, show_period=show_period, period=period, loss_type=loss_type)
+    # Stack: (N_traj, N_points)
+    x_batch = torch.stack(all_x, dim=0)
+    u_batch = torch.stack(all_u, dim=0)
+    t_np = ref_t.detach().cpu().numpy()
+    N_obs = len(ref_t)
+
+    all_mapping_net_calls = np.empty(N_obs, dtype=int)
+    all_inverse_net_calls = np.empty(N_obs, dtype=int)
+
+    loss_matrix = np.empty((N_obs, N_traj))
+
+    for obs_idx in range(N_obs):
+        query_indices = [i for i in range(N_obs) if i != obs_idx]
+        query_times = t_np[query_indices]
+
+        x_pred_queries, u_pred_queries, fwd_count = Batched_Autoregressive_Handoff_Inference_Protocol(
+            mapping_net=mapping_net,
+            inverse_net=inverse_net,
+            x_obs=x_batch[:, obs_idx],
+            u_obs=u_batch[:, obs_idx],
+            t_obs=t_np[obs_idx],
+            t_min=t_np[0],
+            t_max=t_np[-1],
+            Tmax=Tmax,
+            query_times=query_times,
+            query_indices=query_indices,
+            device=device,
+        )
+
+        # Assemble full predictions
+        x_pred_full = torch.empty(N_traj, N_obs, device=device, dtype=torch.float32)
+        u_pred_full = torch.empty(N_traj, N_obs, device=device, dtype=torch.float32)
+        x_pred_full[:, obs_idx] = x_batch[:, obs_idx]
+        u_pred_full[:, obs_idx] = u_batch[:, obs_idx]
+        for j, qi in enumerate(query_indices):
+            x_pred_full[:, qi] = x_pred_queries[:, j]
+            u_pred_full[:, qi] = u_pred_queries[:, j]
+
+        # Per-trajectory loss for this observation index
+        for traj_i in range(N_traj):
+            loss_i = prediction_loss_function(
+                x_pred=x_pred_full[traj_i],
+                u_pred=u_pred_full[traj_i],
+                X_labels=x_batch[traj_i],
+                U_labels=u_batch[traj_i],
+            )
+            loss_matrix[obs_idx, traj_i] = loss_i.item()
+
+        if verbose:
+            mean_this_obs = np.mean(loss_matrix[obs_idx])
+            print(f"Observation index {obs_idx}/{N_obs-1}, mean loss across trajectories: {mean_this_obs:.6f}")
+        all_mapping_net_calls[obs_idx] = fwd_count['mapping_net']
+        all_inverse_net_calls[obs_idx] = fwd_count['inverse_net']
+            
+
+    # Apply energy normalization if requested
+    if normalize_by_energy:
+        loss_matrix_normalized = loss_matrix / sqrt_energies[np.newaxis, :]
+        loss_matrix_for_stats = loss_matrix_normalized
+    else:
+        loss_matrix_normalized = None
+        loss_matrix_for_stats = loss_matrix
+
+    # Aggregate: median over observation choices per trajectory (robust to edge outliers)
+    per_trajectory_median_loss = np.median(loss_matrix_for_stats, axis=0)  # (N_traj,)
+    per_obs_mean_loss = np.mean(loss_matrix_for_stats, axis=1)  # (N_obs,)
+
+    # Statistics over trajectories (the independent units)
+    mean_loss = np.mean(per_trajectory_median_loss)
+    std_loss = np.std(per_trajectory_median_loss, ddof=1)
+    median_loss = np.median(per_trajectory_median_loss)
+    q1_loss = np.percentile(per_trajectory_median_loss, 25)
+    q3_loss = np.percentile(per_trajectory_median_loss, 75)
+    iqr_loss = q3_loss - q1_loss
+
+    # BCa bootstrap CI over trajectories
+    bootstrap_result = bootstrap(
+        data=(per_trajectory_median_loss,),
+        statistic=np.mean,
+        n_resamples=bootstrap_B,
+        confidence_level=confidence_level,
+        method='BCa',
+    )
+    ci_lower = bootstrap_result.confidence_interval.low
+    ci_upper = bootstrap_result.confidence_interval.high
+
+    summary_stats = {
+        'mean': mean_loss,
+        'std': std_loss,
+        'median': median_loss,
+        'q1': q1_loss,
+        'q3': q3_loss,
+        'iqr': iqr_loss,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+    }
+
+    loss_label = 'loss / √energy' if normalize_by_energy else 'loss'
+
+    # Forward pass count statistics
+    all_total_calls = all_mapping_net_calls + all_inverse_net_calls
+    forward_pass_stats = {
+        'mapping_net_mean': np.mean(all_mapping_net_calls),
+        'mapping_net_std': np.std(all_mapping_net_calls, ddof=1),
+        'mapping_net_min': int(np.min(all_mapping_net_calls)),
+        'mapping_net_max': int(np.max(all_mapping_net_calls)),
+        'inverse_net_mean': np.mean(all_inverse_net_calls),
+        'inverse_net_std': np.std(all_inverse_net_calls, ddof=1),
+        'inverse_net_min': int(np.min(all_inverse_net_calls)),
+        'inverse_net_max': int(np.max(all_inverse_net_calls)),
+        'total_mean': np.mean(all_total_calls),
+        'total_std': np.std(all_total_calls, ddof=1),
+        'total_min': int(np.min(all_total_calls)),
+        'total_max': int(np.max(all_total_calls)),
+        'total_across_all_obs': int(np.sum(all_total_calls)),
+    }
+
+    # Find trajectory closest to median
+    median_traj_idx = int(np.argmin(np.abs(per_trajectory_median_loss - median_loss)))
+    median_representative_id = int(trajectory_ids[median_traj_idx])
+    median_representative_loss = per_trajectory_median_loss[median_traj_idx]
+
+    if verbose:
+        print(f"\n=== Cross-Trajectory Statistics ===")
+        print(f"Metric: {loss_label}")
+        print(f"Per-trajectory summary: median across obs. choices")
+        print(f"Mean of medians: {mean_loss:.6f}")
+        print(f"Std of medians: {std_loss:.6f}")
+        print(f"Median of medians: {median_loss:.6f}")
+        print(f"IQR of medians: [{q1_loss:.6f}, {q3_loss:.6f}]")
+        print(f"{confidence_level*100:.0f}% BCa CI for mean of medians (over trajectories): [{ci_lower:.6f}, {ci_upper:.6f}]")
+        print(f"N_traj={N_traj}, N_obs={N_obs}")
+        print(f"\nMedian-representative trajectory: ID={median_representative_id} "
+              f"(obs-median {loss_label}={median_representative_loss:.6f})")
+        print(f"\n=== Forward Pass Count Statistics (over {N_obs} obs. choices, batched over {N_traj} trajectories) ===")
+        print(f"MappingNet calls per obs:  mean={forward_pass_stats['mapping_net_mean']:.1f} "
+              f"(std={forward_pass_stats['mapping_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['mapping_net_min']}, {forward_pass_stats['mapping_net_max']}]")
+        print(f"InverseNet calls per obs:  mean={forward_pass_stats['inverse_net_mean']:.1f} "
+              f"(std={forward_pass_stats['inverse_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['inverse_net_min']}, {forward_pass_stats['inverse_net_max']}]")
+        print(f"Total calls per obs:       mean={forward_pass_stats['total_mean']:.1f} "
+              f"(std={forward_pass_stats['total_std']:.1f}), "
+              f"range=[{forward_pass_stats['total_min']}, {forward_pass_stats['total_max']}]")
+        print(f"Total calls across all obs: {forward_pass_stats['total_across_all_obs']}")
+
+    results = {
+        'loss_matrix': loss_matrix,
+        'loss_matrix_normalized': loss_matrix_normalized,
+        'loss_matrix_for_stats': loss_matrix_for_stats,
+        'per_trajectory_median_loss': per_trajectory_median_loss,
+        'per_obs_mean_loss': per_obs_mean_loss,
+        'summary_stats': summary_stats,
+        'trajectory_ids': trajectory_ids,
+        'energies': energies,
+        't': t_np,
+        'N_obs': N_obs,
+        'N_traj': N_traj,
+        'confidence_level': confidence_level,
+        'normalized': normalize_by_energy,
+        'forward_pass_stats': forward_pass_stats,
+        'all_mapping_net_calls': all_mapping_net_calls,
+        'all_inverse_net_calls': all_inverse_net_calls,
+        'median_representative_id': median_representative_id,
+        'median_representative_loss': median_representative_loss,
+    }
+
+    return results
+
+
+
+def plot_summary_statistics(results, normalized=True, figsize=(16, 6),
+                            timing_stats_batch=None, timing_stats_single=None,
+                            band_alpha=0.3):
+    """
+    Compact summary plot for paper: two or three panels covering all essential statistical information.
+
+    Left: Observation-averaged loss vs trajectory energy with per-trajectory IQR error bars
+          and overall mean with BCa CI band.
+    Center: Loss per observation time with IQR band across trajectories.
+    Right (if any timing_stats provided): Inference time per observation point with
+          measurement stability band and grand mean. Supports single-trajectory,
+          batched multi-trajectory, or both overlaid.
+
+    Also prints both raw and normalized summary statistics.
+
+    Args:
+        results: dict returned by test_model_all_observations_all_trajectories
+        normalized: if True, plot energy-normalized loss. If False, plot raw loss.
+        figsize: figure size tuple (width will be extended if timing panel is shown)
+        timing_stats_batch: optional dict returned by time_inference_gpu.
+        timing_stats_single: optional dict returned by time_inference_gpu_single_trajectory.
+        band_alpha: float, transparency of shaded bands across all plots.
+    """
+    from scipy.stats import bootstrap as scipy_bootstrap
+
+    loss_matrix = results['loss_matrix']
+    energies = results['energies']
+    confidence_level = results['confidence_level']
+    N_obs = results['N_obs']
+    N_traj = results['N_traj']
+
+    if np.any(energies <= 1e-12):
+        raise ValueError("Energy normalization by sqrt(E) requires positive nonzero energies.")
+    sqrt_energies = np.sqrt(energies)
+
+    loss_matrix_normalized = loss_matrix / sqrt_energies[np.newaxis, :]
+
+    # === Print both raw and normalized statistics ===
+    for mode, matrix, label in [
+        ('Raw', loss_matrix, 'loss'),
+        ('Normalized', loss_matrix_normalized, 'energy-normalized loss L/√E'),
+    ]:
+        traj_medians = np.median(matrix, axis=0)
+        mean_val = np.mean(traj_medians)
+        std_val = np.std(traj_medians, ddof=1)
+        median_val = np.median(traj_medians)
+        q1_val = np.percentile(traj_medians, 25)
+        q3_val = np.percentile(traj_medians, 75)
+
+        boot = scipy_bootstrap(
+            data=(traj_medians,),
+            statistic=np.mean,
+            n_resamples=10000,
+            confidence_level=confidence_level,
+            method='BCa',
+        )
+        ci_lo = boot.confidence_interval.low
+        ci_hi = boot.confidence_interval.high
+
+        print(f"\n=== {mode} Statistics ({label}) ===")
+        print(f"Per-trajectory summary: median across obs. choices")
+        print(f"Mean of medians: {mean_val:.6f}")
+        print(f"Std of medians: {std_val:.6f}")
+        print(f"Median of medians: {median_val:.6f}")
+        print(f"IQR of medians: [{q1_val:.6f}, {q3_val:.6f}]")
+        print(f"{confidence_level*100:.0f}% BCa CI for mean of medians (over trajectories): [{ci_lo:.6f}, {ci_hi:.6f}]")
+        print(f"N_traj={N_traj}, N_obs={N_obs}")
+
+    # === Select matrix for plotting ===
+    if normalized:
+        loss_matrix_plot = loss_matrix_normalized
+        loss_label = 'Energy-normalized loss L/√E'
+    else:
+        loss_matrix_plot = loss_matrix
+        loss_label = 'Loss'
+
+    # Compute stats for chosen mode (median across obs. choices per trajectory)
+    traj_medians_plot = np.median(loss_matrix_plot, axis=0)
+    overall_mean = np.mean(traj_medians_plot)
+    overall_std = np.std(traj_medians_plot, ddof=1)
+
+    boot_plot = scipy_bootstrap(
+        data=(traj_medians_plot,),
+        statistic=np.mean,
+        n_resamples=10000,
+        confidence_level=confidence_level,
+        method='BCa',
+    )
+    ci_lower = boot_plot.confidence_interval.low
+    ci_upper = boot_plot.confidence_interval.high
+
+    # === Figure layout ===
+    has_timing = timing_stats_batch is not None or timing_stats_single is not None
+    n_panels = 3 if has_timing else 2
+    fig_width = figsize[0] if not has_timing else figsize[0] + 8
+    fig, axes = plt.subplots(1, n_panels, figsize=(fig_width, figsize[1]))
+    if n_panels == 2:
+        ax1, ax2 = axes
+    else:
+        ax1, ax2, ax3 = axes
+
+    # === Left: Loss vs Energy scatter ===
+    medians = np.median(loss_matrix_plot, axis=0)
+    q25 = np.percentile(loss_matrix_plot, 25, axis=0)
+    q75 = np.percentile(loss_matrix_plot, 75, axis=0)
+    err_lower = medians - q25
+    err_upper = q75 - medians
+
+    ax1.errorbar(energies, medians, yerr=[err_lower, err_upper],
+                 fmt='o', color='red', ecolor='red', elinewidth=1.5,
+                 capsize=4, capthick=1.5, markersize=6, alpha=0.8,
+                 label='Median (IQR across obs. choices)')
+
+    ax1.axhspan(ci_lower, ci_upper, color='red', alpha=band_alpha,
+                label=f'{confidence_level*100:.0f}% BCa CI for mean: [{ci_lower:.4f}, {ci_upper:.4f}]')
+    ax1.axhline(y=overall_mean, color='red', linestyle='-', linewidth=1.5,
+                label=f'Mean across trajectories: {overall_mean:.4f} (std={overall_std:.4f})')
+
+    ax1.set_xlabel('Trajectory Energy')
+    ax1.set_ylabel(loss_label)
+    ax1.set_title(f'{loss_label} vs Energy (N_traj={N_traj}, N_obs={N_obs})')
+    ax1.legend(loc='upper left', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # === Center: Loss per observation time ===
+    if 't' in results:
+        obs_times = results['t']
+    else:
+        obs_times = np.arange(N_obs)
+
+    per_obs_median = np.median(loss_matrix_plot, axis=1)
+    per_obs_p25 = np.percentile(loss_matrix_plot, 25, axis=1)
+    per_obs_p75 = np.percentile(loss_matrix_plot, 75, axis=1)
+
+    ax2.fill_between(obs_times, per_obs_p25, per_obs_p75,
+                     alpha=band_alpha, color='red', label='IQR across trajectories')
+    ax2.plot(obs_times, per_obs_median, marker='o', markersize=3, linestyle='-', color='red', linewidth=1,
+             label='Median across trajectories')
+    ax2.axhline(y=overall_mean, color='red', linestyle='-', linewidth=1.5,
+                label=f'Mean across trajectories: {overall_mean:.4f}')
+
+    ax2.set_xlabel('Observation Time (t)')
+    ax2.set_ylabel(loss_label)
+    ax2.set_title(f'{loss_label} per Observation Time (across {N_traj} trajectories)')
+    ax2.legend(loc='upper right', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    # === Right: Inference time per observation point ===
+    if has_timing:
+        has_both = timing_stats_batch is not None and timing_stats_single is not None
+
+        # Helper to plot one timing source
+        def plot_timing(ts, color, prefix, ax):
+            if len(obs_times) != len(ts['per_obs_mean']):
+                raise ValueError(
+                    f"Timing stats length {len(ts['per_obs_mean'])} does not match "
+                    f"number of observation times {len(obs_times)}."
+                )
+
+            per_obs_mean_ms = ts['per_obs_mean'] * 1000
+            per_obs_std_ms = ts['per_obs_std'] * 1000
+            min_ms = ts['min_s'] * 1000
+            max_ms = ts['max_s'] * 1000
+            n_repeats = ts['n_repeats']
+
+            curve_label = f'{prefix}Mean across repeats' if prefix else 'Mean across repeats'
+            range_label = (f'{prefix}Range across obs. points: [{min_ms:.3f}, {max_ms:.3f}] ms'
+                           if prefix else
+                           f'Range across obs. points: [{min_ms:.3f}, {max_ms:.3f}] ms')
+
+            ax.fill_between(obs_times,
+                            per_obs_mean_ms - per_obs_std_ms,
+                            per_obs_mean_ms + per_obs_std_ms,
+                            alpha=band_alpha, color=color)
+            ax.plot(obs_times, per_obs_mean_ms,
+                    marker='o', markersize=3, linestyle='-', color=color, linewidth=1,
+                    label=curve_label)
+            ax.plot([], [], color='none', label=range_label)
+
+        if has_both:
+            plot_timing(timing_stats_single, 'red', 'Single: ', ax3)
+            plot_timing(timing_stats_batch, 'steelblue', 'Batched: ', ax3)
+            ax3.set_title(f'Inference Time per Obs. Point')
+        elif timing_stats_batch is not None:
+            plot_timing(timing_stats_batch, 'red', '', ax3)
+            ax3.set_title(f'Inference Time per Obs. Point (batched, N_traj={N_traj})')
+        else:
+            plot_timing(timing_stats_single, 'red', '', ax3)
+            ax3.set_title(f'Inference Time per Obs. Point (single trajectory)')
+
+        ax3.set_xlabel('Observation Time (t)')
+        ax3.set_ylabel('Inference Time (ms)')
+        ax3.legend(loc='upper right', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+
+        # Device info text box
+        ts_for_info = timing_stats_batch if timing_stats_batch is not None else timing_stats_single
+        device_name = ts_for_info.get('device_name', 'N/A')
+        n_warmup = ts_for_info.get('n_warmup', '?')
+        n_repeats = ts_for_info.get('n_repeats', '?')
+        ax3.text(0.02, 0.98,
+                 f'{device_name}\n{n_warmup} warmup, {n_repeats} timed runs',
+                 transform=ax3.transAxes, fontsize=7, ha='left', va='top',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    plt.tight_layout()
+    plt.show()
+
+
+def time_inference_gpu_single_trajectory(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    trajectory_id,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    n_warmup=5,
+    n_repeats=20,
+    verbose=True,
+):
+    """
+    Self-contained end-to-end wall-clock timing for single-trajectory
+    inference.
+
+    Loads trajectory data, then measures per-observation-point inference
+    time using time.perf_counter() with torch.cuda.synchronize().
+
+    Intended to be called independently after evaluation:
+        results = test_model_varying_observation_single_trajectory(...)
+        timing_stats = time_inference_gpu_single_trajectory(
+            get_data_from_trajectory_id_function,
+            test_id_df, test_df, trajectory_id,
+            mapping_net, inverse_net, device, Tmax,
+        )
+        results['timing_stats'] = timing_stats
+
+    Args:
+        get_data_from_trajectory_id_function: function to retrieve trajectory data
+        test_id_df: DataFrame with trajectory metadata
+        test_df: DataFrame with trajectory data
+        trajectory_id: ID of the trajectory to time
+        mapping_net: trained MappingNet (already on device)
+        inverse_net: trained InverseNet (already on device)
+        device: torch device
+        Tmax: maximum normalized temporal horizon (must be positive)
+        n_warmup: number of warmup sweeps (not timed)
+        n_repeats: number of timed sweeps
+        verbose: if True, print timing summary
+
+    Returns:
+        timing_stats: dict with:
+            - 'time_matrix': (n_repeats, N_obs) array, seconds per obs per run
+            - 'per_obs_mean': (N_obs,) mean time per obs point across repeats
+            - 'per_obs_std': (N_obs,) std across repeats per obs point
+            - 'mean_s': scalar, mean of per_obs_mean across observation choices
+            - 'std_s': scalar, std of per_obs_mean across observation choices
+              (reflects structural cost variation across observation positions,
+               NOT independent experimental uncertainty)
+            - 'median_s': scalar, median of per_obs_mean
+            - 'min_s': scalar, min of per_obs_mean
+            - 'max_s': scalar, max of per_obs_mean
+            - 'total_sweep_mean_s': scalar, mean total sweep time across repeats
+            - 'n_warmup', 'n_repeats', 'N_obs', 'trajectory_id'
+    """
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
+    # === Load trajectory ===
+    test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+    if x.dim() != 1 or u.dim() != 1 or t.dim() != 1:
+        raise ValueError(f"x, u, t must be 1D, got dims {x.dim()}, {u.dim()}, {t.dim()}")
+
+    t_np = t.detach().cpu().numpy()
+    N_obs = len(t_np)
+
+    if N_obs < 2:
+        raise ValueError(f"Need at least two time points, got {N_obs}")
+
+    if verbose:
+        print(f"\nTiming benchmark: trajectory_id={trajectory_id}, N_obs={N_obs}, "
+              f"device={torch.cuda.get_device_name(device)}")
+
+    # === Define single-obs inference call ===
+    def run_single_obs(obs_idx):
+        query_indices = [i for i in range(N_obs) if i != obs_idx]
+        query_times = t_np[query_indices]
+
+        Autoregressive_Handoff_Inference_Protocol(
+            mapping_net=mapping_net,
+            inverse_net=inverse_net,
+            x_obs=x[obs_idx],
+            u_obs=u[obs_idx],
+            t_obs=t_np[obs_idx],
+            t_min=t_np[0],
+            t_max=t_np[-1],
+            Tmax=Tmax,
+            query_times=query_times,
+            query_indices=query_indices,
+            device=device,
+        )
+
+    # === Warmup ===
+    if verbose:
+        print(f"Running {n_warmup} warmup sweeps...")
+    for _ in range(n_warmup):
+        for obs_idx in range(N_obs):
+            run_single_obs(obs_idx)
+
+    # === Timed runs ===
+    if verbose:
+        print(f"Running {n_repeats} timed sweeps...")
+    time_matrix = np.empty((n_repeats, N_obs))
+
+    for r in range(n_repeats):
+        for obs_idx in range(N_obs):
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+
+            run_single_obs(obs_idx)
+
+            torch.cuda.synchronize(device)
+            elapsed_s = time.perf_counter() - start
+            time_matrix[r, obs_idx] = elapsed_s
+
+    # Per-obs statistics (mean/std across repeats for each obs point)
+    per_obs_mean = np.mean(time_matrix, axis=0)        # (N_obs,)
+    per_obs_std = np.std(time_matrix, axis=0, ddof=1)  # (N_obs,)
+
+    # Summary across observation choices (from per-obs means)
+    mean_s = np.mean(per_obs_mean)
+    std_s = np.std(per_obs_mean, ddof=1)
+    median_s = np.median(per_obs_mean)
+    min_s = np.min(per_obs_mean)
+    max_s = np.max(per_obs_mean)
+
+    # Total sweep time (sum across obs per repeat, then mean across repeats)
+    total_sweep_mean_s = np.mean(np.sum(time_matrix, axis=1))
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"TIMING BENCHMARK — Single-Trajectory Inference")
+        print(f"{'='*70}")
+        print(f"\n--- Hardware & Software ---")
+        print(f"Device:          {torch.cuda.get_device_name(device)}")
+        print(f"CUDA version:    {torch.version.cuda}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"\n--- Protocol ---")
+        print(f"Timing method:   time.perf_counter() with torch.cuda.synchronize()")
+        print(f"Warmup sweeps:   {n_warmup}")
+        print(f"Timed sweeps:    {n_repeats}")
+        print(f"Tmax:            {Tmax}")
+        print(f"\n--- Data ---")
+        print(f"Trajectory ID:   {trajectory_id}")
+        print(f"N_obs:           {N_obs}")
+        print(f"t range:         [{t_np[0]:.6f}, {t_np[-1]:.6f}]")
+        print(f"\n--- Results ---")
+        print(f"Per observation point (mean ± std across obs choices):")
+        print(f"  {mean_s*1000:.3f} ± {std_s*1000:.3f} ms")
+        print(f"Per observation point (median): {median_s*1000:.3f} ms")
+        print(f"Per observation point (range):  [{min_s*1000:.3f}, {max_s*1000:.3f}] ms")
+        print(f"Total sweep (mean ± std across {n_repeats} repeats):")
+        print(f"  {total_sweep_mean_s:.4f} ± {np.std(np.sum(time_matrix, axis=1), ddof=1):.4f} s")
+        print(f"\"End-to-end inference time was measured on a "
+              f"{torch.cuda.get_device_name(device)} using PyTorch {torch.__version__} "
+              f"(CUDA {torch.version.cuda}). Each observation-choice time was measured "
+              f"with time.perf_counter() and torch.cuda.synchronize(), averaged over "
+              f"{n_repeats} runs after {n_warmup} warmup runs. We report the mean ± "
+              f"standard deviation across {N_obs} observation choices (single trajectory, "
+              f"ID={trajectory_id}): "
+              f"{mean_s*1000:.3f} ± {std_s*1000:.3f} ms per observation point.\"")
+        print(f"{'='*70}")
+
+    timing_stats = {
+        'time_matrix': time_matrix,
+        'per_obs_mean': per_obs_mean,
+        'per_obs_std': per_obs_std,
+        'mean_s': mean_s,
+        'std_s': std_s,
+        'median_s': median_s,
+        'min_s': min_s,
+        'max_s': max_s,
+        'total_sweep_mean_s': total_sweep_mean_s,
+        'n_warmup': n_warmup,
+        'n_repeats': n_repeats,
+        'N_obs': N_obs,
+        'trajectory_id': trajectory_id,
+        'Tmax': Tmax,
+        'timing_method': 'perf_counter_with_cuda_synchronize',
+        'device_name': torch.cuda.get_device_name(device),
+        'cuda_version': torch.version.cuda,
+        'pytorch_version': torch.__version__,
+    }
+
+    return timing_stats
+
+
+
+
+
+def test_model_varying_observation_single_trajectory(
+    get_data_from_trajectory_id_function,
+    loss_type,
+    test_id_df,
+    test_df,
+    trajectory_id,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    case=None,
+    k=1, mass=1, g=9.81, length=3.0, constant=2.4,
+    verbose=False,
+):
+    """
+    Single-trajectory diagnostic: run inference using every possible observation point.
+
+    This is a sensitivity analysis over observation choices for one trajectory.
+    The reported intervals summarize variation across observation choices and
+    should not be interpreted as cross-trajectory experimental uncertainty.
+
+    Collects per-run scalar losses, per-time-point pointwise errors, and
+    per-run predicted trajectories for phase space visualization.
+
+    Returns:
+        results: dict containing:
+            - 'per_run_losses': (N,) array of scalar losses, one per observation choice
+            - 'pointwise_errors': (N, T) array of pointwise errors
+            - 'all_x_pred': (N, T) array of predicted q values per observation choice
+            - 'all_u_pred': (N, T) array of predicted p values per observation choice
+            - 'summary_stats': dict with mean, std, median, q1, q3, iqr, min, max
+            - 'per_timepoint_stats': dict with median, p25, p75 arrays of shape (T,)
+            - 'representative_idx': int, index of the run closest to median loss
+            - 't': (T,) array of time values
+            - 'x': (T,) ground truth q
+            - 'u': (T,) ground truth p
+            - 'trajectory_id': trajectory id
+            - 'loss_type': loss type used
+            - 'N': number of observation choices
+            - 'T': number of time points
+    """
+    if loss_type not in ("euclidean", "mae", "mse"):
+        raise ValueError(f"Unknown loss_type '{loss_type}'. Must be 'euclidean', 'mae', or 'mse'.")
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
+    # Load trajectory once
+    test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
+    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
+    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
+
+    T = len(t)
+    if T < 2:
+        raise ValueError(f"Need at least two time points to run observation-choice analysis, got {T}")
+    N = T  # one run per observation point
+
+    # Pre-convert ground truth to numpy once
+    t_np = t.detach().cpu().numpy()
+    x_np = x.detach().cpu().numpy()
+    u_np = u.detach().cpu().numpy()
+
+    per_run_losses = np.empty(N)
+    pointwise_errors = np.empty((N, T))
+    all_x_pred = np.empty((N, T))
+    all_u_pred = np.empty((N, T))
+    all_mapping_net_calls = np.empty(N, dtype=int)
+    all_inverse_net_calls = np.empty(N, dtype=int)
+
+    # Energy computation setup
+    if case is not None:
+        if case not in ("harmonic_oscillator", "ideal_pendulum", "real_pendulum"):
+            raise ValueError(f"Unknown case '{case}'. Must be 'harmonic_oscillator', 'ideal_pendulum', or 'real_pendulum'.")
+
+        def compute_energy(q, p):
+            if case == "harmonic_oscillator":
+                omega_squared = k / mass
+                return 0.5 * p**2 + 0.5 * omega_squared * q**2
+            elif case == "ideal_pendulum":
+                c = g / length
+                return 0.5 * p**2 + c * (1 - np.cos(q))
+            elif case == "real_pendulum":
+                return p**2 + constant * (1 - np.cos(q))
+
+        all_energy_pred = np.empty((N, T))
+        energy_true = compute_energy(x_np, u_np)
+
+    for obs_idx in range(N):
+        pred_loss, x_pred, u_pred, _, _, _, fwd_count = test_model_in_single_trajectory(
+            get_data_from_trajectory_id_function=get_data_from_trajectory_id_function,
+            loss_type=loss_type,
+            test_id_df=test_id_df,
+            test_df=test_df,
+            trajectory_id=trajectory_id,
+            mapping_net=mapping_net,
+            inverse_net=inverse_net,
+            device=device,
+            point_indexes_observed=[obs_idx],
+            Tmax=Tmax,
+            verbose=False,
+        )
+
+        per_run_losses[obs_idx] = pred_loss.item()
+
+        x_pred_np = x_pred.detach().cpu().numpy()
+        u_pred_np = u_pred.detach().cpu().numpy()
+        all_x_pred[obs_idx] = x_pred_np
+        all_u_pred[obs_idx] = u_pred_np
+
+        if case is not None:
+            all_energy_pred[obs_idx] = compute_energy(x_pred_np, u_pred_np)
+
+        if loss_type == "euclidean":
+            pointwise_errors[obs_idx] = np.sqrt((x_pred_np - x_np)**2 + (u_pred_np - u_np)**2)
+        elif loss_type == "mae":
+            pointwise_errors[obs_idx] = np.abs(x_pred_np - x_np) + np.abs(u_pred_np - u_np)
+        elif loss_type == "mse":
+            pointwise_errors[obs_idx] = (x_pred_np - x_np)**2 + (u_pred_np - u_np)**2
+
+        if verbose:
+            print(f"Observation index {obs_idx}/{N-1}, loss: {per_run_losses[obs_idx]:.6f}")
+
+        all_mapping_net_calls[obs_idx] = fwd_count['mapping_net']
+        all_inverse_net_calls[obs_idx] = fwd_count['inverse_net']
+
+    # === Summary statistics over runs ===
+    mean_loss = np.mean(per_run_losses)
+    std_loss = np.std(per_run_losses, ddof=1)
+    median_loss = np.median(per_run_losses)
+    q1_loss = np.percentile(per_run_losses, 25)
+    q3_loss = np.percentile(per_run_losses, 75)
+    iqr_loss = q3_loss - q1_loss
+    min_loss = np.min(per_run_losses)
+    max_loss = np.max(per_run_losses)
+
+    summary_stats = {
+        'mean': mean_loss,
+        'std': std_loss,
+        'median': median_loss,
+        'q1': q1_loss,
+        'q3': q3_loss,
+        'iqr': iqr_loss,
+        'min': min_loss,
+        'max': max_loss,
+    }
+
+    # Representative run: closest to median scalar loss
+    representative_idx = int(np.argmin(np.abs(per_run_losses - median_loss)))
+
+    if verbose:
+        print(f"\n=== Summary Statistics ===")
+        print(f"Mean loss: {mean_loss:.6f}")
+        print(f"Std loss: {std_loss:.6f}")
+        print(f"Median loss: {median_loss:.6f}")
+        print(f"IQR: [{q1_loss:.6f}, {q3_loss:.6f}]")
+        print(f"Range: [{min_loss:.6f}, {max_loss:.6f}]")
+        print(f"Representative run: obs_idx={representative_idx}, loss={per_run_losses[representative_idx]:.6f}")
+
+    # === Per-time-point statistics, excluding self-observation ===
+    per_timepoint_median = np.empty(T)
+    per_timepoint_p25 = np.empty(T)
+    per_timepoint_p75 = np.empty(T)
+
+    for j in range(T):
+        mask = np.ones(N, dtype=bool)
+        mask[j] = False
+        errors_at_j = pointwise_errors[mask, j]
+
+        per_timepoint_median[j] = np.median(errors_at_j)
+        per_timepoint_p25[j] = np.percentile(errors_at_j, 25)
+        per_timepoint_p75[j] = np.percentile(errors_at_j, 75)
+
+    per_timepoint_stats = {
+        'median': per_timepoint_median,
+        'p25': per_timepoint_p25,
+        'p75': per_timepoint_p75,
+    }
+
+    # === Per-time-point energy statistics, excluding self-observation ===
+    if case is not None:
+        energy_timepoint_median = np.empty(T)
+        energy_timepoint_p25 = np.empty(T)
+        energy_timepoint_p75 = np.empty(T)
+        energy_timepoint_p5 = np.empty(T)
+        energy_timepoint_p95 = np.empty(T)
+
+        for j in range(T):
+            mask = np.ones(N, dtype=bool)
+            mask[j] = False
+            energy_at_j = all_energy_pred[mask, j]
+
+            energy_timepoint_median[j] = np.median(energy_at_j)
+            energy_timepoint_p25[j] = np.percentile(energy_at_j, 25)
+            energy_timepoint_p75[j] = np.percentile(energy_at_j, 75)
+            energy_timepoint_p5[j] = np.percentile(energy_at_j, 5)
+            energy_timepoint_p95[j] = np.percentile(energy_at_j, 95)
+
+        energy_stats = {
+            'median': energy_timepoint_median,
+            'p25': energy_timepoint_p25,
+            'p75': energy_timepoint_p75,
+            'p5': energy_timepoint_p5,
+            'p95': energy_timepoint_p95,
+        }
+    else:
+        energy_true = None
+        all_energy_pred = None
+        energy_stats = None
+
+    # === Forward pass count statistics ===
+    all_total_calls = all_mapping_net_calls + all_inverse_net_calls
+    forward_pass_stats = {
+        'mapping_net_mean': np.mean(all_mapping_net_calls),
+        'mapping_net_std': np.std(all_mapping_net_calls, ddof=1),
+        'mapping_net_min': int(np.min(all_mapping_net_calls)),
+        'mapping_net_max': int(np.max(all_mapping_net_calls)),
+        'inverse_net_mean': np.mean(all_inverse_net_calls),
+        'inverse_net_std': np.std(all_inverse_net_calls, ddof=1),
+        'inverse_net_min': int(np.min(all_inverse_net_calls)),
+        'inverse_net_max': int(np.max(all_inverse_net_calls)),
+        'total_mean': np.mean(all_total_calls),
+        'total_std': np.std(all_total_calls, ddof=1),
+        'total_min': int(np.min(all_total_calls)),
+        'total_max': int(np.max(all_total_calls)),
+    }
+    if verbose:
+        print(f"\n=== Forward Pass Count Statistics (over {N} obs. choices) ===")
+        print(f"MappingNet calls:  mean={forward_pass_stats['mapping_net_mean']:.1f} "
+              f"(std={forward_pass_stats['mapping_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['mapping_net_min']}, {forward_pass_stats['mapping_net_max']}]")
+        print(f"InverseNet calls:  mean={forward_pass_stats['inverse_net_mean']:.1f} "
+              f"(std={forward_pass_stats['inverse_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['inverse_net_min']}, {forward_pass_stats['inverse_net_max']}]")
+        print(f"Total calls:       mean={forward_pass_stats['total_mean']:.1f} "
+              f"(std={forward_pass_stats['total_std']:.1f}), "
+              f"range=[{forward_pass_stats['total_min']}, {forward_pass_stats['total_max']}]")
+
+    results = {
+        'per_run_losses': per_run_losses,
+        'pointwise_errors': pointwise_errors,
+        'summary_stats': summary_stats,
+        'per_timepoint_stats': per_timepoint_stats,
+        'representative_idx': representative_idx,
+        't': t_np,
+        'x': x_np,
+        'u': u_np,
+        'trajectory_id': trajectory_id,
+        'loss_type': loss_type,
+        'N': N,
+        'T': T,
+        'all_x_pred': all_x_pred,
+        'all_u_pred': all_u_pred,
+        'energy_true': energy_true,
+        'all_energy_pred': all_energy_pred,
+        'energy_stats': energy_stats,
+        'case': case,
+        'forward_pass_stats': forward_pass_stats,
+        'all_mapping_net_calls': all_mapping_net_calls,
+        'all_inverse_net_calls': all_inverse_net_calls,
+    }
+
+    return results
+
+
+def plot_varying_observation_results(results, obs_idx, figsize=(28, 7), connect_points=True, iqr_alpha=0.4):
+    """
+    Plot results from test_model_varying_observation_single_trajectory.
+
+    Creates two or three subplots:
+        1. Per-time-point error IQR band across observation choices
+        2. Energy: ground truth vs predicted with bands (if case was provided)
+        3. Phase space: ground truth vs prediction
+
+    Args:
+        results: dict returned by test_model_varying_observation_single_trajectory
+        obs_idx: int. Which observation-run to use for plots 2 and 3.
+        figsize: tuple, figure size
+        connect_points: bool, whether to connect phase space points with lines
+        iqr_alpha: float, transparency of IQR bands in plots 1 and 2
+    """
+    t = results['t']
+    per_timepoint_stats = results['per_timepoint_stats']
+    summary_stats = results['summary_stats']
+    trajectory_id = results['trajectory_id']
+    loss_type = results['loss_type']
+    N = results['N']
+    T = results['T']
+    x_gt = results['x']
+    u_gt = results['u']
+    all_x_pred = results['all_x_pred']
+    all_u_pred = results['all_u_pred']
+    pointwise_errors = results['pointwise_errors']
+
+    if not (0 <= obs_idx < N):
+        raise ValueError(f"obs_idx={obs_idx} is out of bounds for N={N} runs")
+
+    energy_true = results.get('energy_true', None)
+    all_energy_pred = results.get('all_energy_pred', None)
+    energy_stats = results.get('energy_stats', None)
+
+    # Predictions for the selected observation run
+    x_pred_run = all_x_pred[obs_idx]
+    u_pred_run = all_u_pred[obs_idx]
+    obs_time = t[obs_idx]
+
+    has_energy = energy_true is not None and energy_stats is not None
+    n_plots = 3 if has_energy else 2
+
+    if n_plots == 2:
+        figsize = (20, 7)
+
+    fig, axes = plt.subplots(1, n_plots, figsize=figsize)
+
+    fig.text(
+        0.005, 0.995,
+        f"Trajectory {trajectory_id} | {N} obs. choices | obs. t={obs_time:.2f} (idx {obs_idx})",
+        ha='left',
+        va='top',
+        fontsize=10,
+        alpha=1.0,
+    )
+
+    if n_plots == 2:
+        ax1, ax3 = axes
+        ax2 = None
+    else:
+        ax1, ax2, ax3 = axes
+
+    # === Plot 1: Per-time-point error IQR band ===
+    ax1.fill_between(t, per_timepoint_stats['p25'], per_timepoint_stats['p75'],
+                     alpha=iqr_alpha, color='red', label='IQR across obs. choices')
+    ax1.plot(t, per_timepoint_stats['median'], color='red', linewidth=1.5,
+             label='Median across obs. choices')
+    ax1.plot(t, pointwise_errors[obs_idx], color='red', linewidth=1.2,
+             linestyle='dotted', label='Selected obs. run')
+
+    ax1.set_xlim(t[0], t[-1])
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel(f'Pointwise Error ({loss_type})')
+    ax1.set_title('Prediction Error Over Time')
+    ax1.legend(loc='upper right', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    selected_run_loss = results['per_run_losses'][obs_idx]
+    textstr = (
+        f"Scalar loss across obs. choices:\n"
+        f"  Mean (std={summary_stats['std']:.4f}): {summary_stats['mean']:.4f}\n"
+        f"  Median [IQR]: {summary_stats['median']:.4f} "
+        f"[{summary_stats['q1']:.4f}, {summary_stats['q3']:.4f}]\n"
+        f"  Range: [{summary_stats['min']:.4f}, {summary_stats['max']:.4f}]\n"
+        f"Selected obs. run: {selected_run_loss:.4f}"
+    )
+    ax1.text(0.02, 0.98, textstr, transform=ax1.transAxes, fontsize=8,
+             ha='left', va='top',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    # === Plot 2: Energy (if available) ===
+    if has_energy:
+        # IQR band across observation choices
+        ax2.fill_between(t, energy_stats['p25'], energy_stats['p75'],
+                         alpha=iqr_alpha, color='red',
+                         label='IQR across obs. choices')
+
+        # Selected run energy curve
+        energy_run = all_energy_pred[obs_idx]
+        ax2.plot(t, energy_run, color='red', linewidth=1.5,
+                 label='E_pred(t) (selected obs. run)')
+
+        # True energy
+        ax2.plot(t, energy_true, color='blue', linewidth=2, label='E_true(t)')
+
+        ax2.set_xlim(t[0], t[-1])
+        ax2.set_xlabel('Time (t)')
+        ax2.set_ylabel('Energy')
+        ax2.set_title('Energy: Predicted vs True')
+        ax2.legend(loc='upper right', fontsize=8)
+        ax2.grid(True, alpha=0.3)
+
+        # Energy error statistics for the selected run
+        energy_errors_run = np.abs(energy_run - energy_true)
+        mean_energy_error = np.mean(energy_errors_run)
+        max_energy_error = np.max(energy_errors_run)
+        true_energy_mean = np.mean(np.abs(energy_true))
+        relative_error = (
+            mean_energy_error / true_energy_mean * 100
+            if true_energy_mean > 1e-12
+            else np.nan
+        )
+
+        energy_textstr = (
+            f"Selected obs. run:\n"
+            f"  Mean |E_pred - E_true|: {mean_energy_error:.4f}\n"
+            f"  Max |E_pred - E_true|: {max_energy_error:.4f}\n"
+            f"  Relative error: {relative_error:.2f}%"
+        )
+        ax2.text(0.02, 0.98, energy_textstr, transform=ax2.transAxes, fontsize=8,
+                 ha='left', va='top',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    # === Plot 3: Phase space ===
+    scatter_gt = ax3.scatter(x_gt, u_gt, c=t, cmap='Blues', s=60, alpha=0.8,
+                             edgecolors='darkblue', linewidths=0.5, zorder=3)
+    scatter_pred = ax3.scatter(x_pred_run, u_pred_run, c=t, cmap='Reds', s=60,
+                               alpha=0.8, edgecolors='darkred',
+                               linewidths=0.5, zorder=3)
+
+    if connect_points:
+        ax3.plot(x_gt, u_gt, color='blue', alpha=0.3, linewidth=1.5, zorder=2)
+        ax3.plot(x_pred_run, u_pred_run, color='red', alpha=0.3,
+                 linewidth=1.5, zorder=2)
+
+    ax3.scatter(x_gt[0], u_gt[0], c='blue', marker='*', s=400,
+                edgecolors='black', linewidths=2.5, zorder=5)
+    ax3.scatter(x_pred_run[0], u_pred_run[0], c='red', marker='*', s=400,
+                edgecolors='black', linewidths=2.5, zorder=5)
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
+               markersize=10, markeredgecolor='darkblue',
+               label='Ground Truth'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+               markersize=10, markeredgecolor='darkred',
+               label='Prediction'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='blue',
+               markersize=15, markeredgecolor='black',
+               label='Start (Ground Truth)'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='red',
+               markersize=15, markeredgecolor='black',
+               label='Start (Prediction)'),
+    ]
+    ax3.legend(handles=legend_elements, fontsize=7, loc='best')
+
+    cbar = plt.colorbar(scatter_pred, ax=ax3, pad=0.02, fraction=0.046)
+    cbar.set_label('Time', fontsize=10)
+
+    ax3.set_xlabel('q', fontsize=12)
+    ax3.set_ylabel('p', fontsize=12)
+    ax3.set_title(
+        'Phase Space: Ground Truth vs Prediction (selected obs. run)',
+        fontsize=11,
+    )
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    plt.show()
+
+
+
+def test_model_variance_with_varying_observed_points(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    Tmax,
+    device,
+    n_permutations=20,
+    confidence_level=0.95,
+    valid_fraction_threshold=0.5,
+    rng_seed=None,
+    verbose=True,
+):
+    """
+    Measure within-segment consistency of MappingNet outputs as observation count increases.
+
+    A perfect MappingNet maps all points within each segment to the same (Q, P) values,
+    so within-segment variance should be near zero whenever at least two points are
+    observed in a segment. This function tracks that variance as the number of observed
+    points grows.
+
+    Segments with fewer than two observed points are excluded (variance is not estimable,
+    not zero). Each segment is weighted equally. The variance is in the learned coordinate
+    scale of Q and P.
+
+    For statistical robustness:
+        - Repeats over multiple random permutations of observation order.
+        - For each point count, averages per-trajectory variances across permutations,
+          then computes cross-trajectory statistics (median, BCa CI for median, IQR).
+        - Trajectories are the independent evaluation units.
+        - Validity is assessed from the raw (trajectory, permutation) entries.
+
+    Args:
+        n_permutations: number of random orderings to average over
+        confidence_level: confidence level for BCa CI
+        valid_fraction_threshold: minimum fraction of (trajectory, permutation) entries
+                                  that must be non-NaN at a given point count to include
+                                  it in the plot (default 0.5)
+        rng_seed: random seed for reproducibility (optional)
+
+    Returns:
+        results: dict with variance data, statistics, and metadata
+    """
+    from scipy.stats import bootstrap as scipy_bootstrap
+    import warnings
+
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
+    trajectory_ids = test_id_df['trajectory_id'].values.astype(int)
+    N_traj = len(trajectory_ids)
+
+    # Preload all trajectories and validate shared time structure
+    all_x = []
+    all_u = []
+    all_t = []
+    ref_t = None
+
+    for trajectory_id in trajectory_ids:
+        traj_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=int(trajectory_id))
+        x_i = torch.as_tensor(traj_data['x'].to_numpy(dtype=np.float32), device=device)
+        u_i = torch.as_tensor(traj_data['u'].to_numpy(dtype=np.float32), device=device)
+        t_i = torch.as_tensor(traj_data['t'].to_numpy(dtype=np.float32), device=device)
+
+        if x_i.dim() != 1 or u_i.dim() != 1 or t_i.dim() != 1:
+            raise ValueError(f"Trajectory {trajectory_id}: x, u, t must be 1D, got dims {x_i.dim()}, {u_i.dim()}, {t_i.dim()}")
+
+        if ref_t is None:
+            ref_t = t_i
+        else:
+            if len(t_i) != len(ref_t):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t_i)} points, expected {len(ref_t)}. "
+                    f"All trajectories must have the same number of points."
+                )
+            if not torch.allclose(t_i, ref_t, atol=1e-6):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has different time values. "
+                    f"All trajectories must share the same time values."
+                )
+
+        all_x.append(x_i)
+        all_u.append(u_i)
+        all_t.append(t_i)
+
+    t_np = ref_t.detach().cpu().numpy()
+    num_points = len(t_np)
+    t_max = t_np[-1]
+
+    # Build segment index mapping
+    num_segments = int(np.ceil(t_max / Tmax - 1e-9))
+    num_segments = max(num_segments, 1)
+    segment_indices_dict = {}
+
+    for seg_idx in range(num_segments):
+        t_start = seg_idx * Tmax
+        t_end = min((seg_idx + 1) * Tmax, t_max)
+        if seg_idx == num_segments - 1:
+            t_end = t_max
+
+        if seg_idx == 0:
+            seg_mask = (t_np >= t_start) & (t_np <= t_end)
+        else:
+            seg_mask = (t_np > t_start) & (t_np <= t_end)
+
+        seg_indices = np.where(seg_mask)[0].tolist()
+        if len(seg_indices) > 0:
+            segment_indices_dict[seg_idx] = seg_indices
+
+    # variance_raw[point_count, traj_idx, perm_idx]
+    variance_raw = np.full((num_points, N_traj, n_permutations), np.nan)
+
+    rng = np.random.default_rng(rng_seed)
+
+    for perm_idx in range(n_permutations):
+        random_order = rng.permutation(num_points)
+
+        if verbose:
+            print(f"Permutation {perm_idx + 1}/{n_permutations}")
+
+        for num_obs in range(1, num_points + 1):
+            point_indexes_observed = random_order[:num_obs].tolist()
+            selected_set = set(point_indexes_observed)
+
+            filtered_dict = {
+                k: [val for val in v if val in selected_set]
+                for k, v in segment_indices_dict.items()
+                if any(val in selected_set for val in v)
+            }
+
+            valid_segments = {
+                k: v for k, v in filtered_dict.items() if len(v) >= 2
+            }
+
+            if len(valid_segments) == 0:
+                continue
+
+            for traj_i in range(N_traj):
+                x = all_x[traj_i]
+                u = all_u[traj_i]
+                t = all_t[traj_i]
+
+
+
+
+
+
+
+                segment_variances = []
+                epsilon = 1e-3
+
+                for seg_idx, seg_obs_indices in valid_segments.items():
+                    t_start = seg_idx * Tmax
+                    relative_t = t[seg_obs_indices] - t_start
+
+                    X_final, U_final, _ = mapping_net(x[seg_obs_indices], u[seg_obs_indices], relative_t)
+
+                    X_std = X_final.std(unbiased=True).item()
+                    U_std = U_final.std(unbiased=True).item()
+                    X_mean_abs = X_final.mean().abs().item()
+                    U_mean_abs = U_final.mean().abs().item()
+
+                    X_cv = X_std / (X_mean_abs + epsilon)
+                    U_cv = U_std / (U_mean_abs + epsilon)
+                    segment_variances.append((X_cv + U_cv) / 2)
+
+
+
+                variance_raw[num_obs - 1, traj_i, perm_idx] = np.mean(segment_variances)
+
+    # Average across permutations (NaN-aware)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        variance_avg = np.nanmean(variance_raw, axis=2)
+
+    # === Compute full MappingNet outputs for all trajectories (for Q(t), P(t) plots) ===
+    X_final_list = [[] for _ in range(N_traj)]
+    U_final_list = [[] for _ in range(N_traj)]
+
+    for traj_i in range(N_traj):
+        x = all_x[traj_i]
+        u = all_u[traj_i]
+        t = all_t[traj_i]
+
+        for seg_idx, seg_indices in segment_indices_dict.items():
+            t_start = seg_idx * Tmax
+            relative_t = t[seg_indices] - t_start
+
+            X_final, U_final, _ = mapping_net(x[seg_indices], u[seg_indices], relative_t)
+
+            X_final_list[traj_i].extend(X_final.cpu().detach().numpy())
+            U_final_list[traj_i].extend(U_final.cpu().detach().numpy())
+
+    # Convert to arrays
+    X_final_array = np.array([np.array(xl) for xl in X_final_list])
+    U_final_array = np.array([np.array(ul) for ul in U_final_list])
+
+    # Validity from raw entries
+    valid_fraction_per_point = np.mean(~np.isnan(variance_raw), axis=(1, 2))
+    valid_mask = valid_fraction_per_point >= valid_fraction_threshold
+
+    point_counts = np.arange(1, num_points + 1)
+
+    # Cross-trajectory statistics at each valid point count
+    median_curve = np.full(num_points, np.nan)
+    p25_curve = np.full(num_points, np.nan)
+    p75_curve = np.full(num_points, np.nan)
+
+    for i in range(num_points):
+        if not valid_mask[i]:
+            continue
+        vals = variance_avg[i, :]
+        vals_clean = vals[~np.isnan(vals)]
+        if len(vals_clean) == 0:
+            continue
+        median_curve[i] = np.median(vals_clean)
+        p25_curve[i] = np.percentile(vals_clean, 25)
+        p75_curve[i] = np.percentile(vals_clean, 75)
+
+    # BCa CI for median at final point count with percentile fallback
+    final_vals = variance_avg[-1, :]
+    final_vals_clean = final_vals[~np.isnan(final_vals)]
+
+    ci_method = None
+
+    if len(final_vals_clean) >= 2:
+        try:
+            boot = scipy_bootstrap(
+                data=(final_vals_clean,),
+                statistic=np.median,
+                n_resamples=10000,
+                confidence_level=confidence_level,
+                method='BCa',
+            )
+            ci_method = "BCa"
+            final_ci_lower = boot.confidence_interval.low
+            final_ci_upper = boot.confidence_interval.high
+        except Exception:
+            boot = scipy_bootstrap(
+                data=(final_vals_clean,),
+                statistic=np.median,
+                n_resamples=10000,
+                confidence_level=confidence_level,
+                method='percentile',
+            )
+            ci_method = "percentile"
+            final_ci_lower = boot.confidence_interval.low
+            final_ci_upper = boot.confidence_interval.high
+    else:
+        ci_method = "N/A"
+        final_ci_lower = np.nan
+        final_ci_upper = np.nan
+
+    final_median = np.nanmedian(final_vals)
+    final_q1 = np.nanpercentile(final_vals, 25)
+    final_q3 = np.nanpercentile(final_vals, 75)
+
+    if verbose:
+        print(f"\n=== Within-Segment Consistency at Full Observation ===")
+        print(f"Median across trajectories: {final_median:.6f}")
+        print(f"IQR: [{final_q1:.6f}, {final_q3:.6f}]")
+        if ci_method != "N/A":
+            print(f"{confidence_level*100:.0f}% {ci_method} bootstrap CI for median (over trajectories): "
+                  f"[{final_ci_lower:.6f}, {final_ci_upper:.6f}]")
+        print(f"N_traj={N_traj}, N_obs={num_points}, N_permutations={n_permutations}")
+        if np.any(valid_mask):
+            print(f"First valid point count: {point_counts[valid_mask][0]}")
+
+    results = {
+        'variance_raw': variance_raw,
+        'variance_avg': variance_avg,
+        'point_counts': point_counts,
+        'valid_mask': valid_mask,
+        'valid_fraction_per_point': valid_fraction_per_point,
+        'valid_fraction_threshold': valid_fraction_threshold,
+        'median_curve': median_curve,
+        'p25_curve': p25_curve,
+        'p75_curve': p75_curve,
+        'final_median': final_median,
+        'final_q1': final_q1,
+        'final_q3': final_q3,
+        'final_ci_lower': final_ci_lower,
+        'final_ci_upper': final_ci_upper,
+        'ci_method': ci_method,
+        'segment_indices_dict': segment_indices_dict,
+        'Tmax': Tmax,
+        't': t_np,
+        'rng_seed': rng_seed,
+        'N_traj': N_traj,
+        'N_obs': num_points,
+        'n_permutations': n_permutations,
+        'confidence_level': confidence_level,
+        'X_final_array': X_final_array,
+        'U_final_array': U_final_array,
+    }
+
+    return results
+
+
+
+def plot_variance_results(results, figsize=(20, 6), only_plot_percentage=None, band_alpha=0.3):
+    """
+    Plot results from test_model_variance_with_varying_observed_points.
+
+    Creates three side-by-side plots:
+        1. Q(t) for all trajectories with Tmax segment markers
+        2. P(t) for all trajectories with Tmax segment markers
+        3. Within-segment variance vs number of sampled points
+
+    Args:
+        results: dict returned by test_model_variance_with_varying_observed_points
+        figsize: figure size tuple
+        only_plot_percentage: float or None, fraction of trajectories to plot in Q(t)/P(t)
+        band_alpha: float, transparency of IQR band
+    """
+    point_counts = results['point_counts']
+    valid_mask = results['valid_mask']
+    median_curve = results['median_curve']
+    p25_curve = results['p25_curve']
+    p75_curve = results['p75_curve']
+    final_median = results['final_median']
+    final_q1 = results['final_q1']
+    final_q3 = results['final_q3']
+    final_ci_lower = results['final_ci_lower']
+    final_ci_upper = results['final_ci_upper']
+    ci_method = results['ci_method']
+    confidence_level = results['confidence_level']
+    valid_fraction_threshold = results['valid_fraction_threshold']
+    N_traj = results['N_traj']
+    N_obs = results['N_obs']
+    n_permutations = results['n_permutations']
+    t_np = results['t']
+    Tmax = results['Tmax']
+    X_final_array = results['X_final_array']
+    U_final_array = results['U_final_array']
+
+    if only_plot_percentage is not None:
+        if not (0.0 <= only_plot_percentage <= 1.0):
+            raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
+        n_to_plot = max(1, int(N_traj * only_plot_percentage))
+        plot_indices = np.random.choice(N_traj, size=n_to_plot, replace=False)
+        plot_indices = sorted(plot_indices)
+    else:
+        plot_indices = list(range(N_traj))
+
+    import matplotlib.cm as cm
+    colors = cm.get_cmap('tab10' if N_traj <= 10 else 'tab20' if N_traj <= 20 else 'hsv')(
+        np.linspace(0, 1, N_traj))
+
+    fig, (ax3, ax1, ax2) = plt.subplots(1, 3, figsize=figsize)
+
+    # === Plot 1: Q(t) ===
+    for i in plot_indices:
+        ax1.plot(t_np, X_final_array[i], alpha=0.7, color=colors[i])
+
+    max_time = t_np[-1]
+    current_marker = Tmax
+    first_line = True
+    while current_marker < max_time:
+        label = f'Tmax ({Tmax:.3f})' if first_line else None
+        ax1.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+        current_marker += Tmax
+        first_line = False
+
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel('Q(t)')
+    if only_plot_percentage is not None:
+        ax1.set_title(f"Q(t) — {len(plot_indices)} of {N_traj}\n({only_plot_percentage*100:.1f}%)")
+    else:
+        ax1.set_title(f"Q(t) — All {N_traj} Trajectories")
+    ax1.grid(True, alpha=0.3)
+    if first_line is False:
+        ax1.legend(loc='upper right', fontsize=8)
+
+    # === Plot 2: P(t) ===
+    for i in plot_indices:
+        ax2.plot(t_np, U_final_array[i], alpha=0.7, color=colors[i])
+
+    current_marker = Tmax
+    first_line = True
+    while current_marker < max_time:
+        label = f'Tmax ({Tmax:.3f})' if first_line else None
+        ax2.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+        current_marker += Tmax
+        first_line = False
+
+    ax2.set_xlabel('Time (t)')
+    ax2.set_ylabel('P(t)')
+    if only_plot_percentage is not None:
+        ax2.set_title(f"P(t) — {len(plot_indices)} of {N_traj}\n({only_plot_percentage*100:.1f}%)")
+    else:
+        ax2.set_title(f"P(t) — All {N_traj} Trajectories")
+    ax2.grid(True, alpha=0.3)
+    if first_line is False:
+        ax2.legend(loc='upper right', fontsize=8)
+
+    # === Plot 3: Variance curve ===
+    if not np.any(valid_mask):
+        ax3.text(0.5, 0.5, 'No valid data to plot', transform=ax3.transAxes,
+                 ha='center', va='center', fontsize=12)
+    else:
+        plot_points = point_counts[valid_mask]
+        plot_median = median_curve[valid_mask]
+        plot_p25 = p25_curve[valid_mask]
+        plot_p75 = p75_curve[valid_mask]
+
+        ax3.fill_between(plot_points, plot_p25, plot_p75,
+                         alpha=band_alpha, color='red', label='IQR across trajectories')
+        ax3.plot(plot_points, plot_median, color='red', linewidth=1.5,
+                 label='Median across trajectories')
+
+        ax3.set_xlim(plot_points[0], plot_points[-1])
+
+        # Stats text box
+        ci_str = (f"{confidence_level*100:.0f}% {ci_method} CI for median:\n"
+                  f"[{final_ci_lower:.4f}, {final_ci_upper:.4f}]") if ci_method != "N/A" else "CI: N/A"
+        textstr = (
+            f"At all {N_obs} pts sampled:\n"
+            f"Median [IQR]: {final_median:.4f}\n"
+            f"[{final_q1:.4f}, {final_q3:.4f}]\n"
+            f"{ci_str}"
+        )
+        ax3.text(0.98, 0.98, textstr, transform=ax3.transAxes, fontsize=8,
+                 ha='right', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+        ax3.legend(loc='upper left', fontsize=8)
+
+    ax3.set_xlabel('Sampled Points per Trajectory')
+    ax3.set_ylabel(r'$\frac{1}{2}(\mathrm{CV}(Q)+\mathrm{CV}(P))$')
+    ax3.set_title(f'Within-Segment Consistency\n(N_perm={n_permutations})')
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+
+
 
 def analyze_means_with_constants(
     save_dir_path,
@@ -9465,53 +7825,6 @@ def visualize_trajectory_movements_with_std_ellipses(
 
 
 
-def filter_outliers_mahalanobis(x_list, u_list, threshold=3, return_std=False):
-    """
-    Use Mahalanobis distance - accounts for correlation between x and u.
-    threshold: typically 2-3 (distance in standard deviations)
-    return_std: If True, return (mean_x, mean_y, std_distances)
-    """
-    x_array = np.array(x_list)
-    u_array = np.array(u_list)
-    
-    # Handle edge cases
-    if len(x_array) <= 2:
-        mean_x = np.mean(x_array)
-        mean_u = np.mean(u_array)
-        if return_std:
-            return mean_x, mean_u, 0.0
-        return mean_x, mean_u
-    
-    # Stack into 2D array
-    data = np.column_stack([x_array, u_array])
-    
-    # Calculate mean and covariance
-    mean = np.mean(data, axis=0)
-    cov = np.cov(data.T)
-    
-    # Calculate Mahalanobis distance for each point
-    try:
-        cov_inv = np.linalg.inv(cov)
-        distances = np.array([mahalanobis(point, mean, cov_inv) for point in data])
-        mask = distances < threshold
-        
-        # Make sure we keep at least one point
-        if not np.any(mask):
-            mask = np.ones(len(data), dtype=bool)
-        
-        std_distances = np.std(distances)
-            
-    except np.linalg.LinAlgError:
-        # Fallback if covariance is singular
-        mask = np.ones(len(data), dtype=bool)
-        std_distances = 0.0
-    
-    mean_x = np.mean(x_array[mask])
-    mean_u = np.mean(u_array[mask])
-    
-    if return_std:
-        return mean_x, mean_u, std_distances
-    return mean_x, mean_u
 
 
 
@@ -10167,859 +8480,27 @@ def analyze_mapping_net(mapping_net, return_lists=False):
             "step_2_a_values": step_2_a_values
         }
 
-def test_model_in_all_trajectories_in_df(
-    get_data_from_trajectory_id_function,
-    prediction_loss_function,
-    test_id_df,
-    test_df,
-    mapping_net,
-    inverse_net,
-    device,
-    point_indexes_observed,
-    recreate_and_plot_phase_space=False,
-    plot_specific_portion=None,
-    connect_points=False,
-    plot_trajectories_subsample=None,
-    max_t_training=None,
-    efficiently=True,
-    method = "mahalanobis",
-    threshold=1.0,
-    dt=0.1,
-    alpha=1.0,
-    gamma=1.0,
-    cluster_weight_threshold=0.4,
-    max_n_components=5,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
-    verbose=True
-):
-    """
-    Test model on all trajectories in test_id_df and return dataframe with prediction losses.
-    
-    Args:
-        recreate_and_plot_phase_space: If True, creates pred_test_df with model predictions and plots phase space comparison
-        plot_specific_portion: If not None, can be:
-            - A float (0.0-1.0): plots from 0.0 to this portion
-            - A list [start, end]: plots from start to end portion (both 0.0-1.0)
-        connect_points: If True, connect points within each trajectory with lines
-        plot_trajectories_subsample: If not None, plots only this portion (0.0-1.0) of trajectories, selected from lowest to highest loss_per_sqrt_energy
-        max_t_training: If not None, use autoregressive prediction for trajectories exceeding this time value
-        efficiently: If True, use standard prediction method. If False, use ensemble method.
-        threshold: Mahalanobis distance threshold (only used when efficiently=False)
-        search_range_lower_pct: Search range lower bound (only used when efficiently=False)
-        search_range_upper_pct: Search range upper bound (only used when efficiently=False)
-    
-    Returns:
-        tuple: (result_df, mean_prediction_loss) or (result_df, mean_prediction_loss, pred_test_df) if recreate_and_plot_phase_space=True
-    """
-
-    
-    # Create a copy to avoid modifying the original
-    result_df = test_id_df.copy()
-    
-    # Initialize list to store losses
-    losses = []
-    
-    # Initialize pred_test_df if needed
-    if recreate_and_plot_phase_space:
-        pred_test_df = pd.DataFrame(index=test_df.index, columns=['x', 'u', 't'])
-    
-    # Loop through each trajectory
-    for idx, row in test_id_df.iterrows():
-        trajectory_id = int(row['trajectory_id'])
-        start_index = int(row['start_index'])
-        end_index = int(row['end_index'])
-        
-        test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-
-        if point_indexes_observed:
-            if efficiently:
-                # ==================== EFFICIENT METHOD ====================
-                # Check if we need segmented prediction
-                if max_t_training is not None and t[-1].item() > max_t_training:
-                    # Autoregressive prediction for long trajectories
-                    t_np = t.detach().cpu().numpy()
-                    t_max = t_np[-1]
-                    
-                    x_pred_segments = []
-                    u_pred_segments = []
-                    
-                    # Determine number of segments
-                    num_segments = int(np.ceil(t_max / max_t_training))
-                    
-                    for seg_idx in range(num_segments):
-                        # Determine time range for this segment
-                        t_start = seg_idx * max_t_training
-                        t_end = min((seg_idx + 1) * max_t_training, t_max)
-                        
-                        # Find indices in this time range
-                        # Avoid overlap: use > for subsequent segments, >= for first segment
-                        if seg_idx == 0:
-                            seg_mask = (t_np >= t_start) & (t_np <= t_end)
-                        else:
-                            seg_mask = (t_np > t_start) & (t_np <= t_end)
-                        
-                        seg_indices = np.where(seg_mask)[0]
-                        
-                        if len(seg_indices) == 0:
-                            continue
-                        
-                        # Get data for this segment
-                        t_seg = t[seg_indices]
-                        t_seg_relative = t_seg - t_start
-                        
-                        if seg_idx == 0:
-                            # First segment: use actual observed points
-                            # Filter observed indices to only those in this segment
-                            obs_in_seg = [i for i in point_indexes_observed if i in seg_indices]
-                            
-                            if len(obs_in_seg) > 0:
-                                # Get relative positions within the segment
-                                obs_indices_relative = [np.where(seg_indices == i)[0][0] for i in obs_in_seg]
-                                
-                                X_final, U_final, t_final = mapping_net(
-                                    x[obs_in_seg], 
-                                    u[obs_in_seg], 
-                                    t_seg_relative[obs_indices_relative]
-                                )
-                                X_final_mean = X_final.mean()
-                                U_final_mean = U_final.mean()
-                                
-                                # Create full shape tensors for this segment
-                                X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                                U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                                
-                                # Place observed values at their relative positions
-                                for i, rel_idx in enumerate(obs_indices_relative):
-                                    X_final_full_shape_seg[rel_idx] = X_final[i]
-                                    U_final_full_shape_seg[rel_idx] = U_final[i]
-                            else:
-                                # No observations in first segment - use original observations with t=0
-                                X_final, U_final, t_final = mapping_net(
-                                    x[point_indexes_observed], 
-                                    u[point_indexes_observed], 
-                                    torch.zeros(len(point_indexes_observed), device=device, dtype=torch.float32)
-                                )
-                                X_final_mean = X_final.mean()
-                                U_final_mean = U_final.mean()
-                                
-                                X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                                U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                                X_final_full_shape_seg[0] = X_final[0]
-                                U_final_full_shape_seg[0] = U_final[0]
-                        else:
-                            # Subsequent segments: use last prediction from previous segment as observation at t=0
-                            x_obs = x_pred_segments[-1][-1].unsqueeze(0)
-                            u_obs = u_pred_segments[-1][-1].unsqueeze(0)
-                            t_obs = torch.tensor([0.0], device=device, dtype=torch.float32)
-                            
-                            X_final, U_final, t_final = mapping_net(x_obs, u_obs, t_obs)
-                            X_final_mean = X_final.mean()
-                            U_final_mean = U_final.mean()
-                            
-                            # Create full shape tensors for this segment
-                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                            
-                            # Place the observation at index 0 (t=0 in relative time)
-                            X_final_full_shape_seg[0] = X_final[0]
-                            U_final_full_shape_seg[0] = U_final[0]
-                        
-                        # Predict for this segment using relative times
-                        x_pred_seg, u_pred_seg, _ = inverse_net(X_final_full_shape_seg, U_final_full_shape_seg, t_seg_relative)
-                        
-                        x_pred_segments.append(x_pred_seg)
-                        u_pred_segments.append(u_pred_seg)
-                    
-                    # Concatenate all segments
-                    x_pred = torch.cat(x_pred_segments, dim=0)
-                    u_pred = torch.cat(u_pred_segments, dim=0)
-                else:
-                    # Original logic for trajectories within max_t_training
-                    X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-                    X_final_mean = X_final.mean()
-                    U_final_mean = U_final.mean()
-                    X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-                    U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-                    # Replace values at observed indices with actual mapped values
-                    X_final_full_shape[point_indexes_observed] = X_final
-                    U_final_full_shape[point_indexes_observed] = U_final
-                    x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
-            
-            else:
-                # ==================== ENSEMBLE METHOD ====================
-                if max_t_training is None:
-                    raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
-                
-                if method == "mahalanobis":
-                    x_pred, u_pred, _ = ensemble_autoregressive_prediction_mahalanobis(
-                        x=x,
-                        u=u,
-                        t=t,
-                        point_indexes_observed=point_indexes_observed,
-                        mapping_net=mapping_net,
-                        inverse_net=inverse_net,
-                        device=device,
-                        max_t_training=max_t_training,
-                        threshold=threshold,
-                        search_range_lower_pct=search_range_lower_pct,
-                        search_range_upper_pct=search_range_upper_pct,
-                        verbose=False  # Don't print ensemble internal details
-                    )
-
-                elif method == "gaussian_mixture":
-                    x_pred, u_pred, _ =   ensemble_autoregressive_prediction_gaussian_mixture(
-                        x=x, 
-                        u=u, 
-                        t=t, 
-                        point_indexes_observed=point_indexes_observed,
-                        mapping_net=mapping_net,
-                        inverse_net=inverse_net,
-                        device=device,
-                        max_t_training=max_t_training,
-                        dt=dt,
-                        alpha=alpha, 
-                        gamma=gamma,
-                        cluster_weight_threshold=cluster_weight_threshold,
-                        max_n_components=max_n_components,
-                        search_range_lower_pct=search_range_lower_pct,
-                        search_range_upper_pct=search_range_upper_pct,
-                        verbose=False
-                    )
-                elif method == "gaussian_mixture_simple":
-                    x_pred, u_pred, _ =   ensemble_autoregressive_prediction_gaussian_mixture_simple(
-                        x=x, 
-                        u=u, 
-                        t=t, 
-                        point_indexes_observed=point_indexes_observed,
-                        mapping_net=mapping_net,
-                        inverse_net=inverse_net,
-                        device=device,
-                        max_t_training=max_t_training,
-                        max_n_components=max_n_components,
-                        search_range_lower_pct=search_range_lower_pct,
-                        search_range_upper_pct=search_range_upper_pct,
-                        verbose=False
-                    )
-                else:
-                    raise ValueError("Not correctly specified method, try one of: mahalanobis, gaussian_mixture, gaussian_mixture_simple")
-            
-            pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
-            losses.append(pred_loss_full_trajectory.item())
-            
-            # Store predictions if needed
-            if recreate_and_plot_phase_space:
-                # Convert predictions to numpy and store at the correct indexes
-                x_pred_numpy = x_pred.detach().cpu().numpy()
-                u_pred_numpy = u_pred.detach().cpu().numpy()
-                t_numpy = t.detach().cpu().numpy()
-                
-                pred_test_df.loc[start_index:end_index-1, 'x'] = x_pred_numpy
-                pred_test_df.loc[start_index:end_index-1, 'u'] = u_pred_numpy
-                pred_test_df.loc[start_index:end_index-1, 't'] = t_numpy
-        else:
-            losses.append(np.nan)
-    
-    # Add the losses as a new column
-    result_df['prediction_loss'] = losses
-    
-    # Add loss per energy column
-    result_df['loss_per_sqrt_energy'] = result_df['prediction_loss'] / np.sqrt(result_df['energy'])
-    
-    # Select only the required columns and sort by energy
-    result_df = result_df[['trajectory_id', 'energy', 'prediction_loss', 'loss_per_sqrt_energy']].sort_values('energy')
-    
-    # Print the dataframe if needed
-    if verbose==True:
-        print(result_df)
-
-    mean_prediction_loss = np.mean(result_df['prediction_loss'])
-
-    if verbose==True:
-        print(f"Mean prediction loss over full dataframe: {mean_prediction_loss:.4f}")
-    
-    # Create first plot
-    if verbose==True:
-        plt.figure(figsize=(10, 6))
-        plt.plot(result_df['energy'], result_df['prediction_loss'], marker='o', linestyle='-')
-        plt.xlabel('Energy')
-        plt.ylabel('Prediction Loss')
-        plt.title('Prediction Loss vs Energy')
-        plt.grid(True)
-        plt.show()
-
-        # Create second plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(result_df['energy'], result_df['loss_per_sqrt_energy'], marker='o', linestyle='-')
-        plt.xlabel('Energy')
-        plt.ylabel('Loss per sqrt Energy')
-        plt.title('Loss per sqrt Energy vs Energy')
-        plt.grid(True)
-        plt.show()
-    
-    # Create phase space comparison plots if requested
-    if recreate_and_plot_phase_space:
-        # Determine which trajectories to plot
-        if plot_trajectories_subsample is not None:
-            # Sort by loss_per_sqrt_energy and select top portion
-            result_df_sorted_by_loss = result_df.sort_values('loss_per_sqrt_energy')
-            num_trajectories_to_plot = int(np.ceil(len(result_df) * plot_trajectories_subsample))
-            selected_trajectory_ids = set(result_df_sorted_by_loss.head(num_trajectories_to_plot)['trajectory_id'].values)
-            trajectories_to_plot = test_id_df[test_id_df['trajectory_id'].isin(selected_trajectory_ids)]
-        else:
-            trajectories_to_plot = test_id_df
-        
-        # Create a colormap for trajectories
-        num_trajectories = len(trajectories_to_plot)
-        if verbose==True:
-            cmap = plt.cm.get_cmap('tab20')  # Use tab20 for distinct colors, or 'hsv' for more colors
-            if num_trajectories > 20:
-                cmap = plt.cm.get_cmap('hsv')  # Use hsv for many trajectories
-
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-        
-        # Plot each trajectory separately with its own color
-        if verbose==True:
-            for traj_idx, (idx, row) in enumerate(trajectories_to_plot.iterrows()):
-                start_index = int(row['start_index'])
-                end_index = int(row['end_index'])
-                trajectory_length = end_index - start_index
-
-                # Determine which indices to plot for this trajectory
-                if plot_specific_portion is not None:
-                    # Check if it's a list or a single float
-                    if isinstance(plot_specific_portion, list):
-                        # List: [start_portion, end_portion]
-                        start_portion, end_portion = plot_specific_portion
-                        start_point = int(trajectory_length * start_portion)
-                        end_point = int(trajectory_length * end_portion)
-                        trajectory_indices = list(range(start_index + start_point, start_index + end_point))
-                    else:
-                        # Float: from 0.0 to the specified portion
-                        num_points_to_plot = int(trajectory_length * plot_specific_portion)
-                        trajectory_indices = list(range(start_index, start_index + num_points_to_plot))
-                else:
-                    trajectory_indices = list(range(start_index, end_index))
-
-                # Get color for this trajectory
-                if verbose==True:
-                    color = cmap(traj_idx / num_trajectories)
-
-                # Extract data for this trajectory
-                x_true = test_df.loc[trajectory_indices, 'x'].values
-                u_true = test_df.loc[trajectory_indices, 'u'].values
-                x_pred = pred_test_df.loc[trajectory_indices, 'x'].values
-                u_pred = pred_test_df.loc[trajectory_indices, 'u'].values
-
-                # Left plot: True phase space
-                if verbose==True:
-                    if connect_points:
-                        ax1.plot(x_true, u_true, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
-                    else:
-                        ax1.scatter(x_true, u_true, color=color, alpha=0.6, s=10)
-
-                    # Right plot: Predicted phase space
-                    if connect_points:
-                        ax2.plot(x_pred, u_pred, '-o', color=color, alpha=0.6, markersize=3, linewidth=1)
-                    else:
-                        ax2.scatter(x_pred, u_pred, color=color, alpha=0.6, s=10)
-        if verbose==True:
-            ax1.set_xlabel('x')
-            ax1.set_ylabel('u')
-            ax1.set_title('True Phase Space (Labels)')
-            ax1.grid(True)
-            
-            ax2.set_xlabel('x')
-            ax2.set_ylabel('u')
-            ax2.set_title('Predicted Phase Space (Model)')
-            ax2.grid(True)
-            
-            plt.tight_layout()
-            plt.show()
-    
-    if recreate_and_plot_phase_space:
-        return result_df, mean_prediction_loss, pred_test_df
-    else:
-        return result_df, mean_prediction_loss
-
-def test_model_variance_in_all_trajectories_in_df(
-    get_data_from_trajectory_id_function,
-    test_id_df,
-    test_df,
-    mapping_net,
-    device,
-    point_indexes_observed
-):
-    """
-    Test model on all trajectories in test_id_df and return dataframe with prediction losses.
-    
-    Returns:
-        pd.DataFrame: DataFrame with columns ['trajectory_id', 'energy', 'prediction_loss', 'loss_per_energy'], sorted by energy
-    """
-
-    
-    # Create a copy to avoid modifying the original
-    result_df = test_id_df.copy()
-    
-    # Initialize list to store losses
-    variances = []
-    
-    # Loop through each trajectory
-    for idx, row in test_id_df.iterrows():
-        trajectory_id = int(row['trajectory_id'])
-        
-        test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-
-        if point_indexes_observed:
-            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-        else:
-            X_final, U_final, t_final = mapping_net(x, u, t)
-        
-        if len(X_final) > 1:
-            X_var = X_final.var(unbiased=True)
-            U_var = U_final.var(unbiased=True)
-        else:
-            X_var = torch.tensor(0.0, device=X_final.device)
-            U_var = torch.tensor(0.0, device=U_final.device)
-        
-        total_variance = X_var + U_var
-
-        variances.append(total_variance.item())
-
-    
-    # Add the variances as a new column
-    result_df['variance_loss'] = variances
-    
-    # Add loss per energy column
-    result_df['variance_per_sqrt_energy'] = result_df['variance_loss'] / np.sqrt(result_df['energy'])
-    
-    # Select only the required columns and sort by energy
-    result_df = result_df[['trajectory_id', 'energy', 'variance_loss', 'variance_per_sqrt_energy']].sort_values('energy')
-    
-    # Print the dataframe
-    print(result_df)
-
-    mean_variance_loss = np.mean(result_df['variance_loss'])
-
-    print(f"Mean prediction loss over full dataframe: {mean_variance_loss:.4f}")
-    
-    # Create first plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['energy'], result_df['variance_loss'], marker='o', linestyle='-')
-    plt.xlabel('Energy')
-    plt.ylabel('Variance Loss')
-    plt.title('Variance Loss vs Energy')
-    plt.grid(True)
-    plt.show()
-    
-    # Create second plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['energy'], result_df['variance_per_sqrt_energy'], marker='o', linestyle='-')
-    plt.xlabel('Energy')
-    plt.ylabel('Loss per sqrt Energy')
-    plt.title('Variance per sqrt Energy vs Energy')
-    plt.grid(True)
-    plt.show()
-    
-    return result_df, mean_variance_loss
-
-
-
-    
-
-
-def plot_prediction_losses(result_dfs):
-    """
-    Plot prediction loss vs energy from multiple result dataframes.
-    
-    Args:
-        result_dfs: List of dataframes with 'energy' and 'prediction_loss' columns
-    """
-
-    
-    plt.figure(figsize=(10, 6))
-    
-    # Check if we should add legend for in/out of distribution
-    add_legend = False
-    labels = [None] * len(result_dfs)
-    
-    if len(result_dfs) == 2:
-        df1, df2 = result_dfs[0], result_dfs[1]
-        min1, max1 = df1['energy'].min(), df1['energy'].max()
-        min2, max2 = df2['energy'].min(), df2['energy'].max()
-        
-        if min1 > max2:
-            # df1 has higher energies (out of distribution)
-            labels = ['Out of distribution', 'In distribution']
-            add_legend = True
-        elif min2 > max1:
-            # df2 has higher energies (out of distribution)
-            labels = ['In distribution', 'Out of distribution']
-            add_legend = True
-    
-    for i, df in enumerate(result_dfs):
-        sorted_df = df.sort_values('energy')
-        plt.plot(sorted_df['energy'], sorted_df['prediction_loss'], 
-                marker='o', linestyle='-', alpha=0.7, label=labels[i])
-    
-    plt.xlabel('Energy')
-    plt.ylabel('Prediction Loss')
-    plt.title('Prediction Loss vs Energy')
-    plt.grid(True)
-    
-    if add_legend:
-        plt.legend()
-    
-    plt.show()
-
-
-def plot_variance_losses(result_dfs):
-    """
-    Plot Variance loss vs energy from multiple result dataframes.
-    
-    Args:
-        result_dfs: List of dataframes with 'energy' and 'Variance_loss' columns
-    """
-
-    
-    plt.figure(figsize=(10, 6))
-    
-    # Check if we should add legend for in/out of distribution
-    add_legend = False
-    labels = [None] * len(result_dfs)
-    
-    if len(result_dfs) == 2:
-        df1, df2 = result_dfs[0], result_dfs[1]
-        min1, max1 = df1['energy'].min(), df1['energy'].max()
-        min2, max2 = df2['energy'].min(), df2['energy'].max()
-        
-        if min1 > max2:
-            # df1 has higher energies (out of distribution)
-            labels = ['Out of distribution', 'In distribution']
-            add_legend = True
-        elif min2 > max1:
-            # df2 has higher energies (out of distribution)
-            labels = ['In distribution', 'Out of distribution']
-            add_legend = True
-    
-    for i, df in enumerate(result_dfs):
-        sorted_df = df.sort_values('energy')
-        plt.plot(sorted_df['energy'], sorted_df['variance_loss'], 
-                marker='o', linestyle='-', alpha=0.7, label=labels[i])
-    
-    plt.xlabel('Energy')
-    plt.ylabel('Variance Loss')
-    plt.title('Variance Loss vs Energy')
-    plt.grid(True)
-    
-    if add_legend:
-        plt.legend()
-    
-    plt.show()
-
-
-def test_model_with_varying_observed_points(
-    get_data_from_trajectory_id_function,
-    prediction_loss_function,
-    test_id_df,
-    test_df,
-    mapping_net,
-    inverse_net,
-    device
-):
-    """
-    Test model by gradually increasing the number of observed points and track mean loss.
-    Points are randomly sampled without replacement.
-    
-    Returns:
-        pd.DataFrame: DataFrame with columns ['num_observed_points', 'mean_loss'], sorted by num_observed_points
-    """
-
-    
-    # Get a sample trajectory to determine the number of available points
-    sample_trajectory_id = int(test_id_df.iloc[0]['trajectory_id'])
-    sample_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=sample_trajectory_id)
-    num_points_available = len(sample_data['x'])
-    
-    num_observed_points_list = []
-    mean_losses_list = []
-    
-    # Create a random permutation of all available indices
-    random_order = np.random.permutation(num_points_available)
-    
-    # Loop from 1 point to all points
-    for num_points in range(1, num_points_available + 1):
-        # Take the first num_points from the random permutation (sampling without replacement)
-        point_indexes_observed = random_order[:num_points].tolist()
-        
-        # Calculate losses for all trajectories with these observed points
-        losses = []
-        
-        for idx, row in test_id_df.iterrows():
-            trajectory_id = int(row['trajectory_id'])
-            
-            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-            
-            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-            X_final_mean = X_final.mean()
-            U_final_mean = U_final.mean()
-            X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-            U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-            # Replace values at observed indices with actual mapped values
-            X_final_full_shape[point_indexes_observed] = X_final
-            U_final_full_shape[point_indexes_observed] = U_final
-
-            x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
-            pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
-            losses.append(pred_loss_full_trajectory.item())
-        
-        # Calculate mean loss for this number of observed points
-        mean_losses_of_dataset = np.mean(losses)
-        
-        num_observed_points_list.append(num_points)
-        mean_losses_list.append(mean_losses_of_dataset)
-    
-    # Create dataframe
-    result_df = pd.DataFrame({
-        'num_observed_points': num_observed_points_list,
-        'mean_loss': mean_losses_list
-    }).sort_values('num_observed_points')
-
-    print(result_df.head(10))
-    
-    # Create plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['num_observed_points'], result_df['mean_loss'], marker='o', linestyle='-')
-    plt.xlabel('Number of Observed Points')
-    plt.ylabel('Mean Loss over full df')
-    plt.title('Mean Loss over full df vs Number of Observed Points')
-    plt.grid(True)
-    plt.show()
-    
-    return result_df
-
-
-
-
-def test_model_variance_with_varying_observed_points(
-    get_data_from_trajectory_id_function,
-    test_id_df,
-    test_df,
-    mapping_net,
-    device
-):
-    """
-    Test model by gradually increasing the number of observed points and track mean loss.
-    Points are randomly sampled without replacement.
-    
-    Returns:
-        pd.DataFrame: DataFrame with columns ['num_observed_points', 'mean_loss'], sorted by num_observed_points
-    """
-
-    
-    # Get a sample trajectory to determine the number of available points
-    sample_trajectory_id = int(test_id_df.iloc[0]['trajectory_id'])
-    sample_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=sample_trajectory_id)
-    num_points_available = len(sample_data['x'])
-    
-    num_observed_points_list = []
-    mean_variances_list = []
-    
-    # Create a random permutation of all available indices
-    random_order = np.random.permutation(num_points_available)
-    
-    # Loop from 1 point to all points
-    for num_points in range(1, num_points_available + 1):
-        # Take the first num_points from the random permutation (sampling without replacement)
-        point_indexes_observed = random_order[:num_points].tolist()
-        
-        # Calculate losses for all trajectories with these observed points
-        variances = []
-        
-        for idx, row in test_id_df.iterrows():
-            trajectory_id = int(row['trajectory_id'])
-            
-            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-            
-            X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-            if len(X_final) > 1:
-                X_var = X_final.var(unbiased=True)
-                U_var = U_final.var(unbiased=True)
-            else:
-                X_var = torch.tensor(0.0, device=X_final.device)
-                U_var = torch.tensor(0.0, device=U_final.device)
-
-            total_variance = X_var + U_var
-
-            variances.append(total_variance.item())
-        
-        # Calculate mean loss for this number of observed points
-        mean_variances_of_dataset = np.mean(variances)
-        
-        num_observed_points_list.append(num_points)
-        mean_variances_list.append(mean_variances_of_dataset)
-    
-    # Create dataframe
-    result_df = pd.DataFrame({
-        'num_observed_points': num_observed_points_list,
-        'mean_variance': mean_variances_list
-    }).sort_values('num_observed_points')
-
-    print(result_df.head(10))
-    
-    # Create plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['num_observed_points'], result_df['mean_variance'], marker='o', linestyle='-')
-    plt.xlabel('Number of Observed Points')
-    plt.ylabel('Mean Variance over full df')
-    plt.title('Mean Variance over full df vs Number of Observed Points')
-    plt.grid(True)
-    plt.show()
-    
-    return result_df
-
-def test_model_variance_with_varying_observed_points_multiple_periods(
-    get_data_from_trajectory_id_function,
-    test_id_df,
-    test_df,
-    mapping_net,
-    max_t_training,
-    device
-):
-    """
-    Test model by gradually increasing the number of observed points and track mean loss.
-    Points are randomly sampled without replacement.
-    
-    Returns:
-        pd.DataFrame: DataFrame with columns ['num_observed_points', 'mean_loss'], sorted by num_observed_points
-    """
-
-    
-    # Get a sample trajectory to determine the number of available points
-    sample_trajectory_id = int(test_id_df.iloc[0]['trajectory_id'])
-    sample_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=sample_trajectory_id)
-    sample_t = torch.as_tensor(sample_data['t'].to_numpy(dtype=np.float32), device=device)
-    num_points_available = len(sample_data['x'])
-    
-    num_observed_points_list = []
-    mean_variances_list = []
-    segment_indeces_dict = {}
-    
-    if max_t_training is not None and sample_t[-1].item() > max_t_training:
-        # Autoregressive prediction for long trajectories
-        t_np = sample_t.detach().cpu().numpy()
-        t_max = t_np[-1]
-        
 
         
-        # Determine number of segments
-        num_segments = int(np.ceil(t_max / max_t_training))
-        
-        for seg_idx in range(num_segments):
-            # Determine time range for this segment
-            t_start = seg_idx * max_t_training
-            t_end = min((seg_idx + 1) * max_t_training, t_max)
-            
-            # Find indices in this time range
-            # Avoid overlap: use > for subsequent segments, >= for first segment
-            if seg_idx == 0:
-                seg_mask = (t_np >= t_start) & (t_np <= t_end)
-            else:
-                seg_mask = (t_np > t_start) & (t_np <= t_end)
-            
-            seg_indices = np.where(seg_mask)[0].tolist()
-            
-            if len(seg_indices) == 0:
-                continue
-            
-            segment_indeces_dict[seg_idx] = seg_indices
 
 
-    # Create a random permutation of all available indices
-    random_order = np.random.permutation(num_points_available)
+
+
+
+
+
     
-    # Loop from 1 point to all points
-    for num_points in range(1, num_points_available + 1):
-        # Take the first num_points from the random permutation (sampling without replacement)
-        point_indexes_observed = random_order[:num_points].tolist()
-        
-        selected_set = set(point_indexes_observed)
 
-        # 2. Create the new dictionary using a dictionary comprehension
-        filtered_dict = {
-            k: [val for val in v if val in selected_set]
-            for k, v in segment_indeces_dict.items()
-            # Only include keys where the intersection is not empty
-            if any(val in selected_set for val in v)
-        }
-        
-        # Calculate losses for all trajectories with these observed points
-        variances = []
-        
-        for idx, row in test_id_df.iterrows():
-            trajectory_id = int(row['trajectory_id'])
-            
-            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-            
-            total_variance = torch.tensor(0.0, device=x.device)
 
-            for available_segments in filtered_dict.keys():
-                segment_indeces = filtered_dict[available_segments]
-                relative_t = t[segment_indeces] - available_segments * max_t_training
-                X_final, U_final, t_final = mapping_net(x[segment_indeces], u[segment_indeces], relative_t)
-                
-                if len(X_final) > 1:
-                    X_var = X_final.var(unbiased=True)
-                    U_var = U_final.var(unbiased=True)
-                else:
-                    X_var = torch.tensor(0.0, device=X_final.device)
-                    U_var = torch.tensor(0.0, device=U_final.device)
 
-                total_segment_variance = X_var + U_var
-                total_variance += total_segment_variance
-            total_variance /= len(filtered_dict.keys())
 
-            variances.append(total_variance.item())
-        
-        # Calculate mean loss for this number of observed points
-        mean_variances_of_dataset = np.mean(variances)
-        
-        num_observed_points_list.append(num_points)
-        mean_variances_list.append(mean_variances_of_dataset)
-    
-    # Create dataframe
-    result_df = pd.DataFrame({
-        'num_observed_points': num_observed_points_list,
-        'mean_variance': mean_variances_list
-    }).sort_values('num_observed_points')
 
-    print(result_df.head(10))
-    
-    # Create plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(result_df['num_observed_points'], result_df['mean_variance'], marker='o', linestyle='-')
-    plt.xlabel('Number of Observed Points')
-    plt.ylabel('Mean Variance over full df')
-    plt.title('Mean Variance over full df vs Number of Observed Points')
-    plt.grid(True)
-    plt.show()
-    
-    return result_df
+
+
+
+
+
+
 
 
 
@@ -11158,126 +8639,196 @@ def check_canonical_transformation(symplectic_result, tolerance=1e-5):
         print(f"  Maximum error across all samples: {max_error:.2e}")
 
 
-def test_canonical_tranformation_on_trajectory(get_data_from_trajectory_id_function, compute_jacobian_functional_function, compute_symplectic_product_function, check_canonical_transformation_function, tolerance, test_id_df, test_df, trajectory_id, mapping_net, inverse_net, device):
+def test_canonical_transformation_on_trajectory(
+    get_data_from_trajectory_id_function,
+    compute_jacobian_functional_function,
+    compute_symplectic_product_function,
+    test_id_df,
+    test_df,
+    trajectory_id,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    tolerance=1e-5,
+    verbose=True,
+):
+    """
+    Test whether MappingNet and InverseNet perform symplectic (canonical) forward passes
+    on a single trajectory, using per-segment relative times.
+
+    For each segment, computes the Jacobian of the transformation with respect to (q, p)
+    for MappingNet and with respect to (Q, P) for InverseNet, then checks whether
+    M^T * Omega * M = Omega at each point.
+
+    Returns:
+        results: dict with per-point residuals and summary statistics for both networks
+    """
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
     test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
     x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
     u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
     t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
 
-    jacobian = compute_jacobian_functional_function(mapping_net, x=x, u=u, t=t)
-    result= compute_symplectic_product_function(jacobian)
+    if x.dim() != 1 or u.dim() != 1 or t.dim() != 1:
+        raise ValueError(f"x, u, t must be 1-dimensional tensors, got dims {x.dim()}, {u.dim()}, {t.dim()}")
 
-    print("For the mapping network:")
-    check_canonical_transformation_function(result, tolerance=tolerance)
+    t_np = t.detach().cpu().numpy()
+    t_max = t_np[-1]
 
-    X_final, U_final, t_final = mapping_net(x, u, t)
-    X_final_mean = X_final.mean()
-    U_final_mean = U_final.mean()
-    X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-    U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
+    # Build segments
+    num_segments = int(np.ceil(t_max / Tmax - 1e-9))
+    num_segments = max(num_segments, 1)
+
+    mapping_jacobians = []
+    inverse_jacobians = []
+
+    for seg_idx in range(num_segments):
+        t_start = seg_idx * Tmax
+        t_end = min((seg_idx + 1) * Tmax, t_max)
+        if seg_idx == num_segments - 1:
+            t_end = t_max
+
+        if seg_idx == 0:
+            seg_mask = (t_np >= t_start) & (t_np <= t_end)
+        else:
+            seg_mask = (t_np > t_start) & (t_np <= t_end)
+
+        seg_indices = np.where(seg_mask)[0]
+
+        if len(seg_indices) == 0:
+            continue
+
+        x_seg = x[seg_indices]
+        u_seg = u[seg_indices]
+        t_seg_relative = t[seg_indices] - t_start
+
+        jac_mapping = compute_jacobian_functional_function(mapping_net, x=x_seg, u=u_seg, t=t_seg_relative)
+        mapping_jacobians.append(jac_mapping)
+
+        Q_seg, P_seg, _ = mapping_net(x_seg, u_seg, t_seg_relative)
+
+        jac_inverse = compute_jacobian_functional_function(inverse_net, x=Q_seg.detach(), u=P_seg.detach(), t=t_seg_relative)
+        inverse_jacobians.append(jac_inverse)
+
+    all_mapping_jac = torch.cat(mapping_jacobians, dim=2)
+    all_inverse_jac = torch.cat(inverse_jacobians, dim=2)
+
+    mapping_symplectic = compute_symplectic_product_function(all_mapping_jac)
+    inverse_symplectic = compute_symplectic_product_function(all_inverse_jac)
+
+    # Compute per-point residuals: ||M^T Omega M - Omega||_max for each point
+    batch_size = mapping_symplectic.shape[2]
+    device_sym = mapping_symplectic.device
+    dtype_sym = mapping_symplectic.dtype
+
+    Omega = torch.tensor([[0.0, 1.0],
+                          [-1.0, 0.0]],
+                         device=device_sym,
+                         dtype=dtype_sym)
+
+    # Vectorized residual computation
+    diff_mapping = torch.abs(mapping_symplectic - Omega.unsqueeze(-1))
+    mapping_residuals = diff_mapping.amax(dim=(0, 1))
+
+    diff_inverse = torch.abs(inverse_symplectic - Omega.unsqueeze(-1))
+    inverse_residuals = diff_inverse.amax(dim=(0, 1))
+
+    mapping_residuals_np = mapping_residuals.detach().cpu().numpy()
+    inverse_residuals_np = inverse_residuals.detach().cpu().numpy()
+
+    # Statistics
+    def compute_residual_stats(residuals, name):
+        return {
+            'mean': np.mean(residuals),
+            'std': np.std(residuals, ddof=1) if len(residuals) > 1 else 0.0,
+            'median': np.median(residuals),
+            'max': np.max(residuals),
+            'min': np.min(residuals),
+            'q25': np.percentile(residuals, 25),
+            'q75': np.percentile(residuals, 75),
+            'n_failing': int(np.sum(residuals > tolerance)),
+            'n_total': len(residuals),
+            'fraction_passing': float(np.mean(residuals <= tolerance)),
+        }
+
+    mapping_stats = compute_residual_stats(mapping_residuals_np, 'mapping')
+    inverse_stats = compute_residual_stats(inverse_residuals_np, 'inverse')
+
+    if verbose:
+        print(f"=== Canonical Transformation Test — Trajectory {trajectory_id} ===")
+        print(f"({num_segments} segment(s), {batch_size} total points, tolerance={tolerance:.1e})\n")
+
+        print("MappingNet: d(Q,P)/d(q,p)")
+        if mapping_stats['n_failing'] == 0:
+            print(f"  ✓ All {batch_size} points pass (max residual: {mapping_stats['max']:.2e})")
+        else:
+            print(f"  ✗ {mapping_stats['n_failing']}/{batch_size} points fail "
+                  f"({mapping_stats['fraction_passing']*100:.1f}% pass)")
+        print(f"  Residual max|M^T Ω M - Ω| per point:")
+        print(f"    Mean:   {mapping_stats['mean']:.2e} (std={mapping_stats['std']:.2e})")
+        print(f"    Median: {mapping_stats['median']:.2e} [IQR: {mapping_stats['q25']:.2e}, {mapping_stats['q75']:.2e}]")
+        print(f"    Min:    {mapping_stats['min']:.2e}")
+        print(f"    Max:    {mapping_stats['max']:.2e}")
+
+        print(f"\nInverseNet: d(q,p)/d(Q,P)")
+        if inverse_stats['n_failing'] == 0:
+            print(f"  ✓ All {batch_size} points pass (max residual: {inverse_stats['max']:.2e})")
+        else:
+            print(f"  ✗ {inverse_stats['n_failing']}/{batch_size} points fail "
+                  f"({inverse_stats['fraction_passing']*100:.1f}% pass)")
+        print(f"  Residual max|M^T Ω M - Ω| per point:")
+        print(f"    Mean:   {inverse_stats['mean']:.2e} (std={inverse_stats['std']:.2e})")
+        print(f"    Median: {inverse_stats['median']:.2e} [IQR: {inverse_stats['q25']:.2e}, {inverse_stats['q75']:.2e}]")
+        print(f"    Min:    {inverse_stats['min']:.2e}")
+        print(f"    Max:    {inverse_stats['max']:.2e}")
+
+        # --- Table row values: M max | M median | M^-1 max | M^-1 median ---
+        print("\n=== Table row (Task = trajectory {}) ===".format(trajectory_id))
+        print(f"  M  max    = {mapping_stats['max']:.2e}")
+        print(f"  M  median = {mapping_stats['median']:.2e}")
+        print(f"  M^-1 max    = {inverse_stats['max']:.2e}")
+        print(f"  M^-1 median = {inverse_stats['median']:.2e}")
+        print("  LaTeX: "
+              f"{mapping_stats['max']:.2e} & {mapping_stats['median']:.2e} & "
+              f"{inverse_stats['max']:.2e} & {inverse_stats['median']:.2e} \\\\")
+
+    results = {
+        'mapping_residuals': mapping_residuals_np,
+        'inverse_residuals': inverse_residuals_np,
+        'mapping_stats': mapping_stats,
+        'inverse_stats': inverse_stats,
+        'mapping_symplectic': mapping_symplectic,
+        'inverse_symplectic': inverse_symplectic,
+        't': t_np,
+        'trajectory_id': trajectory_id,
+        'tolerance': tolerance,
+        'num_segments': num_segments,
+        'n_points': batch_size,
+    }
+
+    return results
 
 
-    inverse_jacobian = compute_jacobian_functional_function(inverse_net, x=X_final_full_shape, u=U_final_full_shape, t=t_final)
-    inverse_result= compute_symplectic_product_function(inverse_jacobian)
-    print("For the inverse network:")
-    check_canonical_transformation_function(inverse_result, tolerance=tolerance)
 
-
-def test_model_in_all_trajectories_with_different_single_observation_in_df(
-    get_data_from_trajectory_id_function,
-    prediction_loss_function,
-    test_id_df,
-    test_df,
-    mapping_net,
-    inverse_net,
-    device,
-    range_max
-
-
-):
-    """
-    Test model on all trajectories in test_id_df with a different single observation and return plot and dictionary
-    """
-
-    
-
-    mean_losses = {}
-    for observed_point in range(0,range_max,1):
-        losses = []
-        # Loop through each trajectory
-        for idx, row in test_id_df.iterrows():
-            trajectory_id = int(row['trajectory_id'])
-
-
-            test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-            x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-            u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-            t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-
-            if observed_point:
-                X_final, U_final, t_final = mapping_net(x[observed_point], u[observed_point], t[observed_point])
-                X_final_mean = X_final.mean()
-                U_final_mean = U_final.mean()
-                X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-                U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-                # Replace values at observed indices with actual mapped values
-                X_final_full_shape[observed_point] = X_final
-                U_final_full_shape[observed_point] = U_final
-                x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
-                pred_loss_full_trajectory = prediction_loss_function(x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u)
-                losses.append(pred_loss_full_trajectory.item())
-
-            else:
-                losses.append(np.nan)
-        mean_losses_val = np.array(losses).mean()
-        print(f"For observed point: {observed_point}, we have mean test loss: {mean_losses_val}")
-        mean_losses[observed_point]=mean_losses_val
-
-    # Get top 5 keys with lowest values
-    top_5 = sorted(mean_losses.items(), key=lambda x: x[1])[:5]
-    
-    print("Top 5 keys with lowest values:")
-    for key, value in top_5:
-        print(f"  Key {key}: {value}")
-
-
-    keys = sorted(mean_losses.keys())
-    values = [mean_losses[k] for k in keys]
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(keys, values, marker='o', linestyle='-', linewidth=2, markersize=6)
-    plt.xlabel('Key')
-    plt.ylabel('Loss')
-    plt.title('Mean Losses')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-    return mean_losses
 
 
 def plot_all_transformed_trajectories(test_id_df, test_df, 
                                      get_data_from_trajectory_id_function, 
-                                     max_t_training,device, mapping_net, option_1=True, 
+                                     Tmax, device, mapping_net, option_1=True, 
                                      only_plot_percentage=None):
     """
     Plot all transformed trajectories with time series and mean value scatter plots.
-    
-    Args:
-        test_id_df: DataFrame containing trajectory metadata (energy, phi or phi0)
-        test_df: DataFrame containing trajectory data (x, u, t)
-        get_data_from_trajectory_id_function: Function to retrieve trajectory data
-        max_t_training: Maximum training time value
-        option_1: If True, show Mean X_final vs Phi and Mean U_final vs Energy.
-                 If False, show Mean X_final vs Energy and Mean U_final vs Phi.
-        only_plot_percentage: If not None, float between 0.0 and 1.0 indicating 
-                             percentage of trajectories to randomly plot in time series (top row only).
     """
-    # Validate only_plot_percentage
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
     if only_plot_percentage is not None:
         if not (0.0 <= only_plot_percentage <= 1.0):
             raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
     
-    # Determine which phi column to use
     if 'phi' in test_id_df.columns:
         phi_column = 'phi'
     elif 'phi0' in test_id_df.columns:
@@ -11285,14 +8836,12 @@ def plot_all_transformed_trajectories(test_id_df, test_df,
     else:
         raise ValueError("DataFrame must contain either 'phi' or 'phi0' column")
     
-    # Get all trajectory IDs
     trajectory_ids = test_id_df['trajectory_id'].values
     
     X_final_list = []
     U_final_list = []
-    t_final = None
+    ref_t_filtered = None
     
-    # Process all trajectories
     for trajectory_id in trajectory_ids:
         test_trajectory_data = get_data_from_trajectory_id_function(
             test_id_df, test_df, trajectory_ids=trajectory_id
@@ -11302,106 +8851,105 @@ def plot_all_transformed_trajectories(test_id_df, test_df,
         u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
         t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
         
-        X_final, U_final, t_final = mapping_net(
-            x[t < max_t_training], 
-            u[t < max_t_training], 
-            t[t < max_t_training]
-        )
+        mask = t < Tmax
+        t_filtered = t[mask]
+        
+        if ref_t_filtered is None:
+            ref_t_filtered = t_filtered
+        else:
+            if len(t_filtered) != len(ref_t_filtered):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t_filtered)} points with t < Tmax, "
+                    f"expected {len(ref_t_filtered)}. All trajectories must have the same number of points."
+                )
+            if not torch.allclose(t_filtered, ref_t_filtered, atol=1e-6):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has different time values for t < Tmax. "
+                    f"All trajectories must share the same time values."
+                )
+        
+        X_final, U_final, _ = mapping_net(x[mask], u[mask], t_filtered)
         
         X_final_list.append(X_final)
         U_final_list.append(U_final)
     
-    # Convert t_final to numpy
-    t_final_np = t_final.cpu().detach().numpy()
+    t_final_np = ref_t_filtered.cpu().detach().numpy()
     
-    # Get phi and energy values for each trajectory
     phis = test_id_df[phi_column].values
     energies = test_id_df['energy'].values
     
-    # Compute mean values for each trajectory
     X_final_means = [X_tensor.cpu().detach().mean().item() for X_tensor in X_final_list]
     U_final_means = [U_tensor.cpu().detach().mean().item() for U_tensor in U_final_list]
     
-    # Determine which trajectories to plot in time series (top row only)
     if only_plot_percentage is not None:
         n_trajectories = len(X_final_list)
         n_to_plot = max(1, int(n_trajectories * only_plot_percentage))
         plot_indices = np.random.choice(n_trajectories, size=n_to_plot, replace=False)
-        plot_indices = sorted(plot_indices)  # Sort for consistent ordering
+        plot_indices = sorted(plot_indices)
     else:
         plot_indices = list(range(len(X_final_list)))
     
-    # Create a consistent color map for all trajectories
     import matplotlib.cm as cm
     n_total = len(X_final_list)
     colors = cm.get_cmap('tab10' if n_total <= 10 else 'tab20' if n_total <= 20 else 'hsv')(np.linspace(0, 1, n_total))
     
-    # Create a figure with 4 subplots (2x2 grid)
     fig = plt.figure(figsize=(16, 12))
     gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
     
-    ax1 = fig.add_subplot(gs[0, 0])  # Top-left: X_final time series
-    ax2 = fig.add_subplot(gs[0, 1])  # Top-right: U_final time series
-    ax3 = fig.add_subplot(gs[1, 0])  # Bottom-left: First scatter plot
-    ax4 = fig.add_subplot(gs[1, 1])  # Bottom-right: Second scatter plot
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax4 = fig.add_subplot(gs[1, 1])
     
-    # Plot subset of tensors from X_final_list on the first axis with matching colors
     for i in plot_indices:
         X_tensor = X_final_list[i]
         X_np = X_tensor.cpu().detach().numpy()
         ax1.plot(t_final_np, X_np, alpha=0.7, color=colors[i])
     
     ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('X values')
+    ax1.set_ylabel('Q(t)')
     if only_plot_percentage is not None:
-        ax1.set_title(f'X_final_list - {len(plot_indices)} of {len(X_final_list)} Trajectories ({only_plot_percentage*100:.1f}%)')
+        ax1.set_title(f"Trajectories' Q(t) — {len(plot_indices)} of {n_total} ({only_plot_percentage*100:.1f}%)")
     else:
-        ax1.set_title(f'X_final_list - All Trajectories ({len(X_final_list)} total)')
+        ax1.set_title(f"Trajectories' Q(t) — All {n_total} Trajectories")
     ax1.grid(True, alpha=0.3)
     
-    # Plot subset of tensors from U_final_list on the second axis with matching colors
     for i in plot_indices:
         U_tensor = U_final_list[i]
         U_np = U_tensor.cpu().detach().numpy()
         ax2.plot(t_final_np, U_np, alpha=0.7, color=colors[i])
     
     ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('U values')
+    ax2.set_ylabel('P(t)')
     if only_plot_percentage is not None:
-        ax2.set_title(f'U_final_list - {len(plot_indices)} of {len(U_final_list)} Trajectories ({only_plot_percentage*100:.1f}%)')
+        ax2.set_title(f"Trajectories' P(t) — {len(plot_indices)} of {n_total} ({only_plot_percentage*100:.1f}%)")
     else:
-        ax2.set_title(f'U_final_list - All Trajectories ({len(U_final_list)} total)')
+        ax2.set_title(f"Trajectories' P(t) — All {n_total} Trajectories")
     ax2.grid(True, alpha=0.3)
     
-    # Determine which scatter plots to show based on option_1
-    # NOTE: Scatter plots use ALL trajectories regardless of only_plot_percentage
     if option_1:
-        # Scatter plot: Mean X_final vs Phi
         ax3.scatter(X_final_means, phis, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
-        ax3.set_xlabel('Mean X_final', fontsize=12)
+        ax3.set_xlabel('Mean Q', fontsize=12)
         ax3.set_ylabel(f'{phi_column.capitalize()}', fontsize=12)
-        ax3.set_title(f'Mean X_final vs {phi_column.capitalize()}', fontsize=14)
+        ax3.set_title(f'Mean Q vs {phi_column.capitalize()}', fontsize=14)
         ax3.grid(True, alpha=0.3)
         
-        # Scatter plot: Mean U_final vs Energy
         ax4.scatter(U_final_means, energies, s=100, alpha=0.7, color='red', edgecolors='black', linewidth=1.5)
-        ax4.set_xlabel('Mean U_final', fontsize=12)
+        ax4.set_xlabel('Mean P', fontsize=12)
         ax4.set_ylabel('Energy', fontsize=12)
-        ax4.set_title('Mean U_final vs Energy', fontsize=14)
+        ax4.set_title('Mean P vs Energy', fontsize=14)
         ax4.grid(True, alpha=0.3)
     else:
-        # Scatter plot: Mean X_final vs Energy
         ax3.scatter(X_final_means, energies, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
-        ax3.set_xlabel('Mean X_final', fontsize=12)
+        ax3.set_xlabel('Mean Q', fontsize=12)
         ax3.set_ylabel('Energy', fontsize=12)
-        ax3.set_title('Mean X_final vs Energy', fontsize=14)
+        ax3.set_title('Mean Q vs Energy', fontsize=14)
         ax3.grid(True, alpha=0.3)
         
-        # Scatter plot: Mean U_final vs Phi
         ax4.scatter(U_final_means, phis, s=100, alpha=0.7, color='red', edgecolors='black', linewidth=1.5)
-        ax4.set_xlabel('Mean U_final', fontsize=12)
+        ax4.set_xlabel('Mean P', fontsize=12)
         ax4.set_ylabel(f'{phi_column.capitalize()}', fontsize=12)
-        ax4.set_title(f'Mean U_final vs {phi_column.capitalize()}', fontsize=14)
+        ax4.set_title(f'Mean P vs {phi_column.capitalize()}', fontsize=14)
         ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -11414,27 +8962,27 @@ def plot_all_transformed_trajectories(test_id_df, test_df,
 
 def plot_all_transformed_trajectories_multiple_periods(test_id_df, test_df, 
                                      get_data_from_trajectory_id_function, 
-                                     max_t_training, device, mapping_net, option_1=True, 
+                                     Tmax, device, mapping_net,
                                      only_plot_percentage=None):
     """
-    Plot all transformed trajectories with time series and mean value scatter plots,
+    Plot all transformed trajectories with time series,
     including vertical markers for training periods.
     """
-    # Validate only_plot_percentage
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
     if only_plot_percentage is not None:
         if not (0.0 <= only_plot_percentage <= 1.0):
             raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
     
-    # Get all trajectory IDs
     trajectory_ids = test_id_df['trajectory_id'].values
+    n_trajectories = len(trajectory_ids)
     
-    X_final_list = [[] for i in range(trajectory_ids.shape[0])]
-    U_final_list = [[] for i in range(trajectory_ids.shape[0])]
+    X_final_list = [[] for _ in range(n_trajectories)]
+    U_final_list = [[] for _ in range(n_trajectories)]
     
-    # We will store the last time vector to use for the x-axis
-    t_final_np = None
+    ref_t = None
 
-    # Process all trajectories
     for i, trajectory_id in enumerate(trajectory_ids):
         test_trajectory_data = get_data_from_trajectory_id_function(
             test_id_df, test_df, trajectory_ids=trajectory_id
@@ -11442,65 +8990,67 @@ def plot_all_transformed_trajectories_multiple_periods(test_id_df, test_df,
         
         x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
         u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)               
-        
-        # If this is the last iteration or first, we capture t for plotting purposes
-        # (Assuming all trajectories share the same time grid)
-        t_np = t.detach().cpu().numpy()
-        t_final_np = t_np 
-        
-        if max_t_training is not None and t[-1].item() > max_t_training:
-            t_max = t_np[-1]
-            
-            # Determine number of segments
-            num_segments = int(np.ceil(t_max / max_t_training))
-            
-            for seg_idx in range(num_segments):
-                # Determine time range for this segment
-                t_start = seg_idx * max_t_training
-                t_end = min((seg_idx + 1) * max_t_training, t_max)
-                
-                # Find indices in this time range
-                if seg_idx == 0:
-                    seg_mask = (t_np >= t_start) & (t_np <= t_end)
-                else:
-                    seg_mask = (t_np > t_start) & (t_np <= t_end)
-                
-                seg_indices = np.where(seg_mask)[0]
-                
-                if len(seg_indices) == 0:
-                    continue
-                
-                X_final, U_final, _ = mapping_net(
-                    x[seg_indices], 
-                    u[seg_indices], 
-                    t[0:len(seg_indices)]
-                )
-                
-                # Append data as flat numpy arrays
-                X_final_list[i].extend(X_final.cpu().detach().numpy())
-                U_final_list[i].extend(U_final.cpu().detach().numpy())
+        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
 
-    # Determine which trajectories to plot
+        if ref_t is None:
+            ref_t = t
+        else:
+            if len(t) != len(ref_t):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t)} points, expected {len(ref_t)}. "
+                    f"All trajectories must have the same number of points."
+                )
+            if not torch.allclose(t, ref_t, atol=1e-6):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has different time values. "
+                    f"All trajectories must share the same time values."
+                )
+
+        t_np = t.detach().cpu().numpy()
+        t_max = t_np[-1]
+        
+        num_segments = int(np.ceil(t_max / Tmax))
+        
+        for seg_idx in range(num_segments):
+            t_start = seg_idx * Tmax
+            t_end = min((seg_idx + 1) * Tmax, t_max)
+            
+            if seg_idx == 0:
+                seg_mask = (t_np >= t_start) & (t_np <= t_end)
+            else:
+                seg_mask = (t_np > t_start) & (t_np <= t_end)
+            
+            seg_indices = np.where(seg_mask)[0]
+            
+            if len(seg_indices) == 0:
+                continue
+            
+            t_seg = t[seg_indices]
+            t_seg_relative = t_seg - t_start
+            
+            X_final, U_final, _ = mapping_net(
+                x[seg_indices], 
+                u[seg_indices], 
+                t_seg_relative
+            )
+            
+            X_final_list[i].extend(X_final.cpu().detach().numpy())
+            U_final_list[i].extend(U_final.cpu().detach().numpy())
+
+    t_final_np = ref_t.detach().cpu().numpy()
+
     if only_plot_percentage is not None:
-        n_trajectories = trajectory_ids.shape[0]
         n_to_plot = max(1, int(n_trajectories * only_plot_percentage))
         plot_indices = np.random.choice(n_trajectories, size=n_to_plot, replace=False)
         plot_indices = sorted(plot_indices)
     else:
-        return None
+        plot_indices = list(range(n_trajectories))
     
-    # Create colors
+    import matplotlib.cm as cm
     colors = cm.get_cmap('tab10' if n_trajectories <= 10 else 'tab20' if n_trajectories <= 20 else 'hsv')(np.linspace(0, 1, n_trajectories))
     
-    # Create figure
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
-    
-    ax1 = fig.add_subplot(gs[0, 0])  # Top-left: X_final
-    ax2 = fig.add_subplot(gs[0, 1])  # Top-right: U_final
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
-    # --- PLOT DATA ---
     for i in plot_indices:
         X_np = np.array(X_final_list[i])
         ax1.plot(t_final_np, X_np, alpha=0.7, color=colors[i])
@@ -11508,184 +9058,38 @@ def plot_all_transformed_trajectories_multiple_periods(test_id_df, test_df,
         U_np = np.array(U_final_list[i])
         ax2.plot(t_final_np, U_np, alpha=0.7, color=colors[i])
 
-    # --- ADD VERTICAL LINES (Multiples of max_t_training) ---
-    if max_t_training is not None and t_final_np is not None:
-        current_marker = max_t_training
-        max_time_in_plot = t_final_np[-1]
-        
-        first_line = True
-        while current_marker < max_time_in_plot:
-            label = f' (max_t_training {max_t_training:.3f})' if first_line else None
-            
-            # Plot on Axis 1
-            ax1.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
-            # Plot on Axis 2
-            ax2.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
-            
-            current_marker += max_t_training
-            first_line = False
+    max_time_in_plot = t_final_np[-1]
+    current_marker = Tmax
+    first_line = True
+    while current_marker < max_time_in_plot:
+        label = f'Tmax ({Tmax:.3f})' if first_line else None
+        ax1.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+        ax2.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+        current_marker += Tmax
+        first_line = False
 
-    # --- FORMATTING & LEGENDS ---
     ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('X values')
-    title_suffix = f'{len(plot_indices)} of {len(X_final_list)}' if only_plot_percentage else 'All'
-    ax1.set_title(f'X_final_list - {title_suffix} Trajectories')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='upper right') # Show legend for the vertical lines
-
-    ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('U values')
-    ax2.set_title(f'U_final_list - {title_suffix} Trajectories')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='upper right') # Show legend for the vertical lines
-    
-    plt.tight_layout()
-    plt.show()
-
-def plot_transformed_trajectory(test_id_df, test_df, trajectory_id, 
-                                get_data_from_trajectory_id_function, mapping_net,
-                                max_t_training, device, option_1=True,
-                                point_indexes_observed=None):
-    """
-    Plot transformed trajectory with energy and phi reference lines (if columns exist).
-    
-    Args:
-        test_id_df: DataFrame containing trajectory metadata (optionally energy, phi or phi0)
-        test_df: DataFrame containing trajectory data (x, u, t)
-        trajectory_id: ID of the trajectory to plot
-        get_data_from_trajectory_id_function: Function to retrieve trajectory data
-        mapping_net: The mapping network to apply transformation
-        max_t_training: Maximum training time value
-        device: Device to use for tensors (e.g., 'cuda:0' or 'cpu')
-        option_1: If True, show phi in X_final and energy in U_final.
-                 If False, show energy in X_final and phi in U_final.
-        point_indexes_observed: Optional list of integers indicating which points were observed.
-                               If provided, creates additional plot with mean lines only.
-    """
-    # Determine which columns are available
-    phi_column = None
-    if 'phi' in test_id_df.columns:
-        phi_column = 'phi'
-    elif 'phi0' in test_id_df.columns:
-        phi_column = 'phi0'
-    
-    has_energy = 'energy' in test_id_df.columns
-    
-    # Load trajectory data
-    test_trajectory_data = get_data_from_trajectory_id_function(
-        test_id_df, test_df, trajectory_ids=trajectory_id
-    )
-    
-    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-    
-    # Apply mapping network
-    X_final, U_final, t_final = mapping_net(
-        x[t < max_t_training], 
-        u[t < max_t_training], 
-        t[t < max_t_training]
-    )
-    
-    # Fetch energy and phi values for this trajectory (if they exist)
-    trajectory_row = test_id_df[test_id_df['trajectory_id'] == trajectory_id].iloc[0]
-    energy_value = trajectory_row['energy'] if has_energy else None
-    phi_value = trajectory_row[phi_column] if phi_column is not None else None
-    
-    # Convert tensors to numpy (move to CPU first if on GPU)
-    X_final_np = X_final.cpu().detach().numpy()
-    U_final_np = U_final.cpu().detach().numpy()
-    t_final_np = t_final.cpu().detach().numpy()
-    
-    # Get t range
-    t_min = t_final_np.min()
-    t_max = t_final_np.max()
-    
-    # Calculate means from observed points if provided
-    if point_indexes_observed is not None:
-        X_observed_mean = X_final_np[point_indexes_observed].mean()
-        U_observed_mean = U_final_np[point_indexes_observed].mean()
-    
-    # Determine which value goes on which plot based on option_1
-    if option_1:
-        x_reference_value = phi_value
-        x_reference_label = phi_column if phi_column else 'φ'
-        x_reference_color = 'orange'
-        u_reference_value = energy_value
-        u_reference_label = 'Energy'
-        u_reference_color = 'purple'
+    ax1.set_ylabel('Q(t)')
+    if only_plot_percentage is not None:
+        ax1.set_title(f"Trajectories' Q(t) — {len(plot_indices)} of {n_trajectories} ({only_plot_percentage*100:.1f}%)")
     else:
-        x_reference_value = energy_value
-        x_reference_label = 'Energy'
-        x_reference_color = 'purple'
-        u_reference_value = phi_value
-        u_reference_label = phi_column if phi_column else 'φ'
-        u_reference_color = 'orange'
-    
-    # ==================== FIRST PLOT (Original) ====================
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-    # Plot X_final on the first axis
-    ax1.plot(t_final_np, X_final_np, label='X_final', color='blue')
-    if x_reference_value is not None:
-        ax1.plot([t_min, t_max], [x_reference_value, x_reference_value], 
-                 color=x_reference_color, linestyle='--', linewidth=2, 
-                 label=f'{x_reference_label} = {x_reference_value:.4f}')
-    ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('X_final')
-    ax1.set_title(f'X_final - Trajectory {trajectory_id}')
-    ax1.grid(True)
-    ax1.legend()
-    
-    # Plot U_final on the second axis
-    ax2.plot(t_final_np, U_final_np, label='U_final', color='red')
-    if u_reference_value is not None:
-        ax2.plot([t_min, t_max], [u_reference_value, u_reference_value], 
-                 color=u_reference_color, linestyle='--', linewidth=2, 
-                 label=f'{u_reference_label} = {u_reference_value:.4f}')
+        ax1.set_title(f"Trajectories' Q(t) — All {n_trajectories} Trajectories")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='upper right')
+
     ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('U_final')
-    ax2.set_title(f'U_final - Trajectory {trajectory_id}')
-    ax2.grid(True)
-    ax2.legend()
+    ax2.set_ylabel('P(t)')
+    if only_plot_percentage is not None:
+        ax2.set_title(f"Trajectories' P(t) — {len(plot_indices)} of {n_trajectories} ({only_plot_percentage*100:.1f}%)")
+    else:
+        ax2.set_title(f"Trajectories' P(t) — All {n_trajectories} Trajectories")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='upper right')
     
     plt.tight_layout()
     plt.show()
-    
-    # ==================== SECOND PLOT (Only Reference and Mean Lines) ====================
-    if point_indexes_observed is not None:
-        fig2, (ax3, ax4) = plt.subplots(2, 1, figsize=(10, 8))
-        
-        # Plot X reference and mean lines only
-        if x_reference_value is not None:
-            ax3.plot([t_min, t_max], [x_reference_value, x_reference_value], 
-                     color=x_reference_color, linestyle='--', linewidth=2, 
-                     label=f'{x_reference_label} = {x_reference_value:.4f}')
-        ax3.plot([t_min, t_max], [X_observed_mean, X_observed_mean], 
-                 color='green', linestyle='-.', linewidth=2, 
-                 label=f'Mean X (observed) = {X_observed_mean:.4f}')
-        ax3.set_xlabel('Time (t)')
-        ax3.set_ylabel('X value')
-        ax3.set_title(f'X Reference vs Observed Mean - Trajectory {trajectory_id}')
-        ax3.grid(True)
-        ax3.legend()
-        
-        # Plot U reference and mean lines only
-        if u_reference_value is not None:
-            ax4.plot([t_min, t_max], [u_reference_value, u_reference_value], 
-                     color=u_reference_color, linestyle='--', linewidth=2, 
-                     label=f'{u_reference_label} = {u_reference_value:.4f}')
-        ax4.plot([t_min, t_max], [U_observed_mean, U_observed_mean], 
-                 color='green', linestyle='-.', linewidth=2, 
-                 label=f'Mean U (observed) = {U_observed_mean:.4f}')
-        ax4.set_xlabel('Time (t)')
-        ax4.set_ylabel('U value')
-        ax4.set_title(f'U Reference vs Observed Mean - Trajectory {trajectory_id}')
-        ax4.grid(True)
-        ax4.legend()
-        
-        plt.tight_layout()
-        plt.show()
+
+
 
 def plot_harmonic_oscillator_energy(x_pred, u_pred, x, u, t, k, mass):
     """
@@ -11789,262 +9193,19 @@ def plot_real_pendulum_energy(x_pred, u_pred, x, u, t, constant):
     plt.tight_layout()
     plt.show()
 
-def test_model_energy_in_single_trajectory(
-    get_data_from_trajectory_id_function, 
-    test_id_df, 
-    test_df, 
-    trajectory_id, 
-    mapping_net, 
-    inverse_net, 
-    device, 
-    point_indexes_observed, 
-    max_t_training=None,
-    efficiently=True,
-    method = "mahalanobis",
-    threshold=1.0,
-    dt=0.1,
-    alpha=1.0,
-    gamma=1.0,
-    cluster_weight_threshold=0.4,
-    max_n_components=5,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
-    case="harmonic_oscillator",
-    length=3.0, k=1, mass=1, g=9.81, constant=2.4,
-    verbose=False,
 
-):
-    """
-    Test model on a single trajectory.
-    
-    Args:
-        efficiently: If True, use standard prediction method. If False, use ensemble method.
-        max_t_training: If not None, use autoregressive prediction for trajectories exceeding this time value
-        threshold: Mahalanobis distance threshold (only used when efficiently=False)
-        search_range_lower_pct: Search range lower bound (only used when efficiently=False)
-        search_range_upper_pct: Search range upper bound (only used when efficiently=False)
-        verbose: If True, print forward pass counts
-    """
-    test_trajectory_data = get_data_from_trajectory_id_function(test_id_df, test_df, trajectory_ids=trajectory_id)
-    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-
-    if point_indexes_observed:
-        if efficiently:
-            # ==================== EFFICIENT METHOD ====================
-            forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
-            
-            # Check if we need segmented prediction
-            if max_t_training is not None and t[-1].item() > max_t_training:
-                # Autoregressive prediction for long trajectories
-                t_np = t.detach().cpu().numpy()
-                t_max = t_np[-1]
-                
-                x_pred_segments = []
-                u_pred_segments = []
-                
-                # Determine number of segments
-                num_segments = int(np.ceil(t_max / max_t_training))
-                
-                for seg_idx in range(num_segments):
-                    # Determine time range for this segment
-                    t_start = seg_idx * max_t_training
-                    t_end = min((seg_idx + 1) * max_t_training, t_max)
-                    
-                    # Find indices in this time range
-                    # Avoid overlap: use > for subsequent segments, >= for first segment
-                    if seg_idx == 0:
-                        seg_mask = (t_np >= t_start) & (t_np <= t_end)
-                    else:
-                        seg_mask = (t_np > t_start) & (t_np <= t_end)
-                    
-                    seg_indices = np.where(seg_mask)[0]
-                    
-                    if len(seg_indices) == 0:
-                        continue
-                    
-                    # Get data for this segment
-                    t_seg = t[seg_indices]
-                    t_seg_relative = t_seg - t_start
-                    
-                    if seg_idx == 0:
-                        # First segment: use actual observed points
-                        # Filter observed indices to only those in this segment
-                        obs_in_seg = [i for i in point_indexes_observed if i in seg_indices]
-                        
-                        if len(obs_in_seg) > 0:
-                            # Get relative positions within the segment
-                            obs_indices_relative = [np.where(seg_indices == i)[0][0] for i in obs_in_seg]
-                            
-                            X_final, U_final, t_final = mapping_net(
-                                x[obs_in_seg], 
-                                u[obs_in_seg], 
-                                t_seg_relative[obs_indices_relative]
-                            )
-                            forward_pass_count['mapping_net'] += 1
-                            
-                            X_final_mean = X_final.mean()
-                            U_final_mean = U_final.mean()
-                            
-                            # Create full shape tensors for this segment
-                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                            
-                            # Place observed values at their relative positions
-                            for i, rel_idx in enumerate(obs_indices_relative):
-                                X_final_full_shape_seg[rel_idx] = X_final[i]
-                                U_final_full_shape_seg[rel_idx] = U_final[i]
-                        else:
-                            # No observations in first segment - use original observations with t=0
-                            X_final, U_final, t_final = mapping_net(
-                                x[point_indexes_observed], 
-                                u[point_indexes_observed], 
-                                torch.zeros(len(point_indexes_observed), device=device, dtype=torch.float32)
-                            )
-                            forward_pass_count['mapping_net'] += 1
-                            
-                            X_final_mean = X_final.mean()
-                            U_final_mean = U_final.mean()
-                            
-                            X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                            U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                            X_final_full_shape_seg[0] = X_final[0]
-                            U_final_full_shape_seg[0] = U_final[0]
-                    else:
-                        # Subsequent segments: use last prediction from previous segment as observation at t=0
-                        x_obs = x_pred_segments[-1][-1].unsqueeze(0)
-                        u_obs = u_pred_segments[-1][-1].unsqueeze(0)
-                        t_obs = torch.tensor([0.0], device=device, dtype=torch.float32)
-                        
-                        X_final, U_final, t_final = mapping_net(x_obs, u_obs, t_obs)
-                        forward_pass_count['mapping_net'] += 1
-                        
-                        X_final_mean = X_final.mean()
-                        U_final_mean = U_final.mean()
-                        
-                        # Create full shape tensors for this segment
-                        X_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=X_final_mean.item())
-                        U_final_full_shape_seg = torch.full_like(t_seg_relative, fill_value=U_final_mean.item())
-                        
-                        # Place the observation at index 0 (t=0 in relative time)
-                        X_final_full_shape_seg[0] = X_final[0]
-                        U_final_full_shape_seg[0] = U_final[0]
-                    
-                    # Predict for this segment using relative times
-                    x_pred_seg, u_pred_seg, _ = inverse_net(X_final_full_shape_seg, U_final_full_shape_seg, t_seg_relative)
-                    forward_pass_count['inverse_net'] += 1
-                    
-                    x_pred_segments.append(x_pred_seg)
-                    u_pred_segments.append(u_pred_seg)
-                
-                # Concatenate all segments
-                x_pred = torch.cat(x_pred_segments, dim=0)
-                u_pred = torch.cat(u_pred_segments, dim=0)
-            else:
-                # Original logic for trajectories within max_t_training
-                X_final, U_final, t_final = mapping_net(x[point_indexes_observed], u[point_indexes_observed], t[point_indexes_observed])
-                forward_pass_count['mapping_net'] += 1
-                
-                X_final_mean = X_final.mean()
-                U_final_mean = U_final.mean()
-                X_final_full_shape = torch.full_like(t, fill_value=X_final_mean.item())
-                U_final_full_shape = torch.full_like(t, fill_value=U_final_mean.item())
-                # Replace values at observed indices with actual mapped values
-                X_final_full_shape[point_indexes_observed] = X_final
-                U_final_full_shape[point_indexes_observed] = U_final
-                x_pred, u_pred, _ = inverse_net(X_final_full_shape, U_final_full_shape, t)
-                forward_pass_count['inverse_net'] += 1
-            
-            if verbose:
-                total_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
-                print(f"\n=== Efficient Method - Forward Pass Count ===")
-                print(f"mapping_net calls: {forward_pass_count['mapping_net']}")
-                print(f"inverse_net calls: {forward_pass_count['inverse_net']}")
-                print(f"Total forward passes: {total_passes}")
-        
-        else:
-            # ==================== ENSEMBLE METHOD ====================
-            if max_t_training is None:
-                raise ValueError("max_t_training must be specified when using ensemble method (efficiently=False)")
-        
-            if method == "mahalanobis":
-                x_pred, u_pred, stats = ensemble_autoregressive_prediction_mahalanobis(
-                    x=x,
-                    u=u,
-                    t=t,
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    threshold=threshold,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False  # Don't print ensemble internal details
-                )
-
-            elif method == "gaussian_mixture":
-                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture(
-                    x=x, 
-                    u=u, 
-                    t=t, 
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    dt=dt,
-                    alpha=alpha, 
-                    gamma=gamma,
-                    cluster_weight_threshold=cluster_weight_threshold,
-                    max_n_components=max_n_components,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False
-                )
-            elif method == "gaussian_mixture_simple":
-                x_pred, u_pred, stats =   ensemble_autoregressive_prediction_gaussian_mixture_simple(
-                    x=x, 
-                    u=u, 
-                    t=t, 
-                    point_indexes_observed=point_indexes_observed,
-                    mapping_net=mapping_net,
-                    inverse_net=inverse_net,
-                    device=device,
-                    max_t_training=max_t_training,
-                    max_n_components=max_n_components,
-                    search_range_lower_pct=search_range_lower_pct,
-                    search_range_upper_pct=search_range_upper_pct,
-                    verbose=False
-                )
-            else:
-                raise ValueError("Not correctly specified method, try one of: mahalanobis, gaussian_mixture, gaussian_mixture_simple")
-                                
-
-            if verbose:
-                print(f"\n=== Ensemble Method - Forward Pass Count ===")
-                print(f"mapping_net calls: {stats['mapping_net_calls']}")
-                print(f"inverse_net calls: {stats['inverse_net_calls']}")
-                print(f"Total forward passes: {stats['total_forward_passes']}")
-                print(f"Coverage: {stats['coverage_pct']:.1f}%")
-        
-
-        if case == "harmonic_oscillator":
-            plot_harmonic_oscillator_energy(x_pred, u_pred, x, u, t, k, mass)
-        elif case == "ideal_pendulum":
-            plot_ideal_pendulum_energy(x_pred, u_pred, x, u, t, length=length, g=g)
-        elif case == "real_pendulum":
-            plot_real_pendulum_energy(x_pred, u_pred, x, u, t, constant=constant) #, length=length,mass=mass, g=g)
         
 
 
 def plot_transformed_trajectory_real_pendulum(test_id_df, test_df, trajectory_id, 
                                               get_data_from_trajectory_id_function, mapping_net,
-                                              max_t_training, device):
+                                              Tmax, device):
     """
     Plot transformed trajectory (X_final and U_final) without energy or mean calculations.
     """
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    
     # Determine which columns are available
     phi_column = None
     if 'phi' in test_id_df.columns:
@@ -12061,8 +9222,8 @@ def plot_transformed_trajectory_real_pendulum(test_id_df, test_df, trajectory_id
     u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
     t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
     
-    # Filter by max_t_training
-    mask = t < max_t_training
+    # Filter by Tmax
+    mask = t < Tmax
     x_filtered = x[mask]
     u_filtered = u[mask]
     t_filtered = t[mask]
@@ -12083,24 +9244,24 @@ def plot_transformed_trajectory_real_pendulum(test_id_df, test_df, trajectory_id
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
     
     # --- Subplot 1: X_final ---
-    ax1.plot(t_final_np, X_final_np, label='X_final', color='blue')
+    ax1.plot(t_final_np, X_final_np, label='Q(t)', color='blue')
     
     if phi_value is not None:
         ax1.axhline(y=phi_value, color='orange', linestyle='--', linewidth=2, 
                     label=f'{phi_column} = {phi_value:.4f}')
         
     ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('X_final')
-    ax1.set_title(f'X_final - Trajectory {trajectory_id}')
+    ax1.set_ylabel('Q(t)')
+    ax1.set_title(f'Q(t) — Trajectory {trajectory_id}')
     ax1.grid(True)
     ax1.legend()
     
     # --- Subplot 2: U_final ---
-    ax2.plot(t_final_np, U_final_np, label='U_final', color='red')
+    ax2.plot(t_final_np, U_final_np, label='P(t)', color='red')
 
     ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('U_final')
-    ax2.set_title(f'U_final - Trajectory {trajectory_id}')
+    ax2.set_ylabel('P(t)')
+    ax2.set_title(f'P(t) — Trajectory {trajectory_id}')
     ax2.grid(True)
     ax2.legend()
     
@@ -12177,147 +9338,3 @@ def get_top_checkpoint_epochs(save_dir_path, metrics_to_analyze):
     return checkpoint_list
 
 
-def evaluate_all_checkpoints(
-    # Checkpoint selection parameters
-    save_dir_path,
-    metrics_to_analyze,
-    # Model instance (already initialized)
-    mapping_net,
-    device,
-    # Test function arguments
-    get_data_from_trajectory_id_function,
-    prediction_loss_function,
-    test_id_df,
-    test_df,
-    point_indexes_observed,
-    recreate_and_plot_phase_space=False,
-    plot_specific_portion=None,
-    connect_points=False,
-    plot_trajectories_subsample=None,
-    max_t_training=None,
-    efficiently=True,
-    method="mahalanobis",
-    threshold=1.0,
-    dt=0.1,
-    alpha=1.0,
-    gamma=1.0,
-    cluster_weight_threshold=0.4,
-    max_n_components=5,
-    search_range_lower_pct=0.5,
-    search_range_upper_pct=0.6,
-    verbose=True
-):
-    """
-    Evaluates all top checkpoints and stores performance metrics.
-    
-    Args:
-        save_dir_path (str): Directory where checkpoints are stored
-        metrics_to_analyze (list): List of metric names to analyze for checkpoint selection
-        mapping_net: Already initialized model instance
-        device (str): Device to run on ('cuda' or 'cpu')
-        ... (all test_model_in_all_trajectories_in_df parameters)
-    
-    Returns:
-        tuple: (results_dict, best_checkpoint_path)
-            - results_dict: Dictionary with checkpoint names as keys and performance metrics as values
-            - best_checkpoint_path: String path to the checkpoint with minimum loss_per_sqrt_energy
-    """
-    # Get list of checkpoints to evaluate
-    checkpoints_list = get_top_checkpoint_epochs(
-        save_dir_path=save_dir_path,
-        metrics_to_analyze=metrics_to_analyze
-    )
-    
-    results = {}
-    
-    print(f"\n🔍 Evaluating {len(checkpoints_list)} checkpoints...\n")
-    
-    for idx, checkpoint_name in enumerate(checkpoints_list, 1):
-        print(f"[{idx}/{len(checkpoints_list)}] Evaluating {checkpoint_name}...")
-        
-        # Construct full checkpoint path
-        checkpoint_path = os.path.join(save_dir_path, checkpoint_name)
-        
-        # Load checkpoint into existing model
-        load_checkpoint(
-            path=checkpoint_path,
-            mapping_net=mapping_net,
-            device=device,
-            optimizer=None,
-            scheduler=None
-        )
-        
-        # Create inverse network
-        inverse_net = InverseStackedHamiltonianNetwork(forward_network=mapping_net)
-        
-        # Test the model
-        prediction_test_df, mean_prediction_loss_test = test_model_in_all_trajectories_in_df(
-            get_data_from_trajectory_id_function=get_data_from_trajectory_id_function,
-            prediction_loss_function=prediction_loss_function,
-            test_id_df=test_id_df,
-            test_df=test_df,
-            mapping_net=mapping_net,
-            inverse_net=inverse_net,
-            device=device,
-            point_indexes_observed=point_indexes_observed,
-            recreate_and_plot_phase_space=recreate_and_plot_phase_space,
-            plot_specific_portion=plot_specific_portion,
-            connect_points=connect_points,
-            plot_trajectories_subsample=plot_trajectories_subsample,
-            max_t_training=max_t_training,
-            efficiently=efficiently,
-            method=method,
-            threshold=threshold,
-            dt=dt,
-            alpha=alpha,
-            gamma=gamma,
-            cluster_weight_threshold=cluster_weight_threshold,
-            max_n_components=max_n_components,
-            search_range_lower_pct=search_range_lower_pct,
-            search_range_upper_pct=search_range_upper_pct,
-            verbose=verbose
-        )
-        
-        # Find the row with minimum loss_per_sqrt_energy
-        min_idx = prediction_test_df['loss_per_sqrt_energy'].idxmin()
-        min_row = prediction_test_df.loc[min_idx]
-        
-        # Store results
-        results[checkpoint_name] = {
-            'mean_prediction_loss': mean_prediction_loss_test,
-            'min_loss_per_sqrt_energy': min_row['loss_per_sqrt_energy'],
-            'best_trajectory_id': min_row['trajectory_id'],
-            'best_energy': min_row['energy']
-        }
-        
-        print(f"  ✓ Mean loss: {mean_prediction_loss_test:.6f}")
-        print(f"  ✓ Best loss_per_sqrt_energy: {min_row['loss_per_sqrt_energy']:.6f} "
-              f"(trajectory {min_row['trajectory_id']}, energy {min_row['energy']:.4f})\n")
-    
-    print("✅ Evaluation complete!\n")
-    
-    # Print top 5 checkpoints by min_loss_per_sqrt_energy
-    print("=" * 80)
-    print("🏆 TOP 5 CHECKPOINTS BY MIN LOSS PER SQRT ENERGY")
-    print("=" * 80)
-    
-    # Sort results by min_loss_per_sqrt_energy
-    sorted_results = sorted(
-        results.items(),
-        key=lambda x: x[1]['min_loss_per_sqrt_energy']
-    )[:5]
-    
-    for rank, (checkpoint_name, metrics) in enumerate(sorted_results, 1):
-        print(f"\n{rank}. {checkpoint_name}")
-        print(f"   Loss per sqrt energy: {metrics['min_loss_per_sqrt_energy']:.6f}")
-        print(f"   Trajectory ID: {metrics['best_trajectory_id']}")
-        print(f"   Energy: {metrics['best_energy']:.4f}")
-        print(f"   Mean prediction loss: {metrics['mean_prediction_loss']:.6f}")
-    
-    print("\n" + "=" * 80 + "\n")
-    
-    # Get the best checkpoint path
-    best_checkpoint_name = sorted_results[0][0]
-    best_checkpoint_path = os.path.join(save_dir_path, best_checkpoint_name)
-    
-    return results, best_checkpoint_path
