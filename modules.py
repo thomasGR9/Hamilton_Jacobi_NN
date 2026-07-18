@@ -1,10 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from matplotlib.patches import Ellipse
 import random
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import pickle
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -25,8 +23,6 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
 import torch.nn.functional as F
 import re
-from scipy.spatial.distance import mahalanobis
-from sklearn.mixture import BayesianGaussianMixture
 import datetime
 from pathlib import Path
 
@@ -4994,51 +4990,6 @@ def load_checkpoint(path, mapping_net, device, optimizer=None, scheduler=None):
 
 
 
-def calculate_phi_A(x0, u0, k=1, mass=1):
-    constant = -(k / mass)
-    #For analytical solutions
-    A = np.sqrt(np.square(x0)+(np.square(u0)/(-constant)))
-    omega = np.sqrt(-constant)
-    phi = np.arctan2(x0/A, u0/(omega*A))
-    return phi, A
-
-
-def add_phi_A_columns(df):
-    # Apply the function row-wise and expand the result into two columns
-    df[['phi', 'A']] = df.apply(
-        lambda row: pd.Series(calculate_phi_A(x0=row['x0'], u0=row['u0'], k=1, mass=1)), axis=1
-    )
-
-    # Reorder columns: insert phi and A right after 'energy'
-    cols = list(df.columns)
-    energy_idx = cols.index('energy')
-    
-    # Remove the new columns from the end
-    cols.remove('phi')
-    cols.remove('A')
-    
-    # Insert them right after 'energy'
-    cols[energy_idx+1:energy_idx+1] = ['phi', 'A']
-    
-    # Return reordered dataframe
-    return df[cols]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def Autoregressive_Handoff_Inference_Protocol(
@@ -7481,346 +7432,9 @@ def plot_variance_results(results, figsize=(20, 6), only_plot_percentage=None, b
 
 
 
-def analyze_means_with_constants(
-    save_dir_path,
-    specific_epoch='last',
-    train_id_df_added=None,
-    val_id_df_added=None,
-    val_id_df_high_energy_added=None,
-    pendulum=False
-):
-    """
-    Extracts X_mean and U_mean for all trajectories at a specific epoch from
-    each of the 3 directories, and combines them with constants
-    from the provided DataFrames.
-
-    Args:
-        save_dir_path (str): Path to the directory containing epoch_* folders.
-        specific_epoch (int or str): Epoch number (e.g., 5) or 'last' for the last epoch.
-        train_id_df_added (pd.DataFrame): DataFrame with constants for train set.
-        val_id_df_added (pd.DataFrame): DataFrame with constants for validation set.
-        val_id_df_high_energy_added (pd.DataFrame): DataFrame with constants for high energy validation set.
-        pendulum (bool): If True, use columns 'phi0' and 'energy' instead of 'phi' and 'A'.
-
-    Returns:
-        tuple: (val_df, val_train_set_df, val_high_energy_df)
-               Each is a DataFrame with columns ['trajectory_id', 'X_mean', 'U_mean', <col_y>, <col_x>].
-    """
-
-    # Define column names based on pendulum mode
-    if pendulum:
-        col_x = "phi0"
-        col_y = "energy"
-    else:
-        col_x = "phi"
-        col_y = "A"
-
-    # --- Helper function to load data for a specific subdirectory ---
-    def extract_means_for_dir(epoch_path, subdir_name, constants_df):
-        subdir_path = os.path.join(epoch_path, subdir_name)
-        if not os.path.exists(subdir_path):
-            print(f"⚠️ Warning: {subdir_path} not found.")
-            return pd.DataFrame(columns=['trajectory_id', 'X_mean', 'U_mean', col_y, col_x])
-
-        data = []
-        for file in os.listdir(subdir_path):
-            if not file.startswith("trajectory_id_") or not file.endswith(".json"):
-                continue
-            try:
-                traj_id = int(file.split("_")[2])
-                file_path = os.path.join(subdir_path, file)
-                with open(file_path, "r") as f:
-                    json_data = json.load(f)
-                X_mean = json_data.get("X_mean", None)
-                U_mean = json_data.get("U_mean", None)
-
-                if constants_df is not None and traj_id in constants_df["trajectory_id"].values:
-                    row = constants_df[constants_df["trajectory_id"] == traj_id].iloc[0]
-                    val_y, val_x = row[col_y], row[col_x]
-                else:
-                    val_y, val_x = None, None
-
-                data.append({
-                    "trajectory_id": traj_id,
-                    "X_mean": X_mean,
-                    "U_mean": U_mean,
-                    col_y: val_y,
-                    col_x: val_x
-                })
-            except Exception as e:
-                print(f"⚠️ Error reading {file}: {e}")
-
-        return pd.DataFrame(data)
-
-    # --- Determine which epoch directory to use ---
-    epoch_dirs = sorted(
-        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
-        key=lambda x: int(x.split("_")[1])
-    )
-
-    if not epoch_dirs:
-        raise FileNotFoundError(f"No epoch directories found in {save_dir_path}")
-
-    if specific_epoch == 'last':
-        epoch_dir_name = epoch_dirs[-1]
-    else:
-        epoch_dir_name = f"epoch_{specific_epoch}"
-        if epoch_dir_name not in epoch_dirs:
-            raise ValueError(f"Epoch {specific_epoch} not found in {save_dir_path}")
-
-    epoch_path = os.path.join(save_dir_path, epoch_dir_name)
-    print(f"📂 Using data from epoch: {epoch_dir_name}")
-
-    # --- Extract for each of the 3 trajectory sets ---
-    val_df = extract_means_for_dir(epoch_path, "val_trajectories_data", val_id_df_added)
-    val_train_set_df = extract_means_for_dir(epoch_path, "val_train_set_trajectories_data", train_id_df_added)
-    val_high_energy_df = extract_means_for_dir(epoch_path, "val_high_energy_trajectories_data", val_id_df_high_energy_added)
-
-    print("✅ Data extraction complete.")
-    return val_df, val_train_set_df, val_high_energy_df
 
 
-def visualize_trajectory_movements_with_std_ellipses(
-    save_dir_path,
-    number_of_points_to_plot=5,
-    right_plot_alpha=0.3,
-    verbose=False,
-    specific_epoch='last',
-    visualize_true_constants=False,
-    train_id_df_added=None,
-    val_id_df_added=None,
-    val_id_df_high_energy_added=None,
-    pendulum=False
-):
-    """
-    Visualizes how X_mean/U_mean evolve (left plot) and how X_std/U_std change (right plot)
-    using ellipses at the same coordinates to represent standard deviation magnitudes.
-    
-    Args:
-        save_dir_path: Path to the directory containing epoch folders
-        number_of_points_to_plot: Number of trajectory IDs to randomly select
-        right_plot_alpha: Transparency level for ellipses in right plots (0.0 to 1.0)
-        verbose: If True, print trajectory values for a specific epoch
-        specific_epoch: Either an integer epoch number or 'last' for the last epoch
-        visualize_true_constants: If True, plot constants of selected trajectories on left plots
-        *_id_df_added: DataFrames containing true constants for each dataset
-        pendulum: If True, use columns 'phi0' and 'energy' instead of 'phi' and 'A'
-    """
 
-    traj_dirs = [
-        "val_trajectories_data",
-        "val_train_set_trajectories_data",
-        "val_high_energy_trajectories_data"
-    ]
-
-    # Ensure correct mapping between directory and DataFrame
-    df_map = {
-        "val_trajectories_data": val_id_df_added,
-        "val_train_set_trajectories_data": train_id_df_added,
-        "val_high_energy_trajectories_data": val_id_df_high_energy_added
-    }
-
-    # Define column names based on pendulum mode
-    if pendulum:
-        col_x = "phi0"
-        col_y = "energy"
-        label_text = "True (energy, φ₀)"
-    else:
-        col_x = "phi"
-        col_y = "A"
-        label_text = "True (A, φ)"
-
-    epoch_dirs = sorted(
-        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
-        key=lambda x: int(x.split("_")[1])
-    )
-    num_epochs = len(epoch_dirs)
-    if num_epochs == 0:
-        print("❌ No epoch directories found.")
-        return
-
-    # Color palettes
-    epoch_cmap = cm.get_cmap("viridis")
-    epoch_colors = [epoch_cmap(i / (num_epochs - 1)) for i in range(num_epochs)]
-    traj_id_cmap = cm.get_cmap("tab10")
-
-    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(12, 12))
-    fig.subplots_adjust(hspace=0.4, wspace=0.3)
-
-    for row_idx, traj_dir in enumerate(traj_dirs):
-        print(f"\n📊 Processing directory: {traj_dir}")
-
-        df = df_map.get(traj_dir, None)
-        first_epoch_path = os.path.join(save_dir_path, epoch_dirs[0], traj_dir)
-        if not os.path.exists(first_epoch_path):
-            print(f"⚠️ Directory {first_epoch_path} not found. Skipping.")
-            continue
-
-        all_files = [f for f in os.listdir(first_epoch_path) if f.startswith("trajectory_id_") and f.endswith(".json")]
-        if not all_files:
-            print(f"⚠️ No trajectory files found in {first_epoch_path}.")
-            continue
-
-        trajectory_ids = [int(f.split("_")[2]) for f in all_files]
-        random.seed(42)
-        selected_ids = random.sample(trajectory_ids, min(number_of_points_to_plot, len(trajectory_ids)))
-
-        # Consistent unique colors per trajectory ID
-        traj_colors = {tid: traj_id_cmap(i / max(len(selected_ids) - 1, 1)) for i, tid in enumerate(selected_ids)}
-
-        traj_data = {
-            tid: {"X_mean": [], "U_mean": [], "X_std": [], "U_std": []}
-            for tid in selected_ids
-        }
-
-        for epoch_dir in epoch_dirs:
-            epoch_path = os.path.join(save_dir_path, epoch_dir, traj_dir)
-            for tid in selected_ids:
-                file_path = os.path.join(epoch_path, f"trajectory_id_{tid}_data.json")
-                if not os.path.exists(file_path):
-                    continue
-                with open(file_path, "r") as f:
-                    data = json.load(f)
-                traj_data[tid]["X_mean"].append(data["X_mean"])
-                traj_data[tid]["U_mean"].append(data["U_mean"])
-                traj_data[tid]["X_std"].append(data["X_std"])
-                traj_data[tid]["U_std"].append(data["U_std"])
-
-        # --- Left plot: Means ---
-        ax_mean = axes[row_idx, 0]
-        ax_mean.set_title(f"{traj_dir.replace('_', ' ')} - Mean Evolution")
-        ax_mean.set_xlabel("X_mean")
-        ax_mean.set_ylabel("U_mean")
-        ax_mean.grid(True, linestyle="--", alpha=0.5)
-
-        for tid in selected_ids:
-            Xs = traj_data[tid]["X_mean"]
-            Us = traj_data[tid]["U_mean"]
-            color = traj_colors[tid]
-            if len(Xs) < 2:
-                continue
-            for j in range(len(Xs) - 1):
-                ax_mean.plot([Xs[j], Xs[j+1]], [Us[j], Us[j+1]], color=epoch_colors[j], alpha=0.8, linewidth=2)
-            ax_mean.scatter(Xs[0], Us[0], color="red", marker="o", s=40)
-            ax_mean.scatter(Xs[-1], Us[-1], color="black", marker="x", s=40)
-
-        # Highlight specific epoch with colored star
-        epoch_idx = None
-        if specific_epoch is not None:
-            if specific_epoch == 'last':
-                epoch_idx = len(epoch_dirs) - 1
-            else:
-                epoch_name = f"epoch_{specific_epoch}"
-                if epoch_name in epoch_dirs:
-                    epoch_idx = epoch_dirs.index(epoch_name)
-
-        if epoch_idx is not None:
-            for tid in selected_ids:
-                Xs = traj_data[tid]["X_mean"]
-                Us = traj_data[tid]["U_mean"]
-                if epoch_idx < len(Xs):
-                    ax_mean.scatter(
-                        Xs[epoch_idx],
-                        Us[epoch_idx],
-                        color=traj_colors[tid],
-                        marker='*',
-                        s=300,
-                        edgecolor='black',
-                        linewidth=1.5,
-                        zorder=10
-                    )
-
-        # --- Optional True Constants Visualization ---
-        if visualize_true_constants and df is not None:
-            const_points = df[df["trajectory_id"].isin(selected_ids)]
-            for _, row in const_points.iterrows():
-                tid = row["trajectory_id"]
-                color = traj_colors.get(tid, "orange")
-                ax_mean.scatter(
-                    row[col_x], row[col_y],
-                    color=color, s=120, marker="D",
-                    edgecolor="black", linewidth=1.5, zorder=15
-                )
-        ax_mean.legend(["Trajectory evolution", "Start", "End", f"Specific epoch / {label_text}"], fontsize=8)
-
-        # --- Right plot: Std Ellipses ---
-        ax_std = axes[row_idx, 1]
-        ax_std.set_title(f"{traj_dir.replace('_', ' ')} - Std Ellipses")
-        ax_std.set_xlabel("X_mean")
-        ax_std.set_ylabel("U_mean")
-        ax_std.grid(True, linestyle="--", alpha=0.5)
-
-        for tid in selected_ids:
-            Xs = traj_data[tid]["X_mean"]
-            Us = traj_data[tid]["U_mean"]
-            Xstds = traj_data[tid]["X_std"]
-            Ustds = traj_data[tid]["U_std"]
-            color = traj_colors[tid]
-            for j in range(len(Xs)):
-                e = Ellipse(
-                    (Xs[j], Us[j]),
-                    width=Xstds[j] * 2,
-                    height=Ustds[j] * 2,
-                    facecolor=color,
-                    edgecolor="black",
-                    alpha=right_plot_alpha
-                )
-                ax_std.add_patch(e)
-            ax_std.plot(Xs, Us, color=color, alpha=right_plot_alpha, linewidth=1, label=f"Traj {tid}")
-
-        # Highlight specific epoch in right plot
-        if epoch_idx is not None:
-            for tid in selected_ids:
-                Xs = traj_data[tid]["X_mean"]
-                Us = traj_data[tid]["U_mean"]
-                if epoch_idx < len(Xs):
-                    ax_std.scatter(
-                        Xs[epoch_idx], Us[epoch_idx],
-                        color=traj_colors[tid],
-                        marker='*', s=300,
-                        edgecolor='black', linewidth=1.5, zorder=10
-                    )
-
-        ax_std.legend(loc="best", fontsize=8, framealpha=0.7)
-
-        # Colorbar for epoch progression (left plot)
-        norm = plt.Normalize(vmin=0, vmax=num_epochs - 1)
-        sm = plt.cm.ScalarMappable(cmap=epoch_cmap, norm=norm)
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=axes[row_idx, 0], orientation="horizontal", fraction=0.05, pad=0.1)
-        cbar.set_label("Epoch progression")
-
-        # --- Verbose output ---
-        if verbose and epoch_idx is not None:
-            epoch_name = epoch_dirs[epoch_idx]
-            print(f"\nFor the {epoch_name} in {traj_dir} the values are:")
-            for tid in selected_ids:
-                if epoch_idx < len(traj_data[tid]["X_mean"]):
-                    X_mean = traj_data[tid]["X_mean"][epoch_idx]
-                    X_std = traj_data[tid]["X_std"][epoch_idx]
-                    U_mean = traj_data[tid]["U_mean"][epoch_idx]
-                    U_std = traj_data[tid]["U_std"][epoch_idx]
-
-                    # Get constants from dataframe if available
-                    val_x, val_y = None, None
-                    if df is not None and tid in df["trajectory_id"].values:
-                        row = df[df["trajectory_id"] == tid].iloc[0]
-                        val_x, val_y = row[col_x], row[col_y]
-
-                    if pendulum:
-                        print(f"{tid}: X_mean = {X_mean:.4f} ± {X_std:.4f}, "
-                              f"U_mean = {U_mean:.4f} ± {U_std:.4f} "
-                              f"and energy={val_y}, phi0={val_x}")
-                    else:
-                        print(f"{tid}: X_mean = {X_mean:.4f} ± {X_std:.4f}, "
-                              f"U_mean = {U_mean:.4f} ± {U_std:.4f} "
-                              f"and A={val_y}, phi={val_x}")
-                else:
-                    print(f"{tid}: No data available")
-
-    plt.tight_layout()
-    plt.show()
-    print("\n✅ Mean + Std (ellipse) visualization complete.")
 
 
 
@@ -8009,288 +7623,7 @@ def visualize_epoch_metrics(save_dir_path, metrics_to_plot, plot_on_same_graph=F
 
 
 
-def analyze_folders_means(save_dir_path, locate_epoch=None):
-    """
-    Analyzes the mean and standard deviation of X_mean and U_mean across all trajectory IDs
-    for each epoch and trajectory directory.
-    
-    Creates 3 plots showing how X_std_full and U_std_full evolve over epochs.
-    
-    Args:
-        save_dir_path: Path to the directory containing epoch folders
-        locate_epoch: If provided (integer), highlights this epoch in plots and prints its statistics
-    """
-    
-    traj_dirs = [
-        "val_trajectories_data",
-        "val_train_set_trajectories_data",
-        "val_high_energy_trajectories_data"
-    ]
-    
-    epoch_dirs = sorted(
-        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
-        key=lambda x: int(x.split("_")[1])
-    )
-    num_epochs = len(epoch_dirs)
-    if num_epochs == 0:
-        print("❌ No epoch directories found.")
-        return
-    
-    print(f"📊 Analyzing {num_epochs} epochs across {len(traj_dirs)} directories...")
-    
-    # Color map for epoch progression
-    cmap = cm.get_cmap("plasma")
-    colors = [cmap(i / (num_epochs - 1)) for i in range(num_epochs)]
-    
-    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(14, 15))
-    fig.suptitle("Evolution of Statistics Across Epochs", fontsize=16, fontweight='bold')
-    fig.subplots_adjust(hspace=0.35, wspace=0.3)
-    
-    # Store data for all directories (for locate_epoch functionality)
-    all_data = {}
-    
-    for row_idx, traj_dir in enumerate(traj_dirs):
-        print(f"\n📁 Processing directory: {traj_dir}")
-        
-        # Storage for aggregated statistics per epoch
-        X_mean_full_per_epoch = []
-        X_std_full_per_epoch = []
-        U_mean_full_per_epoch = []
-        U_std_full_per_epoch = []
-        
-        for epoch_idx, epoch_dir in enumerate(epoch_dirs):
-            epoch_path = os.path.join(save_dir_path, epoch_dir, traj_dir)
-            
-            if not os.path.exists(epoch_path):
-                print(f"⚠️ Directory {epoch_path} not found. Skipping epoch.")
-                X_mean_full_per_epoch.append(np.nan)
-                X_std_full_per_epoch.append(np.nan)
-                U_mean_full_per_epoch.append(np.nan)
-                U_std_full_per_epoch.append(np.nan)
-                continue
-            
-            # Get all trajectory files in this epoch
-            all_files = [f for f in os.listdir(epoch_path) if f.startswith("trajectory_id_") and f.endswith(".json")]
-            
-            if not all_files:
-                print(f"⚠️ No trajectory files found in {epoch_path}.")
-                X_mean_full_per_epoch.append(np.nan)
-                X_std_full_per_epoch.append(np.nan)
-                U_mean_full_per_epoch.append(np.nan)
-                U_std_full_per_epoch.append(np.nan)
-                continue
-            
-            # Collect X_mean and U_mean from all trajectories
-            X_means = []
-            U_means = []
-            
-            for file_name in all_files:
-                file_path = os.path.join(epoch_path, file_name)
-                with open(file_path, "r") as f:
-                    data = json.load(f)
-                    X_means.append(data["X_mean"])
-                    U_means.append(data["U_mean"])
-            
-            # Calculate means and standard deviations across all trajectory IDs
-            X_mean_full = np.mean(X_means)
-            X_std_full = np.std(X_means)
-            U_mean_full = np.mean(U_means)
-            U_std_full = np.std(U_means)
-            
-            X_mean_full_per_epoch.append(X_mean_full)
-            X_std_full_per_epoch.append(X_std_full)
-            U_mean_full_per_epoch.append(U_mean_full)
-            U_std_full_per_epoch.append(U_std_full)
-        
-        # Store data for this directory
-        all_data[traj_dir] = {
-            'X_mean_full': X_mean_full_per_epoch,
-            'X_std_full': X_std_full_per_epoch,
-            'U_mean_full': U_mean_full_per_epoch,
-            'U_std_full': U_std_full_per_epoch
-        }
-        
-        # ===== LEFT PLOT: Standard Deviations =====
-        ax_std = axes[row_idx, 0]
-        ax_std.set_title(f"{traj_dir.replace('_', ' ')} - Std Deviation")
-        ax_std.set_xlabel("X_std_full (Std of X_means)")
-        ax_std.set_ylabel("U_std_full (Std of U_means)")
-        ax_std.grid(True, linestyle="--", alpha=0.5)
-        
-        # Plot lines connecting epochs
-        for i in range(len(X_std_full_per_epoch) - 1):
-            if not (np.isnan(X_std_full_per_epoch[i]) or np.isnan(X_std_full_per_epoch[i+1])):
-                ax_std.plot(
-                    [X_std_full_per_epoch[i], X_std_full_per_epoch[i+1]],
-                    [U_std_full_per_epoch[i], U_std_full_per_epoch[i+1]],
-                    color=colors[i],
-                    alpha=0.8,
-                    linewidth=2
-                )
-        
-        # Plot points for each epoch
-        valid_indices = [i for i in range(len(X_std_full_per_epoch)) if not np.isnan(X_std_full_per_epoch[i])]
-        for i in valid_indices:
-            ax_std.scatter(
-                X_std_full_per_epoch[i],
-                U_std_full_per_epoch[i],
-                color=colors[i],
-                s=100,
-                edgecolor='black',
-                linewidth=1.5,
-                zorder=5
-            )
-        
-        # Mark start and end
-        if valid_indices:
-            ax_std.scatter(
-                X_std_full_per_epoch[valid_indices[0]],
-                U_std_full_per_epoch[valid_indices[0]],
-                color='red',
-                marker='o',
-                s=150,
-                edgecolor='black',
-                linewidth=2,
-                zorder=6,
-                label='Start'
-            )
-            ax_std.scatter(
-                X_std_full_per_epoch[valid_indices[-1]],
-                U_std_full_per_epoch[valid_indices[-1]],
-                color='black',
-                marker='x',
-                s=150,
-                linewidth=3,
-                zorder=6,
-                label='End'
-            )
-        
-        # Highlight the specific epoch if requested
-        if locate_epoch is not None and locate_epoch < len(X_std_full_per_epoch):
-            if not np.isnan(X_std_full_per_epoch[locate_epoch]):
-                ax_std.scatter(
-                    X_std_full_per_epoch[locate_epoch],
-                    U_std_full_per_epoch[locate_epoch],
-                    color='lime',
-                    marker='*',
-                    s=400,
-                    edgecolor='darkgreen',
-                    linewidth=3,
-                    zorder=7,
-                    label=f'Epoch {locate_epoch}'
-                )
-        
-        if valid_indices or locate_epoch is not None:
-            ax_std.legend(loc='best')
-        
-        # Add colorbar for epoch progression
-        norm = plt.Normalize(vmin=0, vmax=num_epochs - 1)
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
-        cbar_std = fig.colorbar(sm, ax=ax_std, orientation="horizontal", fraction=0.05, pad=0.15)
-        cbar_std.set_label("Epoch progression")
-        
-        # ===== RIGHT PLOT: Means =====
-        ax_mean = axes[row_idx, 1]
-        ax_mean.set_title(f"{traj_dir.replace('_', ' ')} - Mean Values")
-        ax_mean.set_xlabel("X_mean_full (Mean of X_means)")
-        ax_mean.set_ylabel("U_mean_full (Mean of U_means)")
-        ax_mean.grid(True, linestyle="--", alpha=0.5)
-        
-        # Plot lines connecting epochs
-        for i in range(len(X_mean_full_per_epoch) - 1):
-            if not (np.isnan(X_mean_full_per_epoch[i]) or np.isnan(X_mean_full_per_epoch[i+1])):
-                ax_mean.plot(
-                    [X_mean_full_per_epoch[i], X_mean_full_per_epoch[i+1]],
-                    [U_mean_full_per_epoch[i], U_mean_full_per_epoch[i+1]],
-                    color=colors[i],
-                    alpha=0.8,
-                    linewidth=2
-                )
-        
-        # Plot points for each epoch
-        valid_indices_mean = [i for i in range(len(X_mean_full_per_epoch)) if not np.isnan(X_mean_full_per_epoch[i])]
-        for i in valid_indices_mean:
-            ax_mean.scatter(
-                X_mean_full_per_epoch[i],
-                U_mean_full_per_epoch[i],
-                color=colors[i],
-                s=100,
-                edgecolor='black',
-                linewidth=1.5,
-                zorder=5
-            )
-        
-        # Mark start and end
-        if valid_indices_mean:
-            ax_mean.scatter(
-                X_mean_full_per_epoch[valid_indices_mean[0]],
-                U_mean_full_per_epoch[valid_indices_mean[0]],
-                color='red',
-                marker='o',
-                s=150,
-                edgecolor='black',
-                linewidth=2,
-                zorder=6,
-                label='Start'
-            )
-            ax_mean.scatter(
-                X_mean_full_per_epoch[valid_indices_mean[-1]],
-                U_mean_full_per_epoch[valid_indices_mean[-1]],
-                color='black',
-                marker='x',
-                s=150,
-                linewidth=3,
-                zorder=6,
-                label='End'
-            )
-        
-        # Highlight the specific epoch if requested
-        if locate_epoch is not None and locate_epoch < len(X_mean_full_per_epoch):
-            if not np.isnan(X_mean_full_per_epoch[locate_epoch]):
-                ax_mean.scatter(
-                    X_mean_full_per_epoch[locate_epoch],
-                    U_mean_full_per_epoch[locate_epoch],
-                    color='lime',
-                    marker='*',
-                    s=400,
-                    edgecolor='darkgreen',
-                    linewidth=3,
-                    zorder=7,
-                    label=f'Epoch {locate_epoch}'
-                )
-        
-        if valid_indices_mean or locate_epoch is not None:
-            ax_mean.legend(loc='best')
-        
-        # Add colorbar for epoch progression
-        cbar_mean = fig.colorbar(sm, ax=ax_mean, orientation="horizontal", fraction=0.05, pad=0.15)
-        cbar_mean.set_label("Epoch progression")
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Print statistics for the located epoch
-    if locate_epoch is not None:
-        print(f"\n{'='*60}")
-        print(f"Statistics for Epoch {locate_epoch}:")
-        print(f"{'='*60}")
-        for traj_dir in traj_dirs:
-            if locate_epoch < len(all_data[traj_dir]['X_mean_full']):
-                X_mean_full = all_data[traj_dir]['X_mean_full'][locate_epoch]
-                X_std_full = all_data[traj_dir]['X_std_full'][locate_epoch]
-                U_mean_full = all_data[traj_dir]['U_mean_full'][locate_epoch]
-                U_std_full = all_data[traj_dir]['U_std_full'][locate_epoch]
-                
-                if not np.isnan(X_mean_full):
-                    print(f"\n{traj_dir}:")
-                    print(f"  X: {X_mean_full:.6f} ± {X_std_full:.6f}")
-                    print(f"  U: {U_mean_full:.6f} ± {U_std_full:.6f}")
-                else:
-                    print(f"\n{traj_dir}: No data available")
-            else:
-                print(f"\n{traj_dir}: Epoch {locate_epoch} not found")
-        print(f"{'='*60}")
+
 
 
 
@@ -8598,45 +7931,7 @@ def compute_symplectic_product(jacobian):
     
     return result
 
-def check_canonical_transformation(symplectic_result, tolerance=1e-5):
-    """
-    Check if all transformations are canonical (i.e., M^T * Ω * M = Ω for all samples).
-    
-    A transformation is canonical if it preserves the symplectic structure,
-    meaning M^T * Ω * M = Ω.
-    
-    Args:
-        symplectic_result: Tensor of shape [2, 2, batch_size] from compute_symplectic_product
-        tolerance: Tolerance for floating point comparison (default: 1e-5)
-    """
-    batch_size = symplectic_result.shape[2]
-    device = symplectic_result.device
-    dtype = symplectic_result.dtype
-    
-    # Create the symplectic matrix Ω
-    Omega = torch.tensor([[0.0, 1.0],
-                          [-1.0, 0.0]], 
-                         device=device, 
-                         dtype=dtype)
-    
-    # Find which samples don't match
-    non_canonical_indices = []
-    max_error = 0.0
-    
-    for i in range(batch_size):
-        diff = torch.abs(symplectic_result[:, :, i] - Omega)
-        sample_max_error = diff.max().item()
-        max_error = max(max_error, sample_max_error)
-        
-        if sample_max_error > tolerance:
-            non_canonical_indices.append(i)
-    
-    if len(non_canonical_indices) == 0:
-        print(f"✓ All {batch_size} transformations are canonical (preserve symplectic structure)!")
-        print(f"  Maximum error across all samples: {max_error:.2e}")
-    else:
-        print(f"Samples {non_canonical_indices} failed the canonical test")
-        print(f"  Maximum error across all samples: {max_error:.2e}")
+
 
 
 def test_canonical_transformation_on_trajectory(
@@ -8815,526 +8110,665 @@ def test_canonical_transformation_on_trajectory(
 
 
 
-def plot_all_transformed_trajectories(test_id_df, test_df, 
-                                     get_data_from_trajectory_id_function, 
-                                     Tmax, device, mapping_net, option_1=True, 
-                                     only_plot_percentage=None):
-    """
-    Plot all transformed trajectories with time series and mean value scatter plots.
-    """
-    if Tmax is None or Tmax <= 0:
-        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
 
-    if only_plot_percentage is not None:
-        if not (0.0 <= only_plot_percentage <= 1.0):
-            raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
+
+
+
+
+
+
+
+
+        
+
+
+
+
+
+
+
+"""
+=================
+Local (per-sample) Lyapunov-time estimation from an ensemble of Hamiltonian
+trajectories sampled in full phase space (q, p), with a common sampling step dt.
+
+Pipeline (every step attributable to prior work):
+  1. Canonical per-conjugate-pair scaling  Q=q/alpha, P=p*alpha, alpha=sqrt(sq/sp).
+     Symplectic (preserves dq^dp), diagonal (no matrix-root ambiguity), and
+     leaves the Lyapunov slope invariant (Eckmann & Ruelle, Rev. Mod. Phys. 57,
+     617, 1985: lambda_max is invariant under smooth invertible coordinate change).
+  2. Neighbour search in scaled phase space (KD-tree). Cross-trajectory neighbours
+     always accepted; same-trajectory neighbours accepted only if |t_j - t0| > w
+     (Theiler 1986). w self-defined as 2 * first-zero-crossing of autocorrelation.
+  3. Per-reference divergence curve S_ref(tau) = ln < ||.|| >_neighbours
+     (Kantz 1994, Phys. Lett. A 185, 77: average distances inside the ball, THEN
+     log). Look-aheads are integer row offsets since dt is common. Neighbours drop
+     out as their own trajectory ends; |S_k| may shrink with k (Kantz-native).
+  4. Automatic scaling-region slope via the ensemble method of Deshmukh, Bradley,
+     Garland & Meiss (Chaos 31, 123102, 2021): all endpoint pairs -> weighted
+     slope PDF -> KDE mode = slope; FWHM gives spread and a no-region verdict.
+     Weights = fit_length**lpower / fit_error**epower with (lpower,epower)=(1,1)
+     for Lyapunov exponents (paper Appendix A; repo ensembles.py).
+  5. Combine across the eps-sweep by Kantz's own rule: arithmetic mean of the
+     per-eps slopes over the eps that produced a valid region; spread = std.
+  6. Convert to local Lyapunov time: 1/lambda (chaotic), inf (lambda ~ 0 within
+     its spread: regular/integrable region), NaN (no valid region / curve too
+     short -> includes end-of-trajectory samples and uncovered regions).
+
+Only two REQUIRED knobs: min_neighbors and min_region_points. Everything else
+self-defines from the data or is swept.
+"""
+
+
+from scipy.stats import gaussian_kde
+from sklearn.neighbors import KDTree
+
+
+# --------------------------------------------------------------------------- #
+#  Deshmukh et al. (2021) ensemble scaling-region estimator
+#  Reproduced from paper Appendix A + the repo's reference functions
+#  (generate_individual_ensembles_ordered_fixed and utils.half_max_x).
+# --------------------------------------------------------------------------- #
+
+def _half_max_x(x, y):
+    """FWHM endpoints of a peak, via linear interpolation at half maximum.
+
+    Verbatim port of utils.half_max_x from vrd1243/scaling_regions_ensemble.
+    Returns [x_left, x_right] bracketing the peak at half its maximum height.
+    """
+    half = np.max(y) / 2.0
+    signs = np.sign(np.add(y, -half))
+    zero_crossings = (signs[0:-2] != signs[1:-1])
+    zc_i = np.where(zero_crossings)[0]
+
+    def lin_interp(i):
+        return x[i] + (x[i + 1] - x[i]) * ((half - y[i]) / (y[i + 1] - y[i]))
+
+    if len(zc_i) == 0:
+        return [x[np.argmax(y)], x[np.argmax(y)]]
+    if len(zc_i) == 1:
+        return [lin_interp(zc_i[0]), np.max(x)]
+    return [lin_interp(zc_i[0]), lin_interp(zc_i[-1])]
+
+
+def _ensemble_slopes(xdata, ydata, min_points, lpower=1.0, epower=1.0):
+    """Ordered ensemble of straight-line fits over all sub-intervals.
+
+    Port of generate_individual_ensembles_ordered_fixed (repo ensembles.py):
+    for every pair (l, r) with r - l >= min_points, least-squares fit a line,
+    record its slope, a fit-length weight (A1) and a fit-error weight (A2),
+    then form the combined weight (A3) = length**lpower / error**epower.
+
+    Returns (slopes, weights) as 1-D arrays, or (None, None) if too few points.
+    """
+    x = np.asarray(xdata, dtype=float)
+    y = np.asarray(ydata, dtype=float)
+    N = len(x)
+    if N < min_points + 1:
+        return None, None
+
+    # Prefix sums so any interval [l..r] (inclusive) least-squares line is O(1).
+    # Slope over [l,r] = (n*Sxy - Sx*Sy) / (n*Sxx - Sx^2), with sums over the
+    # interval; SSE (residual sum of squares) from the standard identity.
+    cx = np.concatenate(([0.0], np.cumsum(x)))
+    cy = np.concatenate(([0.0], np.cumsum(y)))
+    cxx = np.concatenate(([0.0], np.cumsum(x * x)))
+    cyy = np.concatenate(([0.0], np.cumsum(y * y)))
+    cxy = np.concatenate(([0.0], np.cumsum(x * y)))
+
+    ls, rs = [], []
     
-    if 'phi' in test_id_df.columns:
-        phi_column = 'phi'
-    elif 'phi0' in test_id_df.columns:
-        phi_column = 'phi0'
+    ls, rs = np.triu_indices(N, k=min_points)
+    # inclusive interval [l..r] -> prefix indices [l, r+1]
+    n = (rs - ls + 1).astype(float)
+    Sx = cx[rs + 1] - cx[ls]
+    Sy = cy[rs + 1] - cy[ls]
+    Sxx = cxx[rs + 1] - cxx[ls]
+    Syy = cyy[rs + 1] - cyy[ls]
+    Sxy = cxy[rs + 1] - cxy[ls]
+
+    denom = n * Sxx - Sx * Sx
+    denom_safe = np.where(np.abs(denom) < 1e-300, np.nan, denom)
+    slope = (n * Sxy - Sx * Sy) / denom_safe
+    intercept = (Sy - slope * Sx) / n
+    # SSE = Syy - a*Sy - b*Sxy   (a=intercept, b=slope), guard tiny negatives
+    sse = Syy - intercept * Sy - slope * Sxy
+    sse = np.clip(sse, 0.0, None)
+    fit_error = 1e-10 + np.sqrt(sse / (n - 1))
+    dx = x[rs] - x[ls]
+    fit_length = np.sqrt(dx ** 2 + (slope * dx) ** 2)
+    weights = fit_length ** lpower / fit_error ** epower
+
+    good = np.isfinite(slope) & np.isfinite(weights)
+    return slope[good], weights[good]
+
+
+def ensemble_scaling_slope(xdata, ydata, min_points=10,
+                           lpower=1.0, epower=1.0, n_grid=1000,
+                           fwhm_frac_max=0.5):
+    """Deshmukh ensemble slope of a scaling region, with a no-region verdict.
+
+    Parameters
+    ----------
+    xdata, ydata : the divergence curve (tau, S(tau)) for one reference/eps.
+    min_points   : minimum interval width n (paper default 10).
+    lpower,epower: weight exponents; (1,1) for Lyapunov exponents (paper).
+    n_grid       : KDE evaluation grid resolution.
+    fwhm_frac_max: reject as "no scaling region" if the FWHM of the slope PDF
+                   exceeds this fraction of the total slope range (a wide PDF
+                   means no clear mode -> no region, per Deshmukh Sec. II/III).
+
+    Returns
+    -------
+    dict with keys: slope (mode of PDF or NaN), sigma (std within FWHM),
+    valid (bool), fwhm.
+    """
+    nan = {"slope": np.nan, "sigma": np.nan, "valid": False, "fwhm": np.nan}
+
+    slopes, weights = _ensemble_slopes(xdata, ydata, min_points, lpower, epower)
+    if slopes is None or len(slopes) < 3:
+        return nan
+    if not np.all(np.isfinite(slopes)) or np.ptp(slopes) == 0:
+        # all identical slopes -> degenerate but well-defined
+        return {"slope": float(np.mean(slopes)), "sigma": 0.0,
+                "valid": True, "fwhm": 0.0}
+    w = weights.copy()
+    if not np.all(np.isfinite(w)) or np.sum(w) <= 0:
+        w = np.ones_like(slopes)
+
+    # weighted KDE over the slope distribution -> mode is the slope estimate
+    try:
+        kde = gaussian_kde(slopes, weights=w)  # Scott's rule bandwidth (default)
+    except Exception:
+        return nan
+    grid = np.linspace(slopes.min(), slopes.max(), n_grid)
+    pdf = kde(grid)
+    mode = grid[np.argmax(pdf)]
+
+    # FWHM of the peak -> spread + region-existence gate
+    lo, hi = _half_max_x(grid, pdf)
+    fwhm = float(hi - lo)
+    total_range = float(slopes.max() - slopes.min())
+
+    # sigma: std of the weighted slopes lying within the FWHM band
+    in_band = (slopes >= lo) & (slopes <= hi)
+    if np.count_nonzero(in_band) >= 2:
+        sigma = float(np.std(slopes[in_band]))
     else:
-        raise ValueError("DataFrame must contain either 'phi' or 'phi0' column")
-    
-    trajectory_ids = test_id_df['trajectory_id'].values
-    
-    X_final_list = []
-    U_final_list = []
-    ref_t_filtered = None
-    
-    for trajectory_id in trajectory_ids:
-        test_trajectory_data = get_data_from_trajectory_id_function(
-            test_id_df, test_df, trajectory_ids=trajectory_id
-        )
-        
-        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-        
-        mask = t < Tmax
-        t_filtered = t[mask]
-        
-        if ref_t_filtered is None:
-            ref_t_filtered = t_filtered
+        sigma = float(np.std(slopes))
+
+    valid = (total_range > 0) and (fwhm <= fwhm_frac_max * total_range)
+    if not valid:
+        return {"slope": float(mode), "sigma": sigma, "valid": False,
+                "fwhm": fwhm}
+    return {"slope": float(mode), "sigma": sigma, "valid": True, "fwhm": fwhm}
+
+
+# --------------------------------------------------------------------------- #
+#  Self-defined hyperparameters
+# --------------------------------------------------------------------------- #
+
+def theiler_window_from_autocorr(series_list):
+    """Theiler window w = 2 * (first zero-crossing lag of autocorrelation).
+
+    Theiler (1986), Phys. Rev. A 34, 2427; the 2x-autocorrelation-time rule is
+    the standard no-tuning default. Computed per trajectory on the first phase
+    coordinate and aggregated by the median first-zero lag, then doubled.
+    """
+    first_zeros = []
+    for s in series_list:
+        s = np.asarray(s, dtype=float)
+        s = s - s.mean()
+        if len(s) < 4 or np.allclose(s, 0):
+            continue
+        ac = np.correlate(s, s, mode="full")[len(s) - 1:]
+        if ac[0] == 0:
+            continue
+        ac = ac / ac[0]
+        zc = np.where(np.diff(np.sign(ac)) != 0)[0]
+        if len(zc) > 0:
+            first_zeros.append(int(zc[0]))
+    if not first_zeros:
+        return 1
+    return int(max(1, 2 * int(np.median(first_zeros))))
+
+
+def canonical_pair_scaling(Q_cols, P_cols, df):
+    """Per-conjugate-pair symplectic scaling factors alpha_i = sqrt(sq_i/sp_i)."""
+    alphas = np.zeros(len(Q_cols))
+    for i, (qc, pc) in enumerate(zip(Q_cols, P_cols)):
+        sq = df[qc].to_numpy(dtype=float).std()
+        sp = df[pc].to_numpy(dtype=float).std()
+        if sp == 0 or sq == 0:
+            alphas[i] = 1.0
         else:
-            if len(t_filtered) != len(ref_t_filtered):
-                raise ValueError(
-                    f"Trajectory {trajectory_id} has {len(t_filtered)} points with t < Tmax, "
-                    f"expected {len(ref_t_filtered)}. All trajectories must have the same number of points."
-                )
-            if not torch.allclose(t_filtered, ref_t_filtered, atol=1e-6):
-                raise ValueError(
-                    f"Trajectory {trajectory_id} has different time values for t < Tmax. "
-                    f"All trajectories must share the same time values."
-                )
-        
-        X_final, U_final, _ = mapping_net(x[mask], u[mask], t_filtered)
-        
-        X_final_list.append(X_final)
-        U_final_list.append(U_final)
-    
-    t_final_np = ref_t_filtered.cpu().detach().numpy()
-    
-    phis = test_id_df[phi_column].values
-    energies = test_id_df['energy'].values
-    
-    X_final_means = [X_tensor.cpu().detach().mean().item() for X_tensor in X_final_list]
-    U_final_means = [U_tensor.cpu().detach().mean().item() for U_tensor in U_final_list]
-    
-    if only_plot_percentage is not None:
-        n_trajectories = len(X_final_list)
-        n_to_plot = max(1, int(n_trajectories * only_plot_percentage))
-        plot_indices = np.random.choice(n_trajectories, size=n_to_plot, replace=False)
-        plot_indices = sorted(plot_indices)
-    else:
-        plot_indices = list(range(len(X_final_list)))
-    
-    import matplotlib.cm as cm
-    n_total = len(X_final_list)
-    colors = cm.get_cmap('tab10' if n_total <= 10 else 'tab20' if n_total <= 20 else 'hsv')(np.linspace(0, 1, n_total))
-    
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
-    
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax3 = fig.add_subplot(gs[1, 0])
-    ax4 = fig.add_subplot(gs[1, 1])
-    
-    for i in plot_indices:
-        X_tensor = X_final_list[i]
-        X_np = X_tensor.cpu().detach().numpy()
-        ax1.plot(t_final_np, X_np, alpha=0.7, color=colors[i])
-    
-    ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('Q(t)')
-    if only_plot_percentage is not None:
-        ax1.set_title(f"Trajectories' Q(t) — {len(plot_indices)} of {n_total} ({only_plot_percentage*100:.1f}%)")
-    else:
-        ax1.set_title(f"Trajectories' Q(t) — All {n_total} Trajectories")
-    ax1.grid(True, alpha=0.3)
-    
-    for i in plot_indices:
-        U_tensor = U_final_list[i]
-        U_np = U_tensor.cpu().detach().numpy()
-        ax2.plot(t_final_np, U_np, alpha=0.7, color=colors[i])
-    
-    ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('P(t)')
-    if only_plot_percentage is not None:
-        ax2.set_title(f"Trajectories' P(t) — {len(plot_indices)} of {n_total} ({only_plot_percentage*100:.1f}%)")
-    else:
-        ax2.set_title(f"Trajectories' P(t) — All {n_total} Trajectories")
-    ax2.grid(True, alpha=0.3)
-    
-    if option_1:
-        ax3.scatter(X_final_means, phis, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
-        ax3.set_xlabel('Mean Q', fontsize=12)
-        ax3.set_ylabel(f'{phi_column.capitalize()}', fontsize=12)
-        ax3.set_title(f'Mean Q vs {phi_column.capitalize()}', fontsize=14)
-        ax3.grid(True, alpha=0.3)
-        
-        ax4.scatter(U_final_means, energies, s=100, alpha=0.7, color='red', edgecolors='black', linewidth=1.5)
-        ax4.set_xlabel('Mean P', fontsize=12)
-        ax4.set_ylabel('Energy', fontsize=12)
-        ax4.set_title('Mean P vs Energy', fontsize=14)
-        ax4.grid(True, alpha=0.3)
-    else:
-        ax3.scatter(X_final_means, energies, s=100, alpha=0.7, edgecolors='black', linewidth=1.5)
-        ax3.set_xlabel('Mean Q', fontsize=12)
-        ax3.set_ylabel('Energy', fontsize=12)
-        ax3.set_title('Mean Q vs Energy', fontsize=14)
-        ax3.grid(True, alpha=0.3)
-        
-        ax4.scatter(U_final_means, phis, s=100, alpha=0.7, color='red', edgecolors='black', linewidth=1.5)
-        ax4.set_xlabel('Mean P', fontsize=12)
-        ax4.set_ylabel(f'{phi_column.capitalize()}', fontsize=12)
-        ax4.set_title(f'Mean P vs {phi_column.capitalize()}', fontsize=14)
-        ax4.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.show()
+            alphas[i] = np.sqrt(sq / sp)
+    return alphas
 
 
+def eps_grid_from_pairwise(X, n_eps=10, lo_pct=1.0, hi_pct=20.0,
+                           max_pairs=200000, rng=None):
+    """Geometric grid of eps between percentiles of pairwise-distance dist."""
+    rng = np.random.default_rng(0 if rng is None else rng)
+    N = len(X)
+    n_sample = int(np.ceil(np.sqrt(2 * max_pairs)))
+    n_sample = min(N, max(n_sample, 2))
+    idx = rng.choice(N, size=n_sample, replace=False)
+    S = X[idx]
+    # pairwise distances among the sample
+    diff = S[:, None, :] - S[None, :, :]
+    d = np.sqrt((diff ** 2).sum(-1))
+    iu = np.triu_indices(len(S), k=1)
+    dvals = d[iu]
+    dvals = dvals[dvals > 0]
+    lo = np.percentile(dvals, lo_pct)
+    hi = np.percentile(dvals, hi_pct)
+    lo = max(lo, 1e-12)
+    return np.geomspace(lo, hi, n_eps)
 
 
+# --------------------------------------------------------------------------- #
+#  Main driver
+# --------------------------------------------------------------------------- #
 
+def local_lyapunov_times(df, dt,
+                         min_neighbors,          # REQUIRED
+                         min_region_points,      # REQUIRED
+                         q_cols=None, p_cols=None, t_col="t",
+                         traj_col="traj_id",
+                         w=None,                 # self-defined if None
+                         K_max=None,             # self-defined if None
+                         n_eps=8, eps_lo_pct=1.0, eps_hi_pct=20.0,
+                         lpower=1.0, epower=1.0,
+                         fwhm_frac_max=0.5,
+                         zero_tol_factor=2.0,
+                         min_valid_eps=2,
+                         curve_len_factor=4,
+                         rng=0, 
+                         return_details=False,
+                         verbose=True):
 
-def plot_all_transformed_trajectories_multiple_periods(test_id_df, test_df, 
-                                     get_data_from_trajectory_id_function, 
-                                     Tmax, device, mapping_net,
-                                     only_plot_percentage=None):
+    """Compute one local Lyapunov-time estimate per sample.
+
+    Parameters
+    ----------
+    df : DataFrame with columns traj_col, q_cols..., p_cols..., t_col.
+         Rows are all samples from all trajectories.
+    dt : common sampling interval (float).
+    min_neighbors : minimum accepted neighbours in an eps-ball to fit a curve.
+    min_region_points : minimum width of a scaling region (Deshmukh 'n').
+    q_cols, p_cols : lists of the n position / n momentum column names.
+                     If None, inferred (single-DoF: q_cols=['x'], p_cols=['u']).
+    t_col, traj_col : column names for time and trajectory id.
+    w : Theiler window in steps; self-defined (2x autocorr zero) if None.
+    K_max : max look-ahead in steps; longest trajectory length if None.
+    n_eps, eps_lo_pct, eps_hi_pct : eps-sweep grid controls (self-defined range).
+    lpower, epower : Deshmukh weight exponents (1,1 for Lyapunov).
+    fwhm_frac_max : Deshmukh no-region gate.
+    zero_tol_factor : lambda counts as 0 (=> tau_L=inf) if |lambda| <= factor*sigma.
+                     Default 2.0. Larger => more aggressively absorbs near-zero
+                     slopes into the "regular" (inf) verdict.
+    min_valid_eps : a sample is only given a finite (chaotic) tau_L if it produced
+                     a valid scaling region at >= this many eps values. Enforces
+                     Kantz's requirement that estimates agree across parameters;
+                     samples with fewer valid eps cannot be cross-checked and are
+                     treated as regular (inf) rather than trusted as chaotic.
+    curve_len_factor : cap the divergence curve at curve_len_factor*min_region_points
+                     steps. Self-defined efficiency cap (the scaling region lives at
+                     small tau; the saturated tail is discarded by the detector
+                     anyway). Increase only if regions sit at unusually large tau.
+    return_details : also return a per-sample details DataFrame.
+
+    Returns
+    -------
+    tau_L : np.ndarray, length len(df), aligned to df row order. Values are
+            finite>0 (chaotic), np.inf (regular), or np.nan (unestimable).
+    (optional) details : DataFrame with lambda, sigma, n_eps_valid, n_curve.
     """
-    Plot all transformed trajectories with time series,
-    including vertical markers for training periods.
-    """
-    if Tmax is None or Tmax <= 0:
-        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    df = df.reset_index(drop=True)
+    N = len(df)
 
-    if only_plot_percentage is not None:
-        if not (0.0 <= only_plot_percentage <= 1.0):
-            raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
-    
-    trajectory_ids = test_id_df['trajectory_id'].values
-    n_trajectories = len(trajectory_ids)
-    
-    X_final_list = [[] for _ in range(n_trajectories)]
-    U_final_list = [[] for _ in range(n_trajectories)]
-    
-    ref_t = None
-
-    for i, trajectory_id in enumerate(trajectory_ids):
-        test_trajectory_data = get_data_from_trajectory_id_function(
-            test_id_df, test_df, trajectory_ids=trajectory_id
-        )
-        
-        x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-        u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-        t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-
-        if ref_t is None:
-            ref_t = t
+    # ---- resolve columns -------------------------------------------------- #
+    if q_cols is None or p_cols is None:
+        # single-DoF convention from the user's data: 'x' (q), 'u' (p)
+        if "x" in df.columns and "u" in df.columns:
+            q_cols, p_cols = ["x"], ["u"]
         else:
-            if len(t) != len(ref_t):
-                raise ValueError(
-                    f"Trajectory {trajectory_id} has {len(t)} points, expected {len(ref_t)}. "
-                    f"All trajectories must have the same number of points."
-                )
-            if not torch.allclose(t, ref_t, atol=1e-6):
-                raise ValueError(
-                    f"Trajectory {trajectory_id} has different time values. "
-                    f"All trajectories must share the same time values."
-                )
+            raise ValueError("Specify q_cols and p_cols explicitly.")
+    assert len(q_cols) == len(p_cols), "q_cols and p_cols must have equal length"
 
-        t_np = t.detach().cpu().numpy()
-        t_max = t_np[-1]
-        
-        num_segments = int(np.ceil(t_max / Tmax))
-        
-        for seg_idx in range(num_segments):
-            t_start = seg_idx * Tmax
-            t_end = min((seg_idx + 1) * Tmax, t_max)
-            
-            if seg_idx == 0:
-                seg_mask = (t_np >= t_start) & (t_np <= t_end)
-            else:
-                seg_mask = (t_np > t_start) & (t_np <= t_end)
-            
-            seg_indices = np.where(seg_mask)[0]
-            
-            if len(seg_indices) == 0:
+    if traj_col not in df.columns:
+        raise ValueError(f"Missing trajectory column '{traj_col}'.")
+
+    # ---- Step 0: index by trajectory, integer within-trajectory positions - #
+    traj_ids = df[traj_col].to_numpy()
+    t_vals = df[t_col].to_numpy(dtype=float)
+    order = np.lexsort((t_vals, traj_ids))       # sort by traj, then time
+    inv_order = np.argsort(order)                # to map back to df order
+    df_s = df.iloc[order].reset_index(drop=True)
+    traj_s = df_s[traj_col].to_numpy()
+    t_s = df_s[t_col].to_numpy(dtype=float)
+
+    # per-trajectory contiguous blocks (data is now grouped and time-sorted)
+    uniq, starts = np.unique(traj_s, return_index=True)
+    starts = np.sort(starts)
+    ends = np.append(starts[1:], len(df_s))       # exclusive
+    traj_of = np.empty(len(df_s), dtype=int)
+    pos_in_traj = np.empty(len(df_s), dtype=int)   # integer step index (0-based)
+    n_blocks = len(starts)
+    traj_start_arr = np.zeros(n_blocks, dtype=int)
+    traj_len_arr = np.zeros(n_blocks, dtype=int)
+    for b, (s0, e0) in enumerate(zip(starts, ends)):
+        traj_of[s0:e0] = b
+        pos_in_traj[s0:e0] = np.arange(e0 - s0)
+        traj_start_arr[b] = s0
+        traj_len_arr[b] = e0 - s0
+    # dict views kept for readability where used outside the hot loop
+    traj_start = {b: int(traj_start_arr[b]) for b in range(n_blocks)}
+    traj_len = {b: int(traj_len_arr[b]) for b in range(n_blocks)}
+
+    # ---- Step 1: canonical per-pair scaling ------------------------------ #
+    alphas = canonical_pair_scaling(q_cols, p_cols, df_s)
+    Xraw = np.zeros((len(df_s), 2 * len(q_cols)), dtype=float)
+    for i, (qc, pc) in enumerate(zip(q_cols, p_cols)):
+        Xraw[:, 2 * i] = df_s[qc].to_numpy(dtype=float) / alphas[i]     # Q = q/alpha
+        Xraw[:, 2 * i + 1] = df_s[pc].to_numpy(dtype=float) * alphas[i]  # P = p*alpha
+    X = Xraw
+
+    # ---- Step 2: self-defined w, K_max, eps grid ------------------------- #
+    if w is None:
+        series_list = [df_s[q_cols[0]].to_numpy()[traj_start[b]:traj_start[b] + traj_len[b]]
+                       for b in range(len(uniq))]
+        w = theiler_window_from_autocorr(series_list)
+    if K_max is None:
+        K_max = int(max(traj_len.values())) - 1
+
+    eps_grid = eps_grid_from_pairwise(X, n_eps=n_eps,
+                                      lo_pct=eps_lo_pct, hi_pct=eps_hi_pct,
+                                      rng=rng)
+
+    if verbose:
+        print(f"[setup] N={len(df_s)} samples, {len(uniq)} trajectories, "
+              f"dim(q,p)={X.shape[1]}")
+        print(f"[setup] Theiler w={w} steps, K_max={K_max} steps")
+        print(f"[setup] eps-subsample seed (rng)={rng}")
+        print(f"[setup] eps grid: {np.array2string(eps_grid, precision=4)}")
+
+    tree = KDTree(X)
+
+    # ---- Steps 3-5: per-reference loop ----------------------------------- #
+    lam = np.full(len(df_s), np.nan)
+    sig = np.full(len(df_s), np.nan)
+    n_valid_eps = np.zeros(len(df_s), dtype=int)
+    n_curve = np.zeros(len(df_s), dtype=int)
+
+    eps_max = eps_grid[-1]
+
+    for i in range(len(df_s)):
+        A = traj_of[i]
+        t0 = pos_in_traj[i]
+        A_start = traj_start[A]
+        A_len = traj_len[A]
+        max_k_ref = A_len - 1 - t0            # steps available on the reference
+        if max_k_ref < min_region_points:
+            continue                          # end-of-trajectory: self-excludes
+
+        # Same neighbours as the old batched tree.query_radius(X, ...) call,
+        # but queried one reference at a time so we never hold all N neighbour
+        # lists at once. query_radius treats each query point independently, so
+        # this returns identical indices/distances to the old all_idx[i]/all_dist[i].
+        _idx_i, _dist_i = tree.query_radius(X[i:i + 1], r=eps_max,
+                                            return_distance=True)
+        cand = _idx_i[0]
+        cdist = _dist_i[0]
+        # exclude self
+        keep = cand != i
+        cand = cand[keep]; cdist = cdist[keep]
+        if cand.size == 0:
+            continue
+
+        cand_traj = traj_of[cand]
+        cand_pos = pos_in_traj[cand]
+        # Theiler: same-trajectory neighbours must be > w steps away in time
+        same = cand_traj == A
+        theiler_ok = np.abs(cand_pos - t0) > w
+        accept_mask = (~same) | (same & theiler_ok)
+        cand = cand[accept_mask]
+        cdist = cdist[accept_mask]
+        cand_traj = cand_traj[accept_mask]
+        cand_pos = cand_pos[accept_mask]
+        if cand.size == 0:
+            continue
+
+        per_eps_slopes = []
+        for eps in eps_grid:
+            sel = cdist <= eps
+            if np.count_nonzero(sel) < min_neighbors:
                 continue
-            
-            t_seg = t[seg_indices]
-            t_seg_relative = t_seg - t_start
-            
-            X_final, U_final, _ = mapping_net(
-                x[seg_indices], 
-                u[seg_indices], 
-                t_seg_relative
-            )
-            
-            X_final_list[i].extend(X_final.cpu().detach().numpy())
-            U_final_list[i].extend(U_final.cpu().detach().numpy())
+            nb_traj = cand_traj[sel]
+            nb_pos = cand_pos[sel]
+            nb_start = traj_start_arr[nb_traj]     # global start row of each nbr
+            nb_tlen = traj_len_arr[nb_traj]        # length of each nbr's traj
+            nb_room = nb_tlen - 1 - nb_pos         # steps each nbr can advance
 
-    t_final_np = ref_t.detach().cpu().numpy()
+            # Step 3: divergence curve S(k), k = 1..k_cap, Kantz avg-then-log.
+            # The scaling region lives at small tau; building the fully saturated
+            # tail wastes O(L^2) fit work. Cap at curve_len_factor * region width
+            # (self-defined: "enough curve to contain a region plus margin").
+            k_cap = min(K_max, max_k_ref,
+                        curve_len_factor * min_region_points)
+            S = []
+            taus = []
+            for k in range(1, k_cap + 1):
+                ref_state = X[A_start + t0 + k]
+                alive = nb_room >= k            # neighbours still alive at step k
+                if not np.any(alive):
+                    break
+                fut_idx = nb_start[alive] + nb_pos[alive] + k
+                diff = X[fut_idx] - ref_state
+                dists = np.sqrt(np.einsum("ij,ij->i", diff, diff))
+                dists = dists[dists > 0]
+                if dists.size == 0:
+                    break
+                S.append(np.log(np.mean(dists)))
+                taus.append(k * dt)
 
-    if only_plot_percentage is not None:
-        n_to_plot = max(1, int(n_trajectories * only_plot_percentage))
-        plot_indices = np.random.choice(n_trajectories, size=n_to_plot, replace=False)
-        plot_indices = sorted(plot_indices)
-    else:
-        plot_indices = list(range(n_trajectories))
-    
-    import matplotlib.cm as cm
-    colors = cm.get_cmap('tab10' if n_trajectories <= 10 else 'tab20' if n_trajectories <= 20 else 'hsv')(np.linspace(0, 1, n_trajectories))
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            if len(S) < min_region_points + 1:
+                continue
+            n_curve[i] = max(n_curve[i], len(S))
 
-    for i in plot_indices:
-        X_np = np.array(X_final_list[i])
-        ax1.plot(t_final_np, X_np, alpha=0.7, color=colors[i])
-        
-        U_np = np.array(U_final_list[i])
-        ax2.plot(t_final_np, U_np, alpha=0.7, color=colors[i])
+            # Step 4: Deshmukh ensemble slope with region gate
+            res = ensemble_scaling_slope(np.array(taus), np.array(S),
+                                         min_points=min_region_points,
+                                         lpower=lpower, epower=epower,
+                                         fwhm_frac_max=fwhm_frac_max)
+            if res["valid"] and np.isfinite(res["slope"]):
+                per_eps_slopes.append(res["slope"])
 
-    max_time_in_plot = t_final_np[-1]
-    current_marker = Tmax
-    first_line = True
-    while current_marker < max_time_in_plot:
-        label = f'Tmax ({Tmax:.3f})' if first_line else None
-        ax1.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
-        ax2.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
-        current_marker += Tmax
-        first_line = False
-
-    ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('Q(t)')
-    if only_plot_percentage is not None:
-        ax1.set_title(f"Trajectories' Q(t) — {len(plot_indices)} of {n_trajectories} ({only_plot_percentage*100:.1f}%)")
-    else:
-        ax1.set_title(f"Trajectories' Q(t) — All {n_trajectories} Trajectories")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='upper right')
-
-    ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('P(t)')
-    if only_plot_percentage is not None:
-        ax2.set_title(f"Trajectories' P(t) — {len(plot_indices)} of {n_trajectories} ({only_plot_percentage*100:.1f}%)")
-    else:
-        ax2.set_title(f"Trajectories' P(t) — All {n_trajectories} Trajectories")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='upper right')
-    
-    plt.tight_layout()
-    plt.show()
-
-
-
-def plot_harmonic_oscillator_energy(x_pred, u_pred, x, u, t, k, mass):
-    """
-    Plot energy comparison for harmonic oscillator.
-    
-    E = 0.5 * m * u^2 + 0.5 * k * x^2
-    
-    Or equivalently (dividing by mass):
-    E/m = 0.5 * u^2 + 0.5 * (k/m) * x^2
-    """
-    t_np = t.detach().cpu().numpy()
-    x_pred_np = x_pred.detach().cpu().numpy()
-    u_pred_np = u_pred.detach().cpu().numpy()
-    x_np = x.detach().cpu().numpy()
-    u_np = u.detach().cpu().numpy()
-    
-    omega_squared = k / mass  # = -constant from your class
-    
-    def compute_energy(position, velocity):
-        kinetic = 0.5 * velocity**2
-        potential = 0.5 * omega_squared * position**2
-        return kinetic + potential
-    
-    energy_pred = compute_energy(x_pred_np, u_pred_np)
-    energy_true = compute_energy(x_np, u_np)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(t_np, energy_true, label='True', linewidth=2)
-    plt.plot(t_np, energy_pred, label='Predicted', linewidth=2, linestyle='--')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Energy / mass')
-    plt.title('Harmonic Oscillator Energy: Predicted vs True')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_ideal_pendulum_energy(x_pred, u_pred, x, u, t, g, length):
-    """
-    Plot energy comparison using the same formula as ideal_pendulum_GPT.
-    
-    E = 0.5 * omega^2 + (g/L) * (1 - cos(theta))
-    """
-    t_np = t.detach().cpu().numpy()
-    x_pred_np = x_pred.detach().cpu().numpy()
-    u_pred_np = u_pred.detach().cpu().numpy()
-    x_np = x.detach().cpu().numpy()
-    u_np = u.detach().cpu().numpy()
-    
-    constant = g / length  # same as your self.constant
-    
-    def compute_energy(theta, omega):
-        kinetic = 0.5 * omega**2
-        potential = constant * (1 - np.cos(theta))
-        return kinetic + potential
-    
-    energy_pred = compute_energy(x_pred_np, u_pred_np)
-    energy_true = compute_energy(x_np, u_np)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(t_np, energy_true, label='True', linewidth=2)
-    plt.plot(t_np, energy_pred, label='Predicted', linewidth=2, linestyle='--')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Energy (dimensionless)')
-    plt.title('Pendulum Energy: Predicted vs True')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_real_pendulum_energy(x_pred, u_pred, x, u, t, constant):
-    """
-    Plot energy for the Schmidt-Lipson real pendulum data.
-    Uses the same formula as Hamiltonian Neural Networks paper:
-    H = 2.4*(1 - cos(q)) + p^2
-    """
-    t_np = t.detach().cpu().numpy()
-    x_pred_np = x_pred.detach().cpu().numpy()
-    u_pred_np = u_pred.detach().cpu().numpy()
-    x_np = x.detach().cpu().numpy()
-    u_np = u.detach().cpu().numpy()
-    
-    def compute_energy(q, p, constant=constant):
-        kinetic = p**2          
-        potential = constant * (1 - np.cos(q))
-        return kinetic + potential
-    
-    energy_pred = compute_energy(x_pred_np, u_pred_np)
-    energy_true = compute_energy(x_np, u_np)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(t_np, energy_true, label='True', linewidth=2)
-    plt.plot(t_np, energy_pred, label='Predicted', linewidth=2, linestyle='--')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Energy')
-    plt.title('Real Pendulum Energy: Predicted vs True')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-
-        
-
-
-def plot_transformed_trajectory_real_pendulum(test_id_df, test_df, trajectory_id, 
-                                              get_data_from_trajectory_id_function, mapping_net,
-                                              Tmax, device):
-    """
-    Plot transformed trajectory (X_final and U_final) without energy or mean calculations.
-    """
-    if Tmax is None or Tmax <= 0:
-        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
-    
-    # Determine which columns are available
-    phi_column = None
-    if 'phi' in test_id_df.columns:
-        phi_column = 'phi'
-    elif 'phi0' in test_id_df.columns:
-        phi_column = 'phi0'
-    
-    # Load trajectory data
-    test_trajectory_data = get_data_from_trajectory_id_function(
-        test_id_df, test_df, trajectory_ids=trajectory_id
-    )
-    
-    x = torch.as_tensor(test_trajectory_data['x'].to_numpy(dtype=np.float32), device=device)
-    u = torch.as_tensor(test_trajectory_data['u'].to_numpy(dtype=np.float32), device=device)
-    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32), device=device)
-    
-    # Filter by Tmax
-    mask = t < Tmax
-    x_filtered = x[mask]
-    u_filtered = u[mask]
-    t_filtered = t[mask]
-    
-    # Apply mapping network
-    X_final, U_final, t_final = mapping_net(x_filtered, u_filtered, t_filtered)
-    
-    # Fetch reference values for this trajectory (if they exist)
-    trajectory_row = test_id_df[test_id_df['trajectory_id'] == trajectory_id].iloc[0]
-    phi_value = trajectory_row[phi_column] if phi_column is not None else None
-    
-    # Convert tensors to numpy
-    X_final_np = X_final.cpu().detach().numpy()
-    U_final_np = U_final.cpu().detach().numpy()
-    t_final_np = t_final.cpu().detach().numpy()
-    
-    # ==================== PLOT: X_final and U_final ====================
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-    # --- Subplot 1: X_final ---
-    ax1.plot(t_final_np, X_final_np, label='Q(t)', color='blue')
-    
-    if phi_value is not None:
-        ax1.axhline(y=phi_value, color='orange', linestyle='--', linewidth=2, 
-                    label=f'{phi_column} = {phi_value:.4f}')
-        
-    ax1.set_xlabel('Time (t)')
-    ax1.set_ylabel('Q(t)')
-    ax1.set_title(f'Q(t) — Trajectory {trajectory_id}')
-    ax1.grid(True)
-    ax1.legend()
-    
-    # --- Subplot 2: U_final ---
-    ax2.plot(t_final_np, U_final_np, label='P(t)', color='red')
-
-    ax2.set_xlabel('Time (t)')
-    ax2.set_ylabel('P(t)')
-    ax2.set_title(f'P(t) — Trajectory {trajectory_id}')
-    ax2.grid(True)
-    ax2.legend()
-    
-    plt.tight_layout()
-    plt.show()
-
-
-def get_top_checkpoint_epochs(save_dir_path, metrics_to_analyze):
-    """
-    For each metric, finds the top 5 epochs (multiples of 10) with the lowest values.
-    Returns a list of unique checkpoint filenames.
-    
-    Args:
-        save_dir_path (str): Path to the main directory containing 'epoch_n' subdirectories.
-        metrics_to_analyze (list of str): List of metric names to analyze.
-    
-    Returns:
-        list of str: List starting with "best_model.pt" followed by unique checkpoint filenames
-                     in format "checkpoint_epoch_{epoch_number}.pt"
-    """
-
-    
-    # --- Collect all epoch directories ---
-    epoch_dirs = sorted(
-        [d for d in os.listdir(save_dir_path) if d.startswith("epoch_")],
-        key=lambda x: int(x.split("_")[1])
-    )
-    
-    # --- Collect data ---
-    metrics_data = {metric: [] for metric in metrics_to_analyze}
-    epochs = []
-    
-    for d in epoch_dirs:
-        epoch_path = os.path.join(save_dir_path, d, "epoch_metrics.json")
-        if not os.path.isfile(epoch_path):
+        # Step 5: Kantz mean over eps that produced a valid region
+        if len(per_eps_slopes) == 0:
+            if n_curve[i] >= min_region_points + 3:
+                lam[i] = 0.0; sig[i] = 0.0     # n_valid_eps=0 < min_valid_eps -> inf
             continue
-        
-        with open(epoch_path, "r") as f:
-            data = json.load(f)
-        
-        epoch_num = data.get("epoch", int(d.split("_")[1]))
-        epochs.append(epoch_num)
-        
-        for metric in metrics_to_analyze:
-            metrics_data[metric].append(data.get(metric, None))
-    
-    # --- Collect all unique epochs from top 5s ---
-    unique_epochs = set()
-    
-    for metric in metrics_to_analyze:
-        # Filter for epochs that are multiples of 10
-        filtered_data = [
-            (epoch, value) 
-            for epoch, value in zip(epochs, metrics_data[metric]) 
-            if epoch % 10 == 0 and value is not None
-        ]
-        
-        if not filtered_data:
-            continue
-        
-        # Sort by value (lowest first) and take top 5
-        top_5 = sorted(filtered_data, key=lambda x: x[1])[:5]
-        
-        for epoch, value in top_5:
-            unique_epochs.add(epoch)
-    
-    # --- Create checkpoint list ---
-    checkpoint_list = ["best_model.pt"]
-    
-    # Sort epochs and create checkpoint filenames
-    for epoch in sorted(unique_epochs):
-        checkpoint_list.append(f"checkpoint_epoch_{epoch}.pt")
-    
-    return checkpoint_list
+        n_valid_eps[i] = len(per_eps_slopes)
+        lam[i] = float(np.mean(per_eps_slopes))
+        sig[i] = float(np.std(per_eps_slopes)) if len(per_eps_slopes) > 1 else 0.0
+
+    # ---- Step 6: convert to local Lyapunov time -------------------------- #
+    tau_L_s = np.full(len(df_s), np.nan)
+    for i in range(len(df_s)):
+        li = lam[i]
+        if not np.isfinite(li):
+            tau_L_s[i] = np.nan
+        elif n_valid_eps[i] < min_valid_eps:
+            # too few eps to cross-check (Kantz consistency) -> treat as regular
+            tau_L_s[i] = np.inf
+        elif abs(li) <= zero_tol_factor * (sig[i] if np.isfinite(sig[i]) else 0.0):
+            tau_L_s[i] = np.inf          # regular / integrable region
+        elif li > 0:
+            tau_L_s[i] = 1.0 / li
+        else:
+            # strongly negative slope (contraction/artefact) -> not a positive
+            # exponent; report as regular rather than a spurious time
+            tau_L_s[i] = np.inf
+
+    # ---- map back to original df row order ------------------------------- #
+    tau_L = tau_L_s[inv_order]
+    if verbose:
+        finite = np.isfinite(tau_L) & ~np.isinf(tau_L)
+        print(f"[done] finite tau_L: {np.count_nonzero(finite)}, "
+              f"inf (regular): {np.count_nonzero(np.isinf(tau_L))}, "
+              f"NaN: {np.count_nonzero(np.isnan(tau_L))}")
+
+    if return_details:
+        details = pd.DataFrame({
+            "lambda": lam[inv_order],
+            "sigma": sig[inv_order],
+            "n_eps_valid": n_valid_eps[inv_order],
+            "n_curve": n_curve[inv_order],
+            "tau_L": tau_L,
+        }, index=df.index)
+        return tau_L, details
+    return tau_L
 
 
+
+
+
+
+def attach_traj_id(data_df, id_df,
+                   start_col="start_index", end_col="end_index",
+                   id_col="trajectory_id"):
+    """Attach an integer traj_id using [start_index, end_index) blocks
+    (end exclusive), referring to data_df's ORIGINAL index labels."""
+    df = data_df.copy()
+    idx_values = df.index.to_numpy()
+    traj = np.full(len(df), -1, dtype=int)
+    id_df = id_df.copy()
+    for c in (start_col, end_col, id_col):
+        id_df[c] = id_df[c].astype("int64")
+    for _, row in id_df.iterrows():
+        s, e, tid = int(row[start_col]), int(row[end_col]), int(row[id_col])
+        traj[(idx_values >= s) & (idx_values < e)] = tid
+    df = df.reset_index(drop=True)
+    df["traj_id"] = traj
+    if (traj < 0).any():
+        print(f"[warn] {(traj < 0).sum()} rows uncovered; dropping.")
+        df = df[df["traj_id"] >= 0].reset_index(drop=True)
+    return df
+
+
+def infer_dt(df, traj_col="traj_id", t_col="t"):
+    dts = []
+    for _, g in df.groupby(traj_col):
+        tt = np.sort(g[t_col].to_numpy(float))
+        if len(tt) > 1:
+            dts.append(np.median(np.diff(tt)))
+    return float(np.median(dts))
+
+
+def summarize(tau_L, details, label):
+    s = pd.Series(tau_L)
+    fin = s[np.isfinite(s)]
+    print(f"\n=== {label} ===")
+    print(f"total={len(s)}  NaN={s.isna().sum()}  "
+          f"Inf(regular)={np.isinf(s).sum()}  finite={len(fin)}")
+    if len(fin):
+        lam = details['lambda'][np.isfinite(tau_L)]
+        print(f"finite tau_L: median={fin.median():.2f} "
+              f"min={fin.min():.2f} max={fin.max():.2f}")
+        print(f"finite lambda: min={lam.min():.4f} max={lam.max():.4f} "
+              f"(near 0 => noise, not chaos)")
+        
+import numpy as np
+import pandas as pd
+
+
+def compute_Trecord(df, traj_col="traj_id", t_col="t"):
+    """Duration of the longest training trajectory = max over trajectories of
+    (max t - min t) within that trajectory. Data-derived, not hard-coded."""
+    spans = []
+    for _, g in df.groupby(traj_col):
+        tt = g[t_col].to_numpy(dtype=float)
+        if len(tt) >= 2:
+            spans.append(tt.max() - tt.min())
+    if not spans:
+        raise ValueError("No trajectory with >= 2 samples; cannot define T_record.")
+    return float(np.max(spans))
+
+
+def summarize_task(task_name, df, tau_L, details,
+                   n_min, r_min,
+                   traj_col="traj_id", t_col="t"):
+    """Build one standardized summary record (one row of the appendix table)
+    from an already-computed tau_L / details pair.
+
+    Parameters
+    ----------
+    task_name : str, e.g. "T1 (mass--spring)".
+    df        : the dataframe the estimator was run on (must have traj_col, t_col).
+    tau_L     : np.ndarray from local_lyapunov_times, aligned to df rows.
+    details   : DataFrame from local_lyapunov_times(return_details=True).
+    n_min, r_min : the two hand-set knobs actually used for THIS task.
+
+    Returns
+    -------
+    dict with every field the table row and the T_max rule need.
+    """
+    tau = np.asarray(tau_L, dtype=float)
+
+    total    = int(tau.size)
+    n_nan    = int(np.isnan(tau).sum())          # undefined
+    n_inf    = int(np.isinf(tau).sum())          # regular
+    finite_mask = np.isfinite(tau)               # excludes inf AND nan
+    n_finite = int(finite_mask.sum())
+
+    finite_vals = tau[finite_mask]
+    if n_finite > 0:
+        f_median = float(np.median(finite_vals))
+        f_max    = float(np.max(finite_vals))
+        f_min    = float(np.min(finite_vals))
+        tau_min  = f_min                          # t_lambda^min = min over finite
+    else:
+        # genuinely regular/integrable ensemble: no resolvable exponent anywhere
+        f_median = f_max = f_min = np.nan
+        tau_min  = np.inf                         # -> rule returns T_record
+
+    T_record = compute_Trecord(df, traj_col=traj_col, t_col=t_col)
+    T_max    = float(min(T_record, tau_min))      # Eq. (tmax_rule)
+
+    return {
+        "task":      task_name,
+        "n_min":     int(n_min),
+        "r_min":     int(r_min),
+        "total":     total,
+        "regular":   n_inf,      # Reg. (inf)
+        "finite":    n_finite,
+        "undefined": n_nan,
+        "median":    f_median,
+        "max":       f_max,
+        "min":       f_min,      # this is t_lambda^min when finite exists
+        "T_record":  T_record,
+        "T_max":     T_max,
+    }
+
+def _fmt(x, nd=2):
+    """Format a float for the table; blank-ish for NaN summaries."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "$-$"
+    return f"${x:.{nd}f}$"
+
+
+def row_to_latex(rec):
+    """One LaTeX row matching tab:lyap_stats column order:
+    Task & n_min & r_min & Total & Reg.(inf) & Finite & Undef.
+          & median & max & min & T_record & T_max \\"""
+    # T_record / T_max: show 3 decimals to match 6.493 in the paper
+    def _fmt3(x):
+        return "$\\infty$" if np.isinf(x) else f"${x:.3f}$"
+    return (
+        f"{rec['task']} & {rec['n_min']} & {rec['r_min']} & "
+        f"{rec['total']} & {rec['regular']} & {rec['finite']} & {rec['undefined']} & "
+        f"{_fmt(rec['median'])} & {_fmt(rec['max'])} & {_fmt(rec['min'])} & "
+        f"{_fmt3(rec['T_record'])} & {_fmt3(rec['T_max'])} \\\\"
+    )
