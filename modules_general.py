@@ -6,6 +6,59 @@ import torch.nn.functional as F
 import pandas as pd
 
 
+def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
+    """
+    Return the exact portion(s) of `data_df` corresponding to one or more trajectory_ids.
+    - Preserves data_df's original indexing (no reset).
+    - If trajectory_ids contains all ids in ids_df, returns data_df unchanged.
+    - If any requested id is missing, prints missing ids and returns None.
+    """
+    # normalize to list of ints (preserve order)
+    if isinstance(trajectory_ids, (np.integer, int)):
+        trajectory_ids = [int(trajectory_ids)]
+    else:
+        trajectory_ids = [int(x) for x in trajectory_ids]
+
+    # ensure id columns are ints in ids_df
+    ids_df = ids_df.copy()
+    for col in ("start_index", "end_index", "generated_points", "trajectory_id"):
+        if col in ids_df.columns:
+            ids_df[col] = ids_df[col].astype("int64")
+
+    existing_ids = list(ids_df["trajectory_id"].values)
+    missing = [tid for tid in trajectory_ids if tid not in existing_ids]
+    if missing:
+        print(f"trajectory_id(s) {missing} not in ids_df. Pick from {existing_ids}")
+        return None
+
+    # special-case: request for all trajectories -> return full data_df unchanged
+    if set(trajectory_ids) == set(existing_ids):
+        return data_df
+
+    parts = []
+    for tid in trajectory_ids:
+        row = ids_df.loc[ids_df["trajectory_id"] == tid].iloc[0]
+        start = int(row["start_index"])
+        end = int(row["end_index"])   # exclusive by your convention
+
+        if start >= end:
+            # empty trajectory: skip (or you can append an empty frame if you prefer)
+            continue
+
+        # label-based selection: .loc is inclusive on the right, so use end-1
+        sub = data_df.loc[start : end - 1]
+        parts.append(sub)
+
+    if not parts:
+        # nothing found (all requested trajectories empty)
+        return data_df.iloc[0:0]   # empty DataFrame with same columns
+
+    # if single part, return it directly (preserves original index)
+    if len(parts) == 1:
+        return parts[0]
+    # multiple parts: concatenate preserving indices and order
+    return pd.concat(parts)
+
 class Step_1_general(nn.Module):
     """
     General-n Hamilton-Jacobi Layer, Step 1 (coordinate scaling, momentum shift).
@@ -2199,3 +2252,1819 @@ def summarise_segment_progress(merged, loss_col='val_train_pred_loss', color_by=
         m = final[(cv >= lo) & (cv <= hi if b == n_bins-1 else cv < hi)]
         print(f"  {color_by} in [{lo:.3f},{hi:.3f}]: n={len(m):3d}  "
               f"mean={m[loss_col].mean():.4f}  median={m[loss_col].median():.4f}  max={m[loss_col].max():.4f}")
+
+
+
+
+
+def Autoregressive_Handoff_Inference_Protocol_general(
+    mapping_net,
+    inverse_net,
+    x_obs,
+    u_obs,
+    t_obs,
+    t_min,
+    t_max,
+    Tmax,
+    query_times,
+    query_indices,
+    device,
+    n,
+):
+    """
+    General-n Autoregressive Handoff Inference Protocol.
+ 
+    Args:
+        mapping_net: trained general-n MappingNet. Expects (q, p, t) with
+                     q, p of shape (batch, n) and t of shape (batch, 1).
+        inverse_net: trained general-n InverseNet, same shape convention.
+        x_obs: (n,) tensor, observed q vector.
+        u_obs: (n,) tensor, observed p vector.
+        t_obs: float, observation time.
+        t_min: float, start of prediction interval.
+        t_max: float, end of prediction interval.
+        Tmax: float, maximum normalized temporal horizon.
+        query_times: 1D numpy array of query times (excluding t_obs).
+        query_indices: list of ints, original indices for query_times.
+        device: torch device.
+        n: int, number of degrees of freedom.
+ 
+    Returns:
+        pred_dict: dict mapping original index -> (q_pred, p_pred), each an
+                   (n,) float32 numpy array.
+        forward_pass_count: dict with 'mapping_net' and 'inverse_net' counts.
+    """
+    # -------- Input validation --------
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if not isinstance(query_indices, list):
+        raise ValueError(f"query_indices must be a list, got {type(query_indices)}")
+    if len(query_indices) != len(query_times):
+        raise ValueError(
+            f"query_indices and query_times must have the same length, "
+            f"got {len(query_indices)} and {len(query_times)}"
+        )
+    if x_obs.dim() != 1 or u_obs.dim() != 1:
+        raise ValueError(
+            f"x_obs and u_obs must be 1D (n,) tensors, got dims "
+            f"{x_obs.dim()} and {u_obs.dim()}"
+        )
+    if x_obs.shape[-1] != n or u_obs.shape[-1] != n:
+        raise ValueError(
+            f"x_obs and u_obs must have length n={n}, got "
+            f"{x_obs.shape[-1]} and {u_obs.shape[-1]}"
+        )
+    if hasattr(mapping_net, "n") and mapping_net.n != n:
+        raise ValueError(f"mapping_net.n={mapping_net.n} does not match n={n}")
+    if hasattr(inverse_net, "n") and inverse_net.n != n:
+        raise ValueError(f"inverse_net.n={inverse_net.n} does not match n={n}")
+ 
+    forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+    pred_dict = {}
+ 
+    if len(query_indices) == 0:
+        return pred_dict, forward_pass_count
+ 
+    # -------- Case 1: Direct Prediction --------
+    if (t_max - t_min) <= Tmax:
+        t_rel_obs = torch.tensor([[t_obs - t_min]], device=device, dtype=torch.float32)  # (1,1)
+        Q, P, _ = mapping_net(x_obs.unsqueeze(0), u_obs.unsqueeze(0), t_rel_obs)          # (1,n)
+        forward_pass_count['mapping_net'] += 1
+ 
+        t_rel_query = torch.tensor(query_times - t_min, device=device,
+                                   dtype=torch.float32).unsqueeze(1)                       # (Nq,1)
+        Q_full = Q.expand(len(query_indices), n)                                           # (Nq,n)
+        P_full = P.expand(len(query_indices), n)
+        x_pred_query, u_pred_query, _ = inverse_net(Q_full, P_full, t_rel_query)           # (Nq,n)
+        forward_pass_count['inverse_net'] += 1
+ 
+        for j, idx in enumerate(query_indices):
+            pred_dict[idx] = (
+                x_pred_query[j].detach().cpu().numpy(),
+                u_pred_query[j].detach().cpu().numpy(),
+            )
+        return pred_dict, forward_pass_count
+ 
+    # -------- Case 2: Autoregressive Propagation --------
+ 
+    # === Phase 1: Forward Propagation ===
+    fwd = [(idx, query_times[j]) for j, idx in enumerate(query_indices) if query_times[j] > t_obs]
+    if fwd:
+        fwd_indices, fwd_times = zip(*fwd)
+        fwd_indices = list(fwd_indices)
+        fwd_times = np.array(fwd_times)
+ 
+        K_fwd = int(np.ceil((t_max - t_obs) / Tmax - 1e-9))
+        K_fwd = max(K_fwd, 1)
+ 
+        q_curr = x_obs.clone()  # (n,)
+        p_curr = u_obs.clone()  # (n,)
+        t_curr = t_obs
+ 
+        for k in range(K_fwd):
+            T_start_k = t_curr
+            T_end_k = min(t_curr + Tmax, t_max)
+            if k == K_fwd - 1:
+                T_end_k = t_max
+ 
+            if k < K_fwd - 1:
+                I_k_query = [(idx, ft) for idx, ft in zip(fwd_indices, fwd_times)
+                             if T_start_k <= ft < T_end_k]
+            else:
+                I_k_query = [(idx, ft) for idx, ft in zip(fwd_indices, fwd_times)
+                             if T_start_k <= ft <= T_end_k]
+ 
+            need_boundary = (k < K_fwd - 1)
+ 
+            t_rel_list = [ft - T_start_k for _, ft in I_k_query]
+            if need_boundary:
+                t_rel_list.append(T_end_k - T_start_k)
+            if len(t_rel_list) == 0:
+                continue
+ 
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32).unsqueeze(1)  # (Nt,1)
+ 
+            Q_k, P_k, _ = mapping_net(
+                q_curr.unsqueeze(0), p_curr.unsqueeze(0),
+                torch.tensor([[0.0]], device=device, dtype=torch.float32),  # (1,1)
+            )
+            forward_pass_count['mapping_net'] += 1
+ 
+            Q_full_k = Q_k.expand(t_rel_k.shape[0], n)
+            P_full_k = P_k.expand(t_rel_k.shape[0], n)
+ 
+            q_hat_k, p_hat_k, _ = inverse_net(Q_full_k, P_full_k, t_rel_k)  # (Nt,n)
+            forward_pass_count['inverse_net'] += 1
+ 
+            for j, (idx, _) in enumerate(I_k_query):
+                pred_dict[idx] = (
+                    q_hat_k[j].detach().cpu().numpy(),
+                    p_hat_k[j].detach().cpu().numpy(),
+                )
+ 
+            if need_boundary:
+                q_curr = q_hat_k[-1].detach()  # (n,)
+                p_curr = p_hat_k[-1].detach()  # (n,)
+                t_curr = T_end_k
+ 
+    # === Phase 2: Backward Propagation ===
+    bwd = [(idx, query_times[j]) for j, idx in enumerate(query_indices) if query_times[j] < t_obs]
+    if bwd:
+        bwd_indices, bwd_times = zip(*bwd)
+        bwd_indices = list(bwd_indices)
+        bwd_times = np.array(bwd_times)
+ 
+        K_bwd = int(np.ceil((t_obs - t_min) / Tmax - 1e-9))
+        K_bwd = max(K_bwd, 1)
+ 
+        q_curr = x_obs.clone()
+        p_curr = u_obs.clone()
+        t_curr = t_obs
+ 
+        for k in range(K_bwd):
+            T_start_k = max(t_curr - Tmax, t_min)
+            T_end_k = t_curr
+            if k == K_bwd - 1:
+                T_start_k = t_min
+ 
+            if k < K_bwd - 1:
+                I_k_query = [(idx, bt) for idx, bt in zip(bwd_indices, bwd_times)
+                             if T_start_k < bt <= T_end_k]
+            else:
+                I_k_query = [(idx, bt) for idx, bt in zip(bwd_indices, bwd_times)
+                             if T_start_k <= bt <= T_end_k]
+ 
+            need_boundary = (k < K_bwd - 1)
+ 
+            t_rel_list = []
+            if need_boundary:
+                t_rel_list.append(0.0)
+            t_rel_list.extend([bt - T_start_k for _, bt in I_k_query])
+            if len(t_rel_list) == 0:
+                continue
+ 
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32).unsqueeze(1)  # (Nt,1)
+ 
+            t_rel_obs_in_window = T_end_k - T_start_k
+            Q_k, P_k, _ = mapping_net(
+                q_curr.unsqueeze(0), p_curr.unsqueeze(0),
+                torch.tensor([[t_rel_obs_in_window]], device=device, dtype=torch.float32),  # (1,1)
+            )
+            forward_pass_count['mapping_net'] += 1
+ 
+            Q_full_k = Q_k.expand(t_rel_k.shape[0], n)
+            P_full_k = P_k.expand(t_rel_k.shape[0], n)
+ 
+            q_hat_k, p_hat_k, _ = inverse_net(Q_full_k, P_full_k, t_rel_k)  # (Nt,n)
+            forward_pass_count['inverse_net'] += 1
+ 
+            offset = 1 if need_boundary else 0
+            for j, (idx, _) in enumerate(I_k_query):
+                pred_dict[idx] = (
+                    q_hat_k[offset + j].detach().cpu().numpy(),
+                    p_hat_k[offset + j].detach().cpu().numpy(),
+                )
+ 
+            if need_boundary:
+                q_curr = q_hat_k[0].detach()  # (n,)
+                p_curr = p_hat_k[0].detach()  # (n,)
+                t_curr = T_start_k
+ 
+    missing = [idx for idx in query_indices if idx not in pred_dict]
+    if missing:
+        raise RuntimeError(
+            f"Autoregressive_Handoff_Inference_Protocol_general failed to produce "
+            f"predictions for indices {missing}. This is likely a floating point "
+            f"boundary issue. t_obs={t_obs}, t_min={t_min}, t_max={t_max}, Tmax={Tmax}"
+        )
+    return pred_dict, forward_pass_count
+ 
+ 
+def Batched_Autoregressive_Handoff_Inference_Protocol_general(
+    mapping_net,
+    inverse_net,
+    x_obs,
+    u_obs,
+    t_obs,
+    t_min,
+    t_max,
+    Tmax,
+    query_times,
+    query_indices,
+    device,
+    n,
+):
+    """
+    General-n Batched Autoregressive Handoff Inference Protocol.
+ 
+    All trajectories share the same time structure (same t values, same obs index).
+ 
+    Args:
+        x_obs: (N_traj, n) tensor, observed q vectors.
+        u_obs: (N_traj, n) tensor, observed p vectors.
+        (remaining args as in the single-trajectory version)
+        n: int, number of degrees of freedom.
+ 
+    Returns:
+        x_pred_all: (N_traj, N_query, n) tensor of q predictions at query times.
+        u_pred_all: (N_traj, N_query, n) tensor of p predictions at query times.
+        forward_pass_count: dict with 'mapping_net' and 'inverse_net' counts.
+    """
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if not isinstance(query_indices, list):
+        raise ValueError(f"query_indices must be a list, got {type(query_indices)}")
+    if len(query_indices) != len(query_times):
+        raise ValueError(
+            f"query_indices and query_times must have the same length, "
+            f"got {len(query_indices)} and {len(query_times)}"
+        )
+    if x_obs.dim() != 2 or u_obs.dim() != 2:
+        raise ValueError(
+            f"x_obs and u_obs must be 2D (N_traj, n) tensors, got dims "
+            f"{x_obs.dim()} and {u_obs.dim()}"
+        )
+    if x_obs.shape[0] != u_obs.shape[0]:
+        raise ValueError(
+            f"x_obs and u_obs must have the same N_traj, got "
+            f"{x_obs.shape[0]} and {u_obs.shape[0]}"
+        )
+    if x_obs.shape[1] != n or u_obs.shape[1] != n:
+        raise ValueError(
+            f"x_obs and u_obs must have DOF dim n={n}, got "
+            f"{x_obs.shape[1]} and {u_obs.shape[1]}"
+        )
+    if hasattr(mapping_net, "n") and mapping_net.n != n:
+        raise ValueError(f"mapping_net.n={mapping_net.n} does not match n={n}")
+    if hasattr(inverse_net, "n") and inverse_net.n != n:
+        raise ValueError(f"inverse_net.n={inverse_net.n} does not match n={n}")
+ 
+    N_traj = x_obs.shape[0]
+    N_query = len(query_indices)
+    forward_pass_count = {'mapping_net': 0, 'inverse_net': 0}
+ 
+    x_pred_all = torch.empty(N_traj, N_query, n, device=device, dtype=torch.float32)
+    u_pred_all = torch.empty(N_traj, N_query, n, device=device, dtype=torch.float32)
+ 
+    if N_query == 0:
+        return x_pred_all, u_pred_all, forward_pass_count
+ 
+    # -------- Case 1: Direct Prediction --------
+    if (t_max - t_min) <= Tmax:
+        t_rel_obs = torch.full((N_traj, 1), float(t_obs - t_min),
+                               device=device, dtype=torch.float32)  # (N_traj,1)
+        Q, P, _ = mapping_net(x_obs, u_obs, t_rel_obs)              # (N_traj,n)
+        forward_pass_count['mapping_net'] += 1
+ 
+        # traj-major, query-minor flatten
+        Q_full = Q.repeat_interleave(N_query, dim=0)               # (N_traj*Nq, n)
+        P_full = P.repeat_interleave(N_query, dim=0)
+ 
+        t_rel_query = torch.tensor(query_times - t_min, device=device, dtype=torch.float32)  # (Nq,)
+        t_rel_full = t_rel_query.repeat(N_traj).unsqueeze(1)       # (N_traj*Nq, 1)
+ 
+        x_pred_flat, u_pred_flat, _ = inverse_net(Q_full, P_full, t_rel_full)  # (N_traj*Nq, n)
+        forward_pass_count['inverse_net'] += 1
+ 
+        x_pred_all = x_pred_flat.reshape(N_traj, N_query, n)
+        u_pred_all = u_pred_flat.reshape(N_traj, N_query, n)
+        return x_pred_all, u_pred_all, forward_pass_count
+ 
+    # -------- Case 2: Autoregressive Propagation --------
+ 
+    # === Phase 1: Forward Propagation ===
+    fwd_positions = [j for j, idx in enumerate(query_indices) if query_times[j] > t_obs]
+    if len(fwd_positions) > 0:
+        K_fwd = int(np.ceil((t_max - t_obs) / Tmax - 1e-9))
+        K_fwd = max(K_fwd, 1)
+        q_curr = x_obs.clone()  # (N_traj, n)
+        p_curr = u_obs.clone()
+        t_curr = t_obs
+ 
+        for k in range(K_fwd):
+            T_start_k = t_curr
+            T_end_k = min(t_curr + Tmax, t_max)
+            if k == K_fwd - 1:
+                T_end_k = t_max
+            if k < K_fwd - 1:
+                seg_query_positions = [j for j in fwd_positions
+                                       if T_start_k <= query_times[j] < T_end_k]
+            else:
+                seg_query_positions = [j for j in fwd_positions
+                                       if T_start_k <= query_times[j] <= T_end_k]
+ 
+            need_boundary = (k < K_fwd - 1)
+ 
+            t_rel_list = [query_times[j] - T_start_k for j in seg_query_positions]
+            if need_boundary:
+                t_rel_list.append(T_end_k - T_start_k)
+ 
+            N_times = len(t_rel_list)
+            if N_times == 0:
+                continue
+ 
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32)  # (Nt,)
+ 
+            t_zero = torch.zeros(N_traj, 1, device=device, dtype=torch.float32)     # (N_traj,1)
+            Q_k, P_k, _ = mapping_net(q_curr, p_curr, t_zero)                       # (N_traj,n)
+            forward_pass_count['mapping_net'] += 1
+ 
+            Q_full_k = Q_k.repeat_interleave(N_times, dim=0)        # (N_traj*Nt, n)
+            P_full_k = P_k.repeat_interleave(N_times, dim=0)
+            t_rel_full_k = t_rel_k.repeat(N_traj).unsqueeze(1)      # (N_traj*Nt, 1)
+ 
+            q_hat_flat, p_hat_flat, _ = inverse_net(Q_full_k, P_full_k, t_rel_full_k)
+            forward_pass_count['inverse_net'] += 1
+ 
+            q_hat_k = q_hat_flat.reshape(N_traj, N_times, n)
+            p_hat_k = p_hat_flat.reshape(N_traj, N_times, n)
+ 
+            for local_j, global_j in enumerate(seg_query_positions):
+                x_pred_all[:, global_j, :] = q_hat_k[:, local_j, :]
+                u_pred_all[:, global_j, :] = p_hat_k[:, local_j, :]
+ 
+            if need_boundary:
+                q_curr = q_hat_k[:, -1, :].detach()  # (N_traj, n)
+                p_curr = p_hat_k[:, -1, :].detach()
+                t_curr = T_end_k
+ 
+    # === Phase 2: Backward Propagation ===
+    bwd_positions = [j for j, idx in enumerate(query_indices) if query_times[j] < t_obs]
+    if len(bwd_positions) > 0:
+        K_bwd = int(np.ceil((t_obs - t_min) / Tmax - 1e-9))
+        K_bwd = max(K_bwd, 1)
+        q_curr = x_obs.clone()  # (N_traj, n)
+        p_curr = u_obs.clone()
+        t_curr = t_obs
+ 
+        for k in range(K_bwd):
+            T_start_k = max(t_curr - Tmax, t_min)
+            T_end_k = t_curr
+            if k == K_bwd - 1:
+                T_start_k = t_min
+ 
+            if k < K_bwd - 1:
+                seg_query_positions = [j for j in bwd_positions
+                                       if T_start_k < query_times[j] <= T_end_k]
+            else:
+                seg_query_positions = [j for j in bwd_positions
+                                       if T_start_k <= query_times[j] <= T_end_k]
+ 
+            need_boundary = (k < K_bwd - 1)
+ 
+            t_rel_list = []
+            if need_boundary:
+                t_rel_list.append(0.0)
+            t_rel_list.extend([query_times[j] - T_start_k for j in seg_query_positions])
+ 
+            N_times = len(t_rel_list)
+            if N_times == 0:
+                continue
+ 
+            t_rel_k = torch.tensor(t_rel_list, device=device, dtype=torch.float32)  # (Nt,)
+ 
+            t_rel_obs_in_window = T_end_k - T_start_k
+            t_obs_window = torch.full((N_traj, 1), float(t_rel_obs_in_window),
+                                      device=device, dtype=torch.float32)           # (N_traj,1)
+            Q_k, P_k, _ = mapping_net(q_curr, p_curr, t_obs_window)                 # (N_traj,n)
+            forward_pass_count['mapping_net'] += 1
+ 
+            Q_full_k = Q_k.repeat_interleave(N_times, dim=0)
+            P_full_k = P_k.repeat_interleave(N_times, dim=0)
+            t_rel_full_k = t_rel_k.repeat(N_traj).unsqueeze(1)
+ 
+            q_hat_flat, p_hat_flat, _ = inverse_net(Q_full_k, P_full_k, t_rel_full_k)
+            forward_pass_count['inverse_net'] += 1
+ 
+            q_hat_k = q_hat_flat.reshape(N_traj, N_times, n)
+            p_hat_k = p_hat_flat.reshape(N_traj, N_times, n)
+ 
+            offset = 1 if need_boundary else 0
+            for local_j, global_j in enumerate(seg_query_positions):
+                x_pred_all[:, global_j, :] = q_hat_k[:, offset + local_j, :]
+                u_pred_all[:, global_j, :] = p_hat_k[:, offset + local_j, :]
+ 
+            if need_boundary:
+                q_curr = q_hat_k[:, 0, :].detach()  # (N_traj, n)
+                p_curr = p_hat_k[:, 0, :].detach()
+                t_curr = T_start_k
+ 
+    return x_pred_all, u_pred_all, forward_pass_count
+
+
+
+
+
+POS_COLS = ("x", "y")
+MOM_COLS = ("px", "py")
+
+
+def build_omega_general(n, device=None, dtype=None):
+    """
+    Symplectic form for n degrees of freedom, in the grouped ordering
+    z = (q_1, ..., q_n, p_1, ..., p_n) fixed by the paper:
+
+        Omega = [[ 0,   I_n ],
+                 [-I_n, 0   ]]      shape (2n, 2n)
+
+    Reduces to [[0, 1], [-1, 0]] at n = 1.
+    """
+    I = torch.eye(n, device=device, dtype=dtype)
+    Z = torch.zeros(n, n, device=device, dtype=dtype)
+    return torch.cat([torch.cat([Z, I], dim=1),
+                      torch.cat([-I, Z], dim=1)], dim=0)
+
+
+def compute_jacobian_functional_general(model, x, u, t, n):
+    """
+    Compute the 2n x 2n Jacobian of a general-n network using
+    torch.autograd.functional.jacobian, one sample at a time.
+
+    Row/column ordering is the grouped convention z = (q_1..q_n, p_1..p_n):
+        M[i, j] = d z'_i / d z_j
+        rows    0..n-1   -> Q,   rows    n..2n-1 -> P
+        columns 0..n-1   -> q,   columns n..2n-1 -> p
+
+    IMPORTANT: the HJL layers compute their shear terms with
+    create_graph=self.training. If `model` is in eval() mode the generating
+    function gradients are detached, the off-diagonal blocks of M come out
+    exactly zero, and M collapses to a (still symplectic, hence vacuously
+    passing) diagonal scaling. Callers must run this in train() mode; the
+    orchestrator below enforces that.
+
+    Args:
+        model: network taking (q, p, t) with q, p of shape (batch, n) and
+               t of shape (batch, 1), returning (Q, P, t).
+        x: (batch, n) tensor, coordinate-like input.
+        u: (batch, n) tensor, momentum-like input.
+        t: (batch, 1) tensor, time.
+        n: int, number of degrees of freedom.
+
+    Returns:
+        jacobian: (2n, 2n, batch) tensor.
+    """
+    from torch.autograd.functional import jacobian as torch_jacobian
+
+    if x.dim() != 2 or u.dim() != 2:
+        raise ValueError(f"x and u must be 2D (batch, n) tensors, got dims {x.dim()} and {u.dim()}")
+    if x.shape[1] != n or u.shape[1] != n:
+        raise ValueError(f"x and u must have DOF dim n={n}, got {x.shape[1]} and {u.shape[1]}")
+    if t.dim() != 2 or t.shape[1] != 1:
+        raise ValueError(f"t must be a 2D (batch, 1) tensor, got shape {tuple(t.shape)}")
+    if not (x.shape[0] == u.shape[0] == t.shape[0]):
+        raise ValueError(
+            f"batch dims must match, got {x.shape[0]}, {u.shape[0]}, {t.shape[0]}")
+    if hasattr(model, "n") and model.n != n:
+        raise ValueError(f"model.n={model.n} does not match n={n}")
+
+    batch_size = x.shape[0]
+    jacobians = []
+
+    for i in range(batch_size):
+        x_i = x[i:i + 1]          # (1, n)
+        u_i = u[i:i + 1]          # (1, n)
+        t_i = t[i:i + 1]          # (1, 1)
+
+        # Function of (x, u) only; t is held fixed (the paper takes the
+        # Jacobian at fixed segment-relative time).
+        def func(x_val, u_val):
+            X_final, U_final, _ = model(x_val, u_val, t_i)
+            return torch.cat([X_final.reshape(-1), U_final.reshape(-1)], dim=0)   # (2n,)
+
+        jac = torch_jacobian(func, (x_i, u_i))
+
+        # jac[0]: d(out)/dx with shape (2n, 1, n);  jac[1]: d(out)/du likewise.
+        # Explicit reshape rather than .squeeze(), which would over-collapse at n=1.
+        jac_x = jac[0].reshape(2 * n, n)                       # (2n, n)
+        jac_u = jac[1].reshape(2 * n, n)                       # (2n, n)
+
+        jac_matrix = torch.cat([jac_x, jac_u], dim=1)          # (2n, 2n)
+        jacobians.append(jac_matrix)
+
+    jacobian = torch.stack(jacobians, dim=2)                   # (2n, 2n, batch)
+    return jacobian
+
+
+def compute_symplectic_product_general(jacobian, n):
+    """
+    Compute M^T Omega M for each 2n x 2n Jacobian in the batch, with
+    Omega = [[0, I_n], [-I_n, 0]].
+
+    Args:
+        jacobian: (2n, 2n, batch) tensor.
+        n: int, number of degrees of freedom.
+
+    Returns:
+        result: (2n, 2n, batch) tensor, each slice being M^T Omega M.
+    """
+    if jacobian.dim() != 3:
+        raise ValueError(f"jacobian must be 3D (2n, 2n, batch), got dim {jacobian.dim()}")
+    if jacobian.shape[0] != 2 * n or jacobian.shape[1] != 2 * n:
+        raise ValueError(
+            f"jacobian must be (2n, 2n, batch) with n={n} -> "
+            f"({2*n}, {2*n}, batch), got {tuple(jacobian.shape)}")
+
+    batch_size = jacobian.shape[2]
+    device = jacobian.device
+    dtype = jacobian.dtype
+
+    Omega = build_omega_general(n, device=device, dtype=dtype)      # (2n, 2n)
+
+    M = jacobian.permute(2, 0, 1)                                   # (batch, 2n, 2n)
+    M_T = M.transpose(1, 2)                                         # (batch, 2n, 2n)
+    Omega_batch = Omega.unsqueeze(0).expand(batch_size, -1, -1)
+
+    Omega_M = torch.bmm(Omega_batch, M)                             # (batch, 2n, 2n)
+    result_batch = torch.bmm(M_T, Omega_M)                          # (batch, 2n, 2n)
+
+    result = result_batch.permute(1, 2, 0)                          # (2n, 2n, batch)
+    return result
+
+
+def test_canonical_transformation_on_trajectory_general(
+    get_data_from_trajectory_id_function,
+    compute_jacobian_functional_function,
+    compute_symplectic_product_function,
+    test_id_df,
+    test_df,
+    trajectory_id,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    n,
+    pos_cols=POS_COLS,
+    mom_cols=MOM_COLS,
+    tolerance=1e-5,
+    verbose=True,
+):
+    """
+    General-n symplecticity diagnostic on a single trajectory.
+
+    Partitions the trajectory into segments of length Tmax and, at every
+    observation, computes the 2n x 2n Jacobian of MappingNet w.r.t. (q, p) and
+    of InverseNet w.r.t. (Q, P), both at the segment-relative time, then
+    evaluates the residual ||M^T Omega M - Omega||_max per point.
+
+    Both networks are forced into train() mode for the duration and restored
+    on exit: the HJL shear gradients are built with create_graph=self.training,
+    so in eval() mode the off-diagonal Jacobian blocks are identically zero and
+    the residual is vacuously zero.
+
+    Returns:
+        results: dict with per-point residuals and summary statistics for both
+                 networks (same keys as the n=1 version, plus 'n').
+    """
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if len(pos_cols) != n:
+        raise ValueError(f"pos_cols must have n={n} entries, got {len(pos_cols)}: {pos_cols}")
+    if len(mom_cols) != n:
+        raise ValueError(f"mom_cols must have n={n} entries, got {len(mom_cols)}: {mom_cols}")
+    if hasattr(mapping_net, "n") and mapping_net.n != n:
+        raise ValueError(f"mapping_net.n={mapping_net.n} does not match n={n}")
+    if hasattr(inverse_net, "n") and inverse_net.n != n:
+        raise ValueError(f"inverse_net.n={inverse_net.n} does not match n={n}")
+
+    test_trajectory_data = get_data_from_trajectory_id_function(
+        test_id_df, test_df, trajectory_ids=trajectory_id)
+
+    missing = [c for c in list(pos_cols) + list(mom_cols) + ['t']
+               if c not in test_trajectory_data.columns]
+    if missing:
+        raise ValueError(f"columns missing from trajectory data: {missing}")
+
+    x = torch.as_tensor(test_trajectory_data[list(pos_cols)].to_numpy(dtype=np.float32),
+                        device=device)                                   # (T, n)
+    u = torch.as_tensor(test_trajectory_data[list(mom_cols)].to_numpy(dtype=np.float32),
+                        device=device)                                   # (T, n)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32),
+                        device=device)                                   # (T,)
+
+    if x.dim() != 2 or u.dim() != 2 or t.dim() != 1:
+        raise ValueError(
+            f"x, u must be 2-dimensional and t 1-dimensional, got dims "
+            f"{x.dim()}, {u.dim()}, {t.dim()}")
+    if x.shape[1] != n or u.shape[1] != n:
+        raise ValueError(f"x, u must have DOF dim n={n}, got {x.shape[1]}, {u.shape[1]}")
+
+    t_np = t.detach().cpu().numpy()
+    t_max = t_np[-1]
+
+    # Build segments (anchored at absolute zero, as in the n=1 version)
+    num_segments = int(np.ceil(t_max / Tmax - 1e-9))
+    num_segments = max(num_segments, 1)
+
+    mapping_jacobians = []
+    inverse_jacobians = []
+
+    # ---- force train() so that create_graph=True inside the HJL shear grads ----
+    mapping_was_training = mapping_net.training
+    inverse_was_training = inverse_net.training
+    try:
+        mapping_net.train()
+        inverse_net.train()
+
+        for seg_idx in range(num_segments):
+            t_start = seg_idx * Tmax
+            t_end = min((seg_idx + 1) * Tmax, t_max)
+            if seg_idx == num_segments - 1:
+                t_end = t_max
+
+            if seg_idx == 0:
+                seg_mask = (t_np >= t_start) & (t_np <= t_end)
+            else:
+                seg_mask = (t_np > t_start) & (t_np <= t_end)
+
+            seg_indices = np.where(seg_mask)[0]
+
+            if len(seg_indices) == 0:
+                continue
+
+            x_seg = x[seg_indices]                                       # (S, n)
+            u_seg = u[seg_indices]                                       # (S, n)
+            t_seg_relative = (t[seg_indices] - t_start).unsqueeze(1)     # (S, 1)
+
+            jac_mapping = compute_jacobian_functional_function(
+                mapping_net, x=x_seg, u=u_seg, t=t_seg_relative, n=n)
+            mapping_jacobians.append(jac_mapping)
+
+            Q_seg, P_seg, _ = mapping_net(x_seg, u_seg, t_seg_relative)
+
+            jac_inverse = compute_jacobian_functional_function(
+                inverse_net, x=Q_seg.detach(), u=P_seg.detach(),
+                t=t_seg_relative, n=n)
+            inverse_jacobians.append(jac_inverse)
+    finally:
+        # inverse_net shares its modules with mapping_net, so restore the
+        # inverse first and let mapping_net (the owner) have the last word.
+        inverse_net.train(inverse_was_training)
+        mapping_net.train(mapping_was_training)
+
+    all_mapping_jac = torch.cat(mapping_jacobians, dim=2)                # (2n, 2n, N)
+    all_inverse_jac = torch.cat(inverse_jacobians, dim=2)
+
+    mapping_symplectic = compute_symplectic_product_function(all_mapping_jac, n)
+    inverse_symplectic = compute_symplectic_product_function(all_inverse_jac, n)
+
+    batch_size = mapping_symplectic.shape[2]
+    device_sym = mapping_symplectic.device
+    dtype_sym = mapping_symplectic.dtype
+
+    Omega = build_omega_general(n, device=device_sym, dtype=dtype_sym)   # (2n, 2n)
+
+    diff_mapping = torch.abs(mapping_symplectic - Omega.unsqueeze(-1))
+    mapping_residuals = diff_mapping.amax(dim=(0, 1))
+
+    diff_inverse = torch.abs(inverse_symplectic - Omega.unsqueeze(-1))
+    inverse_residuals = diff_inverse.amax(dim=(0, 1))
+
+    mapping_residuals_np = mapping_residuals.detach().cpu().numpy()
+    inverse_residuals_np = inverse_residuals.detach().cpu().numpy()
+
+    def compute_residual_stats(residuals, name):
+        return {
+            'mean': np.mean(residuals),
+            'std': np.std(residuals, ddof=1) if len(residuals) > 1 else 0.0,
+            'median': np.median(residuals),
+            'max': np.max(residuals),
+            'min': np.min(residuals),
+            'q25': np.percentile(residuals, 25),
+            'q75': np.percentile(residuals, 75),
+            'n_failing': int(np.sum(residuals > tolerance)),
+            'n_total': len(residuals),
+            'fraction_passing': float(np.mean(residuals <= tolerance)),
+        }
+
+    mapping_stats = compute_residual_stats(mapping_residuals_np, 'mapping')
+    inverse_stats = compute_residual_stats(inverse_residuals_np, 'inverse')
+
+    if verbose:
+        print(f"=== Canonical Transformation Test — Trajectory {trajectory_id} ===")
+        print(f"(n={n}, Jacobians are {2*n}x{2*n}, {num_segments} segment(s), "
+              f"{batch_size} total points, tolerance={tolerance:.1e})\n")
+
+        print("MappingNet: d(Q,P)/d(q,p)")
+        if mapping_stats['n_failing'] == 0:
+            print(f"  ✓ All {batch_size} points pass (max residual: {mapping_stats['max']:.2e})")
+        else:
+            print(f"  ✗ {mapping_stats['n_failing']}/{batch_size} points fail "
+                  f"({mapping_stats['fraction_passing']*100:.1f}% pass)")
+        print(f"  Residual max|M^T Ω M - Ω| per point:")
+        print(f"    Mean:   {mapping_stats['mean']:.2e} (std={mapping_stats['std']:.2e})")
+        print(f"    Median: {mapping_stats['median']:.2e} [IQR: {mapping_stats['q25']:.2e}, {mapping_stats['q75']:.2e}]")
+        print(f"    Min:    {mapping_stats['min']:.2e}")
+        print(f"    Max:    {mapping_stats['max']:.2e}")
+
+        print(f"\nInverseNet: d(q,p)/d(Q,P)")
+        if inverse_stats['n_failing'] == 0:
+            print(f"  ✓ All {batch_size} points pass (max residual: {inverse_stats['max']:.2e})")
+        else:
+            print(f"  ✗ {inverse_stats['n_failing']}/{batch_size} points fail "
+                  f"({inverse_stats['fraction_passing']*100:.1f}% pass)")
+        print(f"  Residual max|M^T Ω M - Ω| per point:")
+        print(f"    Mean:   {inverse_stats['mean']:.2e} (std={inverse_stats['std']:.2e})")
+        print(f"    Median: {inverse_stats['median']:.2e} [IQR: {inverse_stats['q25']:.2e}, {inverse_stats['q75']:.2e}]")
+        print(f"    Min:    {inverse_stats['min']:.2e}")
+        print(f"    Max:    {inverse_stats['max']:.2e}")
+
+        print("\n=== Table row (Task = trajectory {}) ===".format(trajectory_id))
+        print(f"  M  max    = {mapping_stats['max']:.2e}")
+        print(f"  M  median = {mapping_stats['median']:.2e}")
+        print(f"  M^-1 max    = {inverse_stats['max']:.2e}")
+        print(f"  M^-1 median = {inverse_stats['median']:.2e}")
+        print("  LaTeX: "
+              f"{mapping_stats['max']:.2e} & {mapping_stats['median']:.2e} & "
+              f"{inverse_stats['max']:.2e} & {inverse_stats['median']:.2e} \\\\")
+
+    results = {
+        'mapping_residuals': mapping_residuals_np,
+        'inverse_residuals': inverse_residuals_np,
+        'mapping_stats': mapping_stats,
+        'inverse_stats': inverse_stats,
+        'mapping_symplectic': mapping_symplectic,
+        'inverse_symplectic': inverse_symplectic,
+        't': t_np,
+        'trajectory_id': trajectory_id,
+        'tolerance': tolerance,
+        'num_segments': num_segments,
+        'n_points': batch_size,
+        'n': n,
+    }
+
+    return results
+ 
+
+
+def prediction_loss_euclidean_general(
+    x_pred: torch.Tensor,
+    u_pred: torch.Tensor,
+    X_labels: torch.Tensor,
+    U_labels: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """
+    Prediction loss: mean over prediction times of the Euclidean distance in the
+    2n-dimensional phase space,
+
+        d_t = sqrt( sum_i (q_hat_{t,i} - q_{t,i})^2 + sum_i (p_hat_{t,i} - p_{t,i})^2 )
+
+    At n = 1 with (..., 1)-shaped inputs the sum over the DOF axis is a
+    single-element sum, so this reduces exactly (bitwise) to the n = 1 function
+        sqrt((x_pred - X_labels)^2 + (u_pred - U_labels)^2).mean()
+    evaluated on the corresponding (...,)-shaped tensors.
+
+    Args:
+        x_pred:   (..., n) predicted positions
+        u_pred:   (..., n) predicted momenta
+        X_labels: (..., n) ground-truth positions
+        U_labels: (..., n) ground-truth momenta
+        n: int, number of degrees of freedom (last axis).
+
+    Returns:
+        loss: scalar tensor, mean Euclidean phase-space distance.
+    """
+    if not (x_pred.shape == u_pred.shape == X_labels.shape == U_labels.shape):
+        raise ValueError(
+            f"x_pred, u_pred, X_labels, U_labels must share a shape, got "
+            f"{tuple(x_pred.shape)}, {tuple(u_pred.shape)}, "
+            f"{tuple(X_labels.shape)}, {tuple(U_labels.shape)}")
+    if x_pred.dim() < 1 or x_pred.shape[-1] != n:
+        raise ValueError(
+            f"last axis must be the DOF axis of size n={n}, got shape {tuple(x_pred.shape)}")
+
+    euclidean_distances = torch.sqrt(
+        ((x_pred - X_labels) ** 2).sum(dim=-1)
+        + ((u_pred - U_labels) ** 2).sum(dim=-1)
+    )
+    return torch.mean(euclidean_distances)
+
+
+def test_model_all_observations_all_trajectories_general(
+    get_data_from_trajectory_id_function,
+    prediction_loss_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    n,
+    pos_cols=POS_COLS,
+    mom_cols=MOM_COLS,
+    bootstrap_B=10000,
+    confidence_level=0.95,
+    normalize_by_energy=True,
+    verbose=True,
+):
+    """
+    General-n evaluation of all test trajectories from every possible single
+    observation point.
+
+    Identical in statistics and aggregation to the n = 1 version; the only change
+    is that phase-space quantities carry a trailing DOF axis of size n, and the
+    batched inference call is the general-n protocol.
+
+    `prediction_loss_function` must accept
+        (x_pred, u_pred, X_labels, U_labels, n)
+    by keyword, with the four tensors of shape (N_obs, n), and return a scalar.
+
+    Returns:
+        results: dict, same keys as the n = 1 version plus 'n'.
+    """
+    from scipy.stats import bootstrap
+
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+
+    if normalize_by_energy and 'energy' not in test_id_df.columns:
+        raise ValueError("test_id_df must contain an 'energy' column when normalize_by_energy=True")
+
+    if len(pos_cols) != n:
+        raise ValueError(f"pos_cols must have n={n} entries, got {len(pos_cols)}: {pos_cols}")
+    if len(mom_cols) != n:
+        raise ValueError(f"mom_cols must have n={n} entries, got {len(mom_cols)}: {mom_cols}")
+    if hasattr(mapping_net, "n") and mapping_net.n != n:
+        raise ValueError(f"mapping_net.n={mapping_net.n} does not match n={n}")
+    if hasattr(inverse_net, "n") and inverse_net.n != n:
+        raise ValueError(f"inverse_net.n={inverse_net.n} does not match n={n}")
+
+    trajectory_ids = test_id_df['trajectory_id'].values.astype(int)
+    N_traj = len(trajectory_ids)
+
+    if normalize_by_energy:
+        energies = test_id_df.set_index('trajectory_id').loc[trajectory_ids, 'energy'].values.astype(np.float64)
+        if np.any(energies <= 1e-12):
+            raise ValueError("Energy normalization by sqrt(E) requires positive nonzero energies.")
+        sqrt_energies = np.sqrt(energies)
+    else:
+        energies = test_id_df.set_index('trajectory_id').loc[trajectory_ids, 'energy'].values.astype(np.float64) if 'energy' in test_id_df.columns else np.full(N_traj, np.nan)
+        sqrt_energies = None
+
+    # Load all trajectories and validate shared time structure
+    all_x = []
+    all_u = []
+    ref_t = None
+
+    for idx, row_data in test_id_df.iterrows():
+        trajectory_id = int(row_data['trajectory_id'])
+        test_trajectory_data = get_data_from_trajectory_id_function(
+            test_id_df, test_df, trajectory_ids=trajectory_id)
+
+        missing = [c for c in list(pos_cols) + list(mom_cols) + ['t']
+                   if c not in test_trajectory_data.columns]
+        if missing:
+            raise ValueError(f"Trajectory {trajectory_id}: columns missing: {missing}")
+
+        x_i = torch.as_tensor(test_trajectory_data[list(pos_cols)].to_numpy(dtype=np.float32),
+                              device=device)                                   # (T, n)
+        u_i = torch.as_tensor(test_trajectory_data[list(mom_cols)].to_numpy(dtype=np.float32),
+                              device=device)                                   # (T, n)
+        t_i = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32),
+                              device=device)                                   # (T,)
+
+        if x_i.dim() != 2 or u_i.dim() != 2 or t_i.dim() != 1:
+            raise ValueError(
+                f"Trajectory {trajectory_id}: x, u must be 2D (T, n) and t 1D, got dims "
+                f"{x_i.dim()}, {u_i.dim()}, {t_i.dim()}")
+        if x_i.shape[1] != n or u_i.shape[1] != n:
+            raise ValueError(
+                f"Trajectory {trajectory_id}: DOF dim must be n={n}, got "
+                f"{x_i.shape[1]} and {u_i.shape[1]}")
+
+        if ref_t is None:
+            ref_t = t_i
+        else:
+            if len(t_i) != len(ref_t):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t_i)} points, expected {len(ref_t)}. "
+                    f"All trajectories must have the same number of points for batched inference."
+                )
+            if not torch.allclose(t_i, ref_t, atol=1e-6):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has different time values. "
+                    f"All trajectories must share the same time values for batched inference."
+                )
+
+        all_x.append(x_i)
+        all_u.append(u_i)
+
+    # Stack: (N_traj, N_points, n)
+    x_batch = torch.stack(all_x, dim=0)
+    u_batch = torch.stack(all_u, dim=0)
+    t_np = ref_t.detach().cpu().numpy()
+    N_obs = len(ref_t)
+
+    all_mapping_net_calls = np.empty(N_obs, dtype=int)
+    all_inverse_net_calls = np.empty(N_obs, dtype=int)
+
+    loss_matrix = np.empty((N_obs, N_traj))
+
+    for obs_idx in range(N_obs):
+        query_indices = [i for i in range(N_obs) if i != obs_idx]
+        query_times = t_np[query_indices]
+
+        x_pred_queries, u_pred_queries, fwd_count = \
+            Batched_Autoregressive_Handoff_Inference_Protocol_general(
+                mapping_net=mapping_net,
+                inverse_net=inverse_net,
+                x_obs=x_batch[:, obs_idx, :],          # (N_traj, n)
+                u_obs=u_batch[:, obs_idx, :],          # (N_traj, n)
+                t_obs=t_np[obs_idx],
+                t_min=t_np[0],
+                t_max=t_np[-1],
+                Tmax=Tmax,
+                query_times=query_times,
+                query_indices=query_indices,
+                device=device,
+                n=n,
+            )
+
+        # Assemble full predictions: (N_traj, N_obs, n)
+        x_pred_full = torch.empty(N_traj, N_obs, n, device=device, dtype=torch.float32)
+        u_pred_full = torch.empty(N_traj, N_obs, n, device=device, dtype=torch.float32)
+        x_pred_full[:, obs_idx, :] = x_batch[:, obs_idx, :]
+        u_pred_full[:, obs_idx, :] = u_batch[:, obs_idx, :]
+        for j, qi in enumerate(query_indices):
+            x_pred_full[:, qi, :] = x_pred_queries[:, j, :]
+            u_pred_full[:, qi, :] = u_pred_queries[:, j, :]
+
+        # Per-trajectory loss for this observation index
+        for traj_i in range(N_traj):
+            loss_i = prediction_loss_function(
+                x_pred=x_pred_full[traj_i],            # (N_obs, n)
+                u_pred=u_pred_full[traj_i],
+                X_labels=x_batch[traj_i],
+                U_labels=u_batch[traj_i],
+                n=n,
+            )
+            loss_matrix[obs_idx, traj_i] = loss_i.item()
+
+        if verbose:
+            mean_this_obs = np.mean(loss_matrix[obs_idx])
+            print(f"Observation index {obs_idx}/{N_obs-1}, mean loss across trajectories: {mean_this_obs:.6f}")
+        all_mapping_net_calls[obs_idx] = fwd_count['mapping_net']
+        all_inverse_net_calls[obs_idx] = fwd_count['inverse_net']
+
+    # Apply energy normalization if requested
+    if normalize_by_energy:
+        loss_matrix_normalized = loss_matrix / sqrt_energies[np.newaxis, :]
+        loss_matrix_for_stats = loss_matrix_normalized
+    else:
+        loss_matrix_normalized = None
+        loss_matrix_for_stats = loss_matrix
+
+    # Aggregate: median over observation choices per trajectory
+    per_trajectory_median_loss = np.median(loss_matrix_for_stats, axis=0)  # (N_traj,)
+    per_obs_mean_loss = np.mean(loss_matrix_for_stats, axis=1)             # (N_obs,)
+
+    # Statistics over trajectories (the independent units)
+    mean_loss = np.mean(per_trajectory_median_loss)
+    std_loss = np.std(per_trajectory_median_loss, ddof=1)
+    median_loss = np.median(per_trajectory_median_loss)
+    q1_loss = np.percentile(per_trajectory_median_loss, 25)
+    q3_loss = np.percentile(per_trajectory_median_loss, 75)
+    iqr_loss = q3_loss - q1_loss
+
+    # BCa bootstrap CI over trajectories
+    bootstrap_result = bootstrap(
+        data=(per_trajectory_median_loss,),
+        statistic=np.mean,
+        n_resamples=bootstrap_B,
+        confidence_level=confidence_level,
+        method='BCa',
+    )
+    ci_lower = bootstrap_result.confidence_interval.low
+    ci_upper = bootstrap_result.confidence_interval.high
+
+    summary_stats = {
+        'mean': mean_loss,
+        'std': std_loss,
+        'median': median_loss,
+        'q1': q1_loss,
+        'q3': q3_loss,
+        'iqr': iqr_loss,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+    }
+
+    loss_label = 'loss / √energy' if normalize_by_energy else 'loss'
+
+    # Forward pass count statistics
+    all_total_calls = all_mapping_net_calls + all_inverse_net_calls
+    forward_pass_stats = {
+        'mapping_net_mean': np.mean(all_mapping_net_calls),
+        'mapping_net_std': np.std(all_mapping_net_calls, ddof=1),
+        'mapping_net_min': int(np.min(all_mapping_net_calls)),
+        'mapping_net_max': int(np.max(all_mapping_net_calls)),
+        'inverse_net_mean': np.mean(all_inverse_net_calls),
+        'inverse_net_std': np.std(all_inverse_net_calls, ddof=1),
+        'inverse_net_min': int(np.min(all_inverse_net_calls)),
+        'inverse_net_max': int(np.max(all_inverse_net_calls)),
+        'total_mean': np.mean(all_total_calls),
+        'total_std': np.std(all_total_calls, ddof=1),
+        'total_min': int(np.min(all_total_calls)),
+        'total_max': int(np.max(all_total_calls)),
+        'total_across_all_obs': int(np.sum(all_total_calls)),
+    }
+
+    # Find trajectory closest to median
+    median_traj_idx = int(np.argmin(np.abs(per_trajectory_median_loss - median_loss)))
+    median_representative_id = int(trajectory_ids[median_traj_idx])
+    median_representative_loss = per_trajectory_median_loss[median_traj_idx]
+
+    if verbose:
+        print(f"\n=== Cross-Trajectory Statistics ===")
+        print(f"Metric: {loss_label}")
+        print(f"Per-trajectory summary: median across obs. choices")
+        print(f"Mean of medians: {mean_loss:.6f}")
+        print(f"Std of medians: {std_loss:.6f}")
+        print(f"Median of medians: {median_loss:.6f}")
+        print(f"IQR of medians: [{q1_loss:.6f}, {q3_loss:.6f}]")
+        print(f"{confidence_level*100:.0f}% BCa CI for mean of medians (over trajectories): [{ci_lower:.6f}, {ci_upper:.6f}]")
+        print(f"N_traj={N_traj}, N_obs={N_obs}, n={n}")
+        print(f"\nMedian-representative trajectory: ID={median_representative_id} "
+              f"(obs-median {loss_label}={median_representative_loss:.6f})")
+        print(f"\n=== Forward Pass Count Statistics (over {N_obs} obs. choices, batched over {N_traj} trajectories) ===")
+        print(f"MappingNet calls per obs:  mean={forward_pass_stats['mapping_net_mean']:.1f} "
+              f"(std={forward_pass_stats['mapping_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['mapping_net_min']}, {forward_pass_stats['mapping_net_max']}]")
+        print(f"InverseNet calls per obs:  mean={forward_pass_stats['inverse_net_mean']:.1f} "
+              f"(std={forward_pass_stats['inverse_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['inverse_net_min']}, {forward_pass_stats['inverse_net_max']}]")
+        print(f"Total calls per obs:       mean={forward_pass_stats['total_mean']:.1f} "
+              f"(std={forward_pass_stats['total_std']:.1f}), "
+              f"range=[{forward_pass_stats['total_min']}, {forward_pass_stats['total_max']}]")
+        print(f"Total calls across all obs: {forward_pass_stats['total_across_all_obs']}")
+
+    results = {
+        'loss_matrix': loss_matrix,
+        'loss_matrix_normalized': loss_matrix_normalized,
+        'loss_matrix_for_stats': loss_matrix_for_stats,
+        'per_trajectory_median_loss': per_trajectory_median_loss,
+        'per_obs_mean_loss': per_obs_mean_loss,
+        'summary_stats': summary_stats,
+        'trajectory_ids': trajectory_ids,
+        'energies': energies,
+        't': t_np,
+        'N_obs': N_obs,
+        'N_traj': N_traj,
+        'confidence_level': confidence_level,
+        'normalized': normalize_by_energy,
+        'forward_pass_stats': forward_pass_stats,
+        'all_mapping_net_calls': all_mapping_net_calls,
+        'all_inverse_net_calls': all_inverse_net_calls,
+        'median_representative_id': median_representative_id,
+        'median_representative_loss': median_representative_loss,
+        'n': n,
+    }
+
+    return results
+
+
+POS_COLS = ("x", "y")
+MOM_COLS = ("px", "py")
+
+
+# =====================================================================
+#  Energy functions:  energy(q, p) with q, p numpy of shape (..., n) -> (...)
+# =====================================================================
+
+def make_energy_henon_heiles(lam=1.0):
+    """
+    H = 0.5(px^2 + py^2) + 0.5(x^2 + y^2) + lam*(x^2 y - y^3/3)   [n = 2]
+
+    Identical to HenonHeiles.hamiltonian used to generate the data, and the
+    exact Hamiltonian of build_hh_integrator's equations of motion.
+    """
+    def energy(q, p):
+        x, y = q[..., 0], q[..., 1]
+        px, py = p[..., 0], p[..., 1]
+        return 0.5 * (px**2 + py**2) + 0.5 * (x**2 + y**2) \
+            + lam * (x**2 * y - (1 / 3.) * y**3)
+    energy.__name__ = f"henon_heiles(lam={lam})"
+    return energy
+
+
+def make_energy_harmonic_oscillator(k=1.0, mass=1.0):
+    """H = 0.5 p^2 + 0.5 (k/m) q^2, summed over DOF. Bitwise-identical at n=1."""
+    def energy(q, p):
+        return 0.5 * (p**2).sum(-1) + 0.5 * (k / mass) * (q**2).sum(-1)
+    energy.__name__ = f"harmonic_oscillator(k={k},mass={mass})"
+    return energy
+
+
+def make_energy_ideal_pendulum(g=9.81, length=3.0):
+    """H = 0.5 p^2 + (g/l)(1 - cos q), summed over DOF. Bitwise-identical at n=1."""
+    def energy(q, p):
+        return 0.5 * (p**2).sum(-1) + (g / length) * (1 - np.cos(q)).sum(-1)
+    energy.__name__ = f"ideal_pendulum(g={g},length={length})"
+    return energy
+
+
+def make_energy_real_pendulum(constant=2.4):
+    """H = p^2 + c(1 - cos q), summed over DOF. Bitwise-identical at n=1."""
+    def energy(q, p):
+        return (p**2).sum(-1) + constant * (1 - np.cos(q)).sum(-1)
+    energy.__name__ = f"real_pendulum(constant={constant})"
+    return energy
+
+
+# =====================================================================
+#  Evaluation loss (NOT the training loss: no 1/n normalisation)
+# =====================================================================
+
+def prediction_loss_general(
+    x_pred: torch.Tensor,
+    u_pred: torch.Tensor,
+    X_labels: torch.Tensor,
+    U_labels: torch.Tensor,
+    n: int,
+    loss_type: str = "mse",
+) -> torch.Tensor:
+    """
+    General-n MAE / MSE prediction loss.
+
+    The DOF axis is SUMMED, not averaged, so that for loss_type='mse' this is
+    exactly the paper's scalar
+        L_m = mean over prediction times of
+              SE(t) = sum_i (q_hat_i - q_i)^2 + sum_i (p_hat_i - p_i)^2 .
+
+    NOTE this is the *evaluation* loss. The training loss of Sec. Training
+    additionally divides by n; the two coincide at n = 1.
+
+    At n = 1 with (..., 1)-shaped inputs the DOF sum is a single-element sum,
+    so this reduces bitwise to the n = 1 `prediction_loss` on (...,)-shaped
+    tensors, for both 'mae' and 'mse'.
+
+    Args:
+        x_pred, u_pred, X_labels, U_labels: (..., n) tensors
+        n: int, number of degrees of freedom (last axis)
+        loss_type: 'mae' or 'mse'
+
+    Returns:
+        loss: scalar tensor
+    """
+    if not (x_pred.shape == u_pred.shape == X_labels.shape == U_labels.shape):
+        raise ValueError(
+            f"x_pred, u_pred, X_labels, U_labels must share a shape, got "
+            f"{tuple(x_pred.shape)}, {tuple(u_pred.shape)}, "
+            f"{tuple(X_labels.shape)}, {tuple(U_labels.shape)}")
+    if x_pred.dim() < 1 or x_pred.shape[-1] != n:
+        raise ValueError(
+            f"last axis must be the DOF axis of size n={n}, got shape {tuple(x_pred.shape)}")
+
+    if loss_type.lower() == "mae":
+        x_loss = torch.mean(torch.abs(x_pred - X_labels).sum(dim=-1))
+        u_loss = torch.mean(torch.abs(u_pred - U_labels).sum(dim=-1))
+    elif loss_type.lower() == "mse":
+        x_loss = torch.mean(((x_pred - X_labels) ** 2).sum(dim=-1))
+        u_loss = torch.mean(((u_pred - U_labels) ** 2).sum(dim=-1))
+    else:
+        raise ValueError(f"Invalid loss_type '{loss_type}'. Choose either 'mae' or 'mse'.")
+
+    total_loss = x_loss + u_loss
+    return total_loss
+
+
+# =====================================================================
+#  Single-trajectory inference from one observation index
+# =====================================================================
+
+def test_model_in_single_trajectory_general(
+    get_data_from_trajectory_id_function,
+    loss_type,
+    test_id_df,
+    test_df,
+    trajectory_id,
+    mapping_net,
+    inverse_net,
+    device,
+    point_indexes_observed,
+    Tmax,
+    n,
+    pos_cols=POS_COLS,
+    mom_cols=MOM_COLS,
+    verbose=False,
+):
+    """
+    General-n version. Returns the same 7-tuple as the n = 1 function, with
+    x_pred, u_pred, x, u now of shape (T, n) and t of shape (T,).
+    """
+    if not isinstance(point_indexes_observed, list) or len(point_indexes_observed) != 1:
+        raise ValueError(f"point_indexes_observed must be a list with exactly one integer, got {point_indexes_observed}")
+
+    if not isinstance(point_indexes_observed[0], (int, np.integer)):
+        raise ValueError(f"point_indexes_observed[0] must be an integer, got {type(point_indexes_observed[0])}")
+
+    if loss_type not in ("euclidean", "mae", "mse"):
+        raise ValueError(f"Unknown loss_type '{loss_type}'. Must be 'euclidean', 'mae', or 'mse'.")
+
+    if len(pos_cols) != n:
+        raise ValueError(f"pos_cols must have n={n} entries, got {len(pos_cols)}: {pos_cols}")
+    if len(mom_cols) != n:
+        raise ValueError(f"mom_cols must have n={n} entries, got {len(mom_cols)}: {mom_cols}")
+
+    test_trajectory_data = get_data_from_trajectory_id_function(
+        test_id_df, test_df, trajectory_ids=trajectory_id)
+
+    missing = [c for c in list(pos_cols) + list(mom_cols) + ['t']
+               if c not in test_trajectory_data.columns]
+    if missing:
+        raise ValueError(f"columns missing from trajectory data: {missing}")
+
+    x = torch.as_tensor(test_trajectory_data[list(pos_cols)].to_numpy(dtype=np.float32),
+                        device=device)                                       # (T, n)
+    u = torch.as_tensor(test_trajectory_data[list(mom_cols)].to_numpy(dtype=np.float32),
+                        device=device)                                       # (T, n)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32),
+                        device=device)                                       # (T,)
+
+    if x.dim() != 2 or u.dim() != 2 or t.dim() != 1:
+        raise ValueError(
+            f"x, u must be 2-dimensional (T, n) and t 1-dimensional, got dims "
+            f"{x.dim()}, {u.dim()}, {t.dim()}")
+    if x.shape[1] != n or u.shape[1] != n:
+        raise ValueError(f"x, u must have DOF dim n={n}, got {x.shape[1]}, {u.shape[1]}")
+
+    obs_idx = point_indexes_observed[0]
+    T = len(t)
+
+    if obs_idx < 0 or obs_idx >= T:
+        raise ValueError(f"point_indexes_observed[0]={obs_idx} is out of bounds for trajectory of length {T}")
+
+    t_np = t.detach().cpu().numpy()
+    query_indices = [i for i in range(T) if i != obs_idx]
+    query_times = t_np[query_indices]
+
+    pred_dict, forward_pass_count = Autoregressive_Handoff_Inference_Protocol_general(
+        mapping_net=mapping_net,
+        inverse_net=inverse_net,
+        x_obs=x[obs_idx],                    # (n,)
+        u_obs=u[obs_idx],                    # (n,)
+        t_obs=t_np[obs_idx],
+        t_min=t_np[0],
+        t_max=t_np[-1],
+        Tmax=Tmax,
+        query_times=query_times,
+        query_indices=query_indices,
+        device=device,
+        n=n,
+    )
+
+    # Assemble predictions. pred_dict entries are (n,) float32 numpy arrays, so
+    # we stage in numpy and transfer once (pure copies; bit-exact, but avoids
+    # T-1 host<->device round trips that scalar assignment would incur).
+    x_pred_np = np.empty((T, n), dtype=np.float32)
+    u_pred_np = np.empty((T, n), dtype=np.float32)
+    x_pred_np[obs_idx] = x[obs_idx].detach().cpu().numpy()
+    u_pred_np[obs_idx] = u[obs_idx].detach().cpu().numpy()
+    for idx in query_indices:
+        x_pred_np[idx] = pred_dict[idx][0]
+        u_pred_np[idx] = pred_dict[idx][1]
+    x_pred = torch.as_tensor(x_pred_np, device=device)                       # (T, n)
+    u_pred = torch.as_tensor(u_pred_np, device=device)                       # (T, n)
+
+    if verbose:
+        total_passes = forward_pass_count['mapping_net'] + forward_pass_count['inverse_net']
+        print(f"\n=== Forward Pass Count ===")
+        print(f"mapping_net calls: {forward_pass_count['mapping_net']}")
+        print(f"inverse_net calls: {forward_pass_count['inverse_net']}")
+        print(f"Total forward passes: {total_passes}")
+
+    if loss_type == "euclidean":
+        pred_loss_full_trajectory = prediction_loss_euclidean_general(
+            x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, n=n)
+    elif loss_type in ("mae", "mse"):
+        pred_loss_full_trajectory = prediction_loss_general(
+            x_pred=x_pred, u_pred=u_pred, X_labels=x, U_labels=u, n=n, loss_type=loss_type)
+
+    return pred_loss_full_trajectory, x_pred, u_pred, x, u, t, forward_pass_count
+
+
+# =====================================================================
+#  Varying-observation sensitivity analysis
+# =====================================================================
+
+def test_model_varying_observation_single_trajectory_general(
+    get_data_from_trajectory_id_function,
+    loss_type,
+    test_id_df,
+    test_df,
+    trajectory_id,
+    mapping_net,
+    inverse_net,
+    device,
+    Tmax,
+    n,
+    pos_cols=POS_COLS,
+    mom_cols=MOM_COLS,
+    energy_function=None,
+    verbose=False,
+):
+    """
+    General-n single-trajectory diagnostic over every observation choice.
+
+    `energy_function` replaces the n = 1 `case` + (k, mass, g, length, constant)
+    parameters: a callable energy(q, p) taking numpy arrays of shape (..., n)
+    and returning shape (...). None disables energy tracking, exactly as
+    case=None did.
+
+    Returns the same dict as the n = 1 version, with:
+        'x', 'u'                     : (T, n)
+        'all_x_pred', 'all_u_pred'   : (N, T, n)
+        'pointwise_errors'           : (N, T)      [DOF axis collapsed]
+        'energy_true'                : (T,)
+        'all_energy_pred'            : (N, T)
+        'case'                       : energy_function.__name__ or None
+    plus 'n', 'pos_cols', 'mom_cols'.
+    """
+    if loss_type not in ("euclidean", "mae", "mse"):
+        raise ValueError(f"Unknown loss_type '{loss_type}'. Must be 'euclidean', 'mae', or 'mse'.")
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if len(pos_cols) != n:
+        raise ValueError(f"pos_cols must have n={n} entries, got {len(pos_cols)}: {pos_cols}")
+    if len(mom_cols) != n:
+        raise ValueError(f"mom_cols must have n={n} entries, got {len(mom_cols)}: {mom_cols}")
+    if energy_function is not None and not callable(energy_function):
+        raise ValueError(f"energy_function must be callable or None, got {type(energy_function)}")
+
+    # Load trajectory once
+    test_trajectory_data = get_data_from_trajectory_id_function(
+        test_id_df, test_df, trajectory_ids=trajectory_id)
+
+    missing = [c for c in list(pos_cols) + list(mom_cols) + ['t']
+               if c not in test_trajectory_data.columns]
+    if missing:
+        raise ValueError(f"columns missing from trajectory data: {missing}")
+
+    x = torch.as_tensor(test_trajectory_data[list(pos_cols)].to_numpy(dtype=np.float32),
+                        device=device)                                       # (T, n)
+    u = torch.as_tensor(test_trajectory_data[list(mom_cols)].to_numpy(dtype=np.float32),
+                        device=device)                                       # (T, n)
+    t = torch.as_tensor(test_trajectory_data['t'].to_numpy(dtype=np.float32),
+                        device=device)                                       # (T,)
+
+    T = len(t)
+    if T < 2:
+        raise ValueError(f"Need at least two time points to run observation-choice analysis, got {T}")
+    if x.shape[1] != n or u.shape[1] != n:
+        raise ValueError(f"x, u must have DOF dim n={n}, got {x.shape[1]}, {u.shape[1]}")
+    N = T  # one run per observation point
+
+    # Pre-convert ground truth to numpy once
+    t_np = t.detach().cpu().numpy()
+    x_np = x.detach().cpu().numpy()                                          # (T, n)
+    u_np = u.detach().cpu().numpy()                                          # (T, n)
+
+    per_run_losses = np.empty(N)
+    pointwise_errors = np.empty((N, T))
+    all_x_pred = np.empty((N, T, n))
+    all_u_pred = np.empty((N, T, n))
+    all_mapping_net_calls = np.empty(N, dtype=int)
+    all_inverse_net_calls = np.empty(N, dtype=int)
+
+    # Energy computation setup
+    if energy_function is not None:
+        all_energy_pred = np.empty((N, T))
+        energy_true = energy_function(x_np, u_np)                            # (T,)
+        energy_true = np.asarray(energy_true)
+        if energy_true.shape != (T,):
+            raise ValueError(
+                f"energy_function must return shape (T,) = ({T},) for (T, n) inputs, "
+                f"got {energy_true.shape}")
+
+    for obs_idx in range(N):
+        pred_loss, x_pred, u_pred, _, _, _, fwd_count = test_model_in_single_trajectory_general(
+            get_data_from_trajectory_id_function=get_data_from_trajectory_id_function,
+            loss_type=loss_type,
+            test_id_df=test_id_df,
+            test_df=test_df,
+            trajectory_id=trajectory_id,
+            mapping_net=mapping_net,
+            inverse_net=inverse_net,
+            device=device,
+            point_indexes_observed=[obs_idx],
+            Tmax=Tmax,
+            n=n,
+            pos_cols=pos_cols,
+            mom_cols=mom_cols,
+            verbose=False,
+        )
+
+        per_run_losses[obs_idx] = pred_loss.item()
+
+        x_pred_np = x_pred.detach().cpu().numpy()                            # (T, n)
+        u_pred_np = u_pred.detach().cpu().numpy()                            # (T, n)
+        all_x_pred[obs_idx] = x_pred_np
+        all_u_pred[obs_idx] = u_pred_np
+
+        if energy_function is not None:
+            all_energy_pred[obs_idx] = energy_function(x_pred_np, u_pred_np)
+
+        # DOF axis summed (phase-space quantities), bitwise-identical at n = 1
+        if loss_type == "euclidean":
+            pointwise_errors[obs_idx] = np.sqrt(
+                ((x_pred_np - x_np)**2).sum(-1) + ((u_pred_np - u_np)**2).sum(-1))
+        elif loss_type == "mae":
+            pointwise_errors[obs_idx] = (
+                np.abs(x_pred_np - x_np).sum(-1) + np.abs(u_pred_np - u_np).sum(-1))
+        elif loss_type == "mse":
+            pointwise_errors[obs_idx] = (
+                ((x_pred_np - x_np)**2).sum(-1) + ((u_pred_np - u_np)**2).sum(-1))
+
+        if verbose:
+            print(f"Observation index {obs_idx}/{N-1}, loss: {per_run_losses[obs_idx]:.6f}")
+
+        all_mapping_net_calls[obs_idx] = fwd_count['mapping_net']
+        all_inverse_net_calls[obs_idx] = fwd_count['inverse_net']
+
+    # === Summary statistics over runs ===
+    mean_loss = np.mean(per_run_losses)
+    std_loss = np.std(per_run_losses, ddof=1)
+    median_loss = np.median(per_run_losses)
+    q1_loss = np.percentile(per_run_losses, 25)
+    q3_loss = np.percentile(per_run_losses, 75)
+    iqr_loss = q3_loss - q1_loss
+    min_loss = np.min(per_run_losses)
+    max_loss = np.max(per_run_losses)
+
+    summary_stats = {
+        'mean': mean_loss,
+        'std': std_loss,
+        'median': median_loss,
+        'q1': q1_loss,
+        'q3': q3_loss,
+        'iqr': iqr_loss,
+        'min': min_loss,
+        'max': max_loss,
+    }
+
+    representative_idx = int(np.argmin(np.abs(per_run_losses - median_loss)))
+
+    if verbose:
+        print(f"\n=== Summary Statistics ===")
+        print(f"Mean loss: {mean_loss:.6f}")
+        print(f"Std loss: {std_loss:.6f}")
+        print(f"Median loss: {median_loss:.6f}")
+        print(f"IQR: [{q1_loss:.6f}, {q3_loss:.6f}]")
+        print(f"Range: [{min_loss:.6f}, {max_loss:.6f}]")
+        print(f"Representative run: obs_idx={representative_idx}, loss={per_run_losses[representative_idx]:.6f}")
+
+    # === Per-time-point statistics, excluding self-observation ===
+    per_timepoint_median = np.empty(T)
+    per_timepoint_p25 = np.empty(T)
+    per_timepoint_p75 = np.empty(T)
+
+    for j in range(T):
+        mask = np.ones(N, dtype=bool)
+        mask[j] = False
+        errors_at_j = pointwise_errors[mask, j]
+
+        per_timepoint_median[j] = np.median(errors_at_j)
+        per_timepoint_p25[j] = np.percentile(errors_at_j, 25)
+        per_timepoint_p75[j] = np.percentile(errors_at_j, 75)
+
+    per_timepoint_stats = {
+        'median': per_timepoint_median,
+        'p25': per_timepoint_p25,
+        'p75': per_timepoint_p75,
+    }
+
+    # === Per-time-point energy statistics, excluding self-observation ===
+    if energy_function is not None:
+        energy_timepoint_median = np.empty(T)
+        energy_timepoint_p25 = np.empty(T)
+        energy_timepoint_p75 = np.empty(T)
+        energy_timepoint_p5 = np.empty(T)
+        energy_timepoint_p95 = np.empty(T)
+
+        for j in range(T):
+            mask = np.ones(N, dtype=bool)
+            mask[j] = False
+            energy_at_j = all_energy_pred[mask, j]
+
+            energy_timepoint_median[j] = np.median(energy_at_j)
+            energy_timepoint_p25[j] = np.percentile(energy_at_j, 25)
+            energy_timepoint_p75[j] = np.percentile(energy_at_j, 75)
+            energy_timepoint_p5[j] = np.percentile(energy_at_j, 5)
+            energy_timepoint_p95[j] = np.percentile(energy_at_j, 95)
+
+        energy_stats = {
+            'median': energy_timepoint_median,
+            'p25': energy_timepoint_p25,
+            'p75': energy_timepoint_p75,
+            'p5': energy_timepoint_p5,
+            'p95': energy_timepoint_p95,
+        }
+    else:
+        energy_true = None
+        all_energy_pred = None
+        energy_stats = None
+
+    # === Forward pass count statistics ===
+    all_total_calls = all_mapping_net_calls + all_inverse_net_calls
+    forward_pass_stats = {
+        'mapping_net_mean': np.mean(all_mapping_net_calls),
+        'mapping_net_std': np.std(all_mapping_net_calls, ddof=1),
+        'mapping_net_min': int(np.min(all_mapping_net_calls)),
+        'mapping_net_max': int(np.max(all_mapping_net_calls)),
+        'inverse_net_mean': np.mean(all_inverse_net_calls),
+        'inverse_net_std': np.std(all_inverse_net_calls, ddof=1),
+        'inverse_net_min': int(np.min(all_inverse_net_calls)),
+        'inverse_net_max': int(np.max(all_inverse_net_calls)),
+        'total_mean': np.mean(all_total_calls),
+        'total_std': np.std(all_total_calls, ddof=1),
+        'total_min': int(np.min(all_total_calls)),
+        'total_max': int(np.max(all_total_calls)),
+    }
+    if verbose:
+        print(f"\n=== Forward Pass Count Statistics (over {N} obs. choices) ===")
+        print(f"MappingNet calls:  mean={forward_pass_stats['mapping_net_mean']:.1f} "
+              f"(std={forward_pass_stats['mapping_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['mapping_net_min']}, {forward_pass_stats['mapping_net_max']}]")
+        print(f"InverseNet calls:  mean={forward_pass_stats['inverse_net_mean']:.1f} "
+              f"(std={forward_pass_stats['inverse_net_std']:.1f}), "
+              f"range=[{forward_pass_stats['inverse_net_min']}, {forward_pass_stats['inverse_net_max']}]")
+        print(f"Total calls:       mean={forward_pass_stats['total_mean']:.1f} "
+              f"(std={forward_pass_stats['total_std']:.1f}), "
+              f"range=[{forward_pass_stats['total_min']}, {forward_pass_stats['total_max']}]")
+
+    results = {
+        'per_run_losses': per_run_losses,
+        'pointwise_errors': pointwise_errors,
+        'summary_stats': summary_stats,
+        'per_timepoint_stats': per_timepoint_stats,
+        'representative_idx': representative_idx,
+        't': t_np,
+        'x': x_np,
+        'u': u_np,
+        'trajectory_id': trajectory_id,
+        'loss_type': loss_type,
+        'N': N,
+        'T': T,
+        'all_x_pred': all_x_pred,
+        'all_u_pred': all_u_pred,
+        'energy_true': energy_true,
+        'all_energy_pred': all_energy_pred,
+        'energy_stats': energy_stats,
+        'case': (energy_function.__name__ if energy_function is not None else None),
+        'forward_pass_stats': forward_pass_stats,
+        'all_mapping_net_calls': all_mapping_net_calls,
+        'all_inverse_net_calls': all_inverse_net_calls,
+        'n': n,
+        'pos_cols': tuple(pos_cols),
+        'mom_cols': tuple(mom_cols),
+    }
+
+    return results
+
+
+# =====================================================================
+#  Plotting
+# =====================================================================
+
+def plot_varying_observation_results_general(
+    results, obs_idx, phase_coords=None, figsize=(28, 7),
+    connect_points=True, iqr_alpha=0.4,
+):
+    """
+    General-n version. Identical to the n = 1 plot except that panel 3 shows the
+    two phase-space coordinates named in `phase_coords`.
+
+    Args:
+        results: dict from test_model_varying_observation_single_trajectory_general
+        obs_idx: int, which observation-run to display in panels 2 and 3
+        phase_coords: tuple of exactly two distinct names drawn from
+            pos_cols + mom_cols, e.g. ('x','px'), ('y','px'), ('x','y').
+            Default (pos_cols[0], mom_cols[0]), which is the n = 1 (q, p) plot.
+        figsize, connect_points, iqr_alpha: as in the n = 1 version.
+    """
+    t = results['t']
+    per_timepoint_stats = results['per_timepoint_stats']
+    summary_stats = results['summary_stats']
+    trajectory_id = results['trajectory_id']
+    loss_type = results['loss_type']
+    N = results['N']
+    T = results['T']
+    x_gt = results['x']                       # (T, n)
+    u_gt = results['u']                       # (T, n)
+    all_x_pred = results['all_x_pred']        # (N, T, n)
+    all_u_pred = results['all_u_pred']
+    pointwise_errors = results['pointwise_errors']
+    pos_cols = tuple(results['pos_cols'])
+    mom_cols = tuple(results['mom_cols'])
+
+    if not (0 <= obs_idx < N):
+        raise ValueError(f"obs_idx={obs_idx} is out of bounds for N={N} runs")
+
+    # ---- resolve the two phase-space coordinates ----
+    all_names = list(pos_cols) + list(mom_cols)
+    if len(set(all_names)) != len(all_names):
+        raise ValueError(f"pos_cols + mom_cols contain duplicate names: {all_names}")
+    if phase_coords is None:
+        phase_coords = (pos_cols[0], mom_cols[0])
+    if len(phase_coords) != 2:
+        raise ValueError(f"phase_coords must name exactly two coordinates, got {phase_coords}")
+    if phase_coords[0] == phase_coords[1]:
+        raise ValueError(f"phase_coords must name two distinct coordinates, got {phase_coords}")
+    for c in phase_coords:
+        if c not in all_names:
+            raise ValueError(f"unknown coordinate '{c}'; available: {all_names}")
+
+    def _gt(name):
+        return x_gt[:, pos_cols.index(name)] if name in pos_cols \
+            else u_gt[:, mom_cols.index(name)]
+
+    def _pred(name, run):
+        return all_x_pred[run][:, pos_cols.index(name)] if name in pos_cols \
+            else all_u_pred[run][:, mom_cols.index(name)]
+
+    cA, cB = phase_coords
+    A_gt, B_gt = _gt(cA), _gt(cB)
+    A_pred, B_pred = _pred(cA, obs_idx), _pred(cB, obs_idx)
+
+    energy_true = results.get('energy_true', None)
+    all_energy_pred = results.get('all_energy_pred', None)
+    energy_stats = results.get('energy_stats', None)
+
+    obs_time = t[obs_idx]
+
+    has_energy = energy_true is not None and energy_stats is not None
+    n_plots = 3 if has_energy else 2
+
+    if n_plots == 2:
+        figsize = (20, 7)
+
+    fig, axes = plt.subplots(1, n_plots, figsize=figsize)
+
+    fig.text(
+        0.005, 0.995,
+        f"Trajectory {trajectory_id} | {N} obs. choices | obs. t={obs_time:.2f} (idx {obs_idx})",
+        ha='left',
+        va='top',
+        fontsize=10,
+        alpha=1.0,
+    )
+
+    if n_plots == 2:
+        ax1, ax3 = axes
+        ax2 = None
+    else:
+        ax1, ax2, ax3 = axes
+
+    # === Plot 1: Per-time-point error IQR band ===
+    ax1.fill_between(t, per_timepoint_stats['p25'], per_timepoint_stats['p75'],
+                     alpha=iqr_alpha, color='red', label='IQR across obs. choices')
+    ax1.plot(t, per_timepoint_stats['median'], color='red', linewidth=1.5,
+             label='Median across obs. choices')
+    ax1.plot(t, pointwise_errors[obs_idx], color='red', linewidth=1.2,
+             linestyle='dotted', label='Selected obs. run')
+
+    ax1.set_xlim(t[0], t[-1])
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel(f'Pointwise Error ({loss_type})')
+    ax1.set_title('Prediction Error Over Time')
+    ax1.legend(loc='upper right', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    selected_run_loss = results['per_run_losses'][obs_idx]
+    textstr = (
+        f"Scalar loss across obs. choices:\n"
+        f"  Mean (std={summary_stats['std']:.4f}): {summary_stats['mean']:.4f}\n"
+        f"  Median [IQR]: {summary_stats['median']:.4f} "
+        f"[{summary_stats['q1']:.4f}, {summary_stats['q3']:.4f}]\n"
+        f"  Range: [{summary_stats['min']:.4f}, {summary_stats['max']:.4f}]\n"
+        f"Selected obs. run: {selected_run_loss:.4f}"
+    )
+    ax1.text(0.02, 0.98, textstr, transform=ax1.transAxes, fontsize=8,
+             ha='left', va='top',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    # === Plot 2: Energy (if available) ===
+    if has_energy:
+        ax2.fill_between(t, energy_stats['p25'], energy_stats['p75'],
+                         alpha=iqr_alpha, color='red',
+                         label='IQR across obs. choices')
+
+        energy_run = all_energy_pred[obs_idx]
+        ax2.plot(t, energy_run, color='red', linewidth=1.5,
+                 label='E_pred(t) (selected obs. run)')
+
+        ax2.plot(t, energy_true, color='blue', linewidth=2, label='E_true(t)')
+
+        ax2.set_xlim(t[0], t[-1])
+        ax2.set_xlabel('Time (t)')
+        ax2.set_ylabel('Energy')
+        ax2.set_title('Energy: Predicted vs True')
+        ax2.legend(loc='upper right', fontsize=8)
+        ax2.grid(True, alpha=0.3)
+
+        energy_errors_run = np.abs(energy_run - energy_true)
+        mean_energy_error = np.mean(energy_errors_run)
+        max_energy_error = np.max(energy_errors_run)
+        true_energy_mean = np.mean(np.abs(energy_true))
+        relative_error = (
+            mean_energy_error / true_energy_mean * 100
+            if true_energy_mean > 1e-12
+            else np.nan
+        )
+
+        energy_textstr = (
+            f"Selected obs. run:\n"
+            f"  Mean |E_pred - E_true|: {mean_energy_error:.4f}\n"
+            f"  Max |E_pred - E_true|: {max_energy_error:.4f}\n"
+            f"  Relative error: {relative_error:.2f}%"
+        )
+        ax2.text(0.02, 0.98, energy_textstr, transform=ax2.transAxes, fontsize=8,
+                 ha='left', va='top',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    # === Plot 3: Phase space (selected coordinate pair) ===
+    scatter_gt = ax3.scatter(A_gt, B_gt, c=t, cmap='Blues', s=60, alpha=0.8,
+                             edgecolors='darkblue', linewidths=0.5, zorder=3)
+    scatter_pred = ax3.scatter(A_pred, B_pred, c=t, cmap='Reds', s=60,
+                               alpha=0.8, edgecolors='darkred',
+                               linewidths=0.5, zorder=3)
+
+    if connect_points:
+        ax3.plot(A_gt, B_gt, color='blue', alpha=0.3, linewidth=1.5, zorder=2)
+        ax3.plot(A_pred, B_pred, color='red', alpha=0.3,
+                 linewidth=1.5, zorder=2)
+
+    ax3.scatter(A_gt[0], B_gt[0], c='blue', marker='*', s=400,
+                edgecolors='black', linewidths=2.5, zorder=5)
+    ax3.scatter(A_pred[0], B_pred[0], c='red', marker='*', s=400,
+                edgecolors='black', linewidths=2.5, zorder=5)
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
+               markersize=10, markeredgecolor='darkblue',
+               label='Ground Truth'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+               markersize=10, markeredgecolor='darkred',
+               label='Prediction'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='blue',
+               markersize=15, markeredgecolor='black',
+               label='Start (Ground Truth)'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='red',
+               markersize=15, markeredgecolor='black',
+               label='Start (Prediction)'),
+    ]
+    ax3.legend(handles=legend_elements, fontsize=7, loc='best')
+
+    cbar = plt.colorbar(scatter_pred, ax=ax3, pad=0.02, fraction=0.046)
+    cbar.set_label('Time', fontsize=10)
+
+    ax3.set_xlabel(cA, fontsize=12)
+    ax3.set_ylabel(cB, fontsize=12)
+    ax3.set_title(
+        f'Phase Space ({cA}, {cB}): Ground Truth vs Prediction (selected obs. run)',
+        fontsize=11,
+    )
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    plt.show()
