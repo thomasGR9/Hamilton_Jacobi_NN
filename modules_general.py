@@ -4068,3 +4068,460 @@ def plot_varying_observation_results_general(
 
     plt.tight_layout(rect=[0, 0, 1, 0.99])
     plt.show()
+
+
+
+
+
+
+
+
+
+def test_model_variance_with_varying_observed_points_general(
+    get_data_from_trajectory_id_function,
+    test_id_df,
+    test_df,
+    mapping_net,
+    Tmax,
+    device,
+    n,
+    pos_cols=POS_COLS,
+    mom_cols=MOM_COLS,
+    n_permutations=20,
+    confidence_level=0.95,
+    valid_fraction_threshold=0.5,
+    rng_seed=None,
+    verbose=True,
+):
+    """
+    General-n within-segment consistency of MappingNet outputs as observation
+    count increases.
+
+    Per segment the score is the mean coefficient of variation over ALL 2n latent
+    coordinates,
+        V_seg = 1/(2n) * sum_i [ CV(Q_i) + CV(P_i) ],
+        CV(z) = std(z) / (|mean(z)| + eps),   eps = 1e-3,
+    i.e. each DOF is normalised by its OWN mean, then averaged. This is the mean
+    CV over the method's conserved quantities, exactly parallel to the baseline's
+    (1/K) sum_k CV(C_k), and reduces to 1/2 (CV(Q)+CV(P)) bitwise at n = 1.
+
+    Everything downstream of the per-segment scalar (permutation averaging,
+    hierarchical aggregation, validity masking, BCa CI) is identical to the n = 1
+    version, because V_seg is a scalar just as before.
+
+    Returns:
+        results: dict, same keys as the n = 1 version, with X_final_array and
+                 U_final_array now (N_traj, N_obs, n), plus 'n', 'pos_cols',
+                 'mom_cols'.
+    """
+    from scipy.stats import bootstrap as scipy_bootstrap
+    import warnings
+
+    if Tmax is None or Tmax <= 0:
+        raise ValueError(f"Tmax must be a positive number, got {Tmax}")
+    if len(pos_cols) != n:
+        raise ValueError(f"pos_cols must have n={n} entries, got {len(pos_cols)}: {pos_cols}")
+    if len(mom_cols) != n:
+        raise ValueError(f"mom_cols must have n={n} entries, got {len(mom_cols)}: {mom_cols}")
+    if hasattr(mapping_net, "n") and mapping_net.n != n:
+        raise ValueError(f"mapping_net.n={mapping_net.n} does not match n={n}")
+
+    trajectory_ids = test_id_df['trajectory_id'].values.astype(int)
+    N_traj = len(trajectory_ids)
+
+    # Preload all trajectories and validate shared time structure
+    all_x = []
+    all_u = []
+    all_t = []
+    ref_t = None
+
+    for trajectory_id in trajectory_ids:
+        traj_data = get_data_from_trajectory_id_function(
+            test_id_df, test_df, trajectory_ids=int(trajectory_id))
+
+        missing = [c for c in list(pos_cols) + list(mom_cols) + ['t']
+                   if c not in traj_data.columns]
+        if missing:
+            raise ValueError(f"Trajectory {trajectory_id}: columns missing: {missing}")
+
+        x_i = torch.as_tensor(traj_data[list(pos_cols)].to_numpy(dtype=np.float32),
+                              device=device)                                   # (T, n)
+        u_i = torch.as_tensor(traj_data[list(mom_cols)].to_numpy(dtype=np.float32),
+                              device=device)                                   # (T, n)
+        t_i = torch.as_tensor(traj_data['t'].to_numpy(dtype=np.float32),
+                              device=device)                                   # (T,)
+
+        if x_i.dim() != 2 or u_i.dim() != 2 or t_i.dim() != 1:
+            raise ValueError(
+                f"Trajectory {trajectory_id}: x, u must be 2D (T, n) and t 1D, got dims "
+                f"{x_i.dim()}, {u_i.dim()}, {t_i.dim()}")
+        if x_i.shape[1] != n or u_i.shape[1] != n:
+            raise ValueError(
+                f"Trajectory {trajectory_id}: DOF dim must be n={n}, got "
+                f"{x_i.shape[1]} and {u_i.shape[1]}")
+
+        if ref_t is None:
+            ref_t = t_i
+        else:
+            if len(t_i) != len(ref_t):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has {len(t_i)} points, expected {len(ref_t)}. "
+                    f"All trajectories must have the same number of points."
+                )
+            if not torch.allclose(t_i, ref_t, atol=1e-6):
+                raise ValueError(
+                    f"Trajectory {trajectory_id} has different time values. "
+                    f"All trajectories must share the same time values."
+                )
+
+        all_x.append(x_i)
+        all_u.append(u_i)
+        all_t.append(t_i)
+
+    t_np = ref_t.detach().cpu().numpy()
+    num_points = len(t_np)
+    t_max = t_np[-1]
+
+    # Build segment index mapping
+    num_segments = int(np.ceil(t_max / Tmax - 1e-9))
+    num_segments = max(num_segments, 1)
+    segment_indices_dict = {}
+
+    for seg_idx in range(num_segments):
+        t_start = seg_idx * Tmax
+        t_end = min((seg_idx + 1) * Tmax, t_max)
+        if seg_idx == num_segments - 1:
+            t_end = t_max
+
+        if seg_idx == 0:
+            seg_mask = (t_np >= t_start) & (t_np <= t_end)
+        else:
+            seg_mask = (t_np > t_start) & (t_np <= t_end)
+
+        seg_indices = np.where(seg_mask)[0].tolist()
+        if len(seg_indices) > 0:
+            segment_indices_dict[seg_idx] = seg_indices
+
+    # variance_raw[point_count, traj_idx, perm_idx]
+    variance_raw = np.full((num_points, N_traj, n_permutations), np.nan)
+
+    rng = np.random.default_rng(rng_seed)
+
+    def _seg_cv(X_final, U_final, eps=1e-3):
+        # X_final, U_final: (S, n). Per-DOF CV, averaged over all 2n coordinates.
+        Xstd = X_final.std(dim=0, unbiased=True)            # (n,)
+        Ustd = U_final.std(dim=0, unbiased=True)
+        Xcv = Xstd / (X_final.mean(dim=0).abs() + eps)      # (n,)
+        Ucv = Ustd / (U_final.mean(dim=0).abs() + eps)
+        return 0.5 * (Xcv.mean().item() + Ucv.mean().item())
+
+    for perm_idx in range(n_permutations):
+        random_order = rng.permutation(num_points)
+
+        if verbose:
+            print(f"Permutation {perm_idx + 1}/{n_permutations}")
+
+        for num_obs in range(1, num_points + 1):
+            point_indexes_observed = random_order[:num_obs].tolist()
+            selected_set = set(point_indexes_observed)
+
+            filtered_dict = {
+                k: [val for val in v if val in selected_set]
+                for k, v in segment_indices_dict.items()
+                if any(val in selected_set for val in v)
+            }
+
+            valid_segments = {
+                k: v for k, v in filtered_dict.items() if len(v) >= 2
+            }
+
+            if len(valid_segments) == 0:
+                continue
+
+            for traj_i in range(N_traj):
+                x = all_x[traj_i]
+                u = all_u[traj_i]
+                t = all_t[traj_i]
+
+                segment_variances = []
+
+                for seg_idx, seg_obs_indices in valid_segments.items():
+                    t_start = seg_idx * Tmax
+                    relative_t = (t[seg_obs_indices] - t_start).unsqueeze(1)   # (S, 1)
+
+                    X_final, U_final, _ = mapping_net(
+                        x[seg_obs_indices], u[seg_obs_indices], relative_t)     # (S, n)
+
+                    segment_variances.append(_seg_cv(X_final, U_final))
+
+                variance_raw[num_obs - 1, traj_i, perm_idx] = np.mean(segment_variances)
+
+    # Average across permutations (NaN-aware)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        variance_avg = np.nanmean(variance_raw, axis=2)
+
+    # === Full MappingNet outputs for all trajectories (for Q(t), P(t) plots) ===
+    X_final_list = [[] for _ in range(N_traj)]
+    U_final_list = [[] for _ in range(N_traj)]
+
+    for traj_i in range(N_traj):
+        x = all_x[traj_i]
+        u = all_u[traj_i]
+        t = all_t[traj_i]
+
+        for seg_idx, seg_indices in segment_indices_dict.items():
+            t_start = seg_idx * Tmax
+            relative_t = (t[seg_indices] - t_start).unsqueeze(1)               # (S, 1)
+
+            X_final, U_final, _ = mapping_net(x[seg_indices], u[seg_indices], relative_t)  # (S, n)
+
+            X_final_list[traj_i].append(X_final.detach().cpu().numpy())
+            U_final_list[traj_i].append(U_final.detach().cpu().numpy())
+
+    # (N_traj, N_obs, n)
+    X_final_array = np.array([np.concatenate(xl, axis=0) for xl in X_final_list])
+    U_final_array = np.array([np.concatenate(ul, axis=0) for ul in U_final_list])
+
+    # Validity from raw entries
+    valid_fraction_per_point = np.mean(~np.isnan(variance_raw), axis=(1, 2))
+    valid_mask = valid_fraction_per_point >= valid_fraction_threshold
+
+    point_counts = np.arange(1, num_points + 1)
+
+    # Cross-trajectory statistics at each valid point count
+    median_curve = np.full(num_points, np.nan)
+    p25_curve = np.full(num_points, np.nan)
+    p75_curve = np.full(num_points, np.nan)
+
+    for i in range(num_points):
+        if not valid_mask[i]:
+            continue
+        vals = variance_avg[i, :]
+        vals_clean = vals[~np.isnan(vals)]
+        if len(vals_clean) == 0:
+            continue
+        median_curve[i] = np.median(vals_clean)
+        p25_curve[i] = np.percentile(vals_clean, 25)
+        p75_curve[i] = np.percentile(vals_clean, 75)
+
+    # BCa CI for median at final point count with percentile fallback
+    final_vals = variance_avg[-1, :]
+    final_vals_clean = final_vals[~np.isnan(final_vals)]
+
+    ci_method = None
+
+    if len(final_vals_clean) >= 2:
+        try:
+            boot = scipy_bootstrap(
+                data=(final_vals_clean,),
+                statistic=np.median,
+                n_resamples=10000,
+                confidence_level=confidence_level,
+                method='BCa',
+            )
+            ci_method = "BCa"
+            final_ci_lower = boot.confidence_interval.low
+            final_ci_upper = boot.confidence_interval.high
+        except Exception:
+            boot = scipy_bootstrap(
+                data=(final_vals_clean,),
+                statistic=np.median,
+                n_resamples=10000,
+                confidence_level=confidence_level,
+                method='percentile',
+            )
+            ci_method = "percentile"
+            final_ci_lower = boot.confidence_interval.low
+            final_ci_upper = boot.confidence_interval.high
+    else:
+        ci_method = "N/A"
+        final_ci_lower = np.nan
+        final_ci_upper = np.nan
+
+    final_median = np.nanmedian(final_vals)
+    final_q1 = np.nanpercentile(final_vals, 25)
+    final_q3 = np.nanpercentile(final_vals, 75)
+
+    if verbose:
+        print(f"\n=== Within-Segment Consistency at Full Observation ===")
+        print(f"Median across trajectories: {final_median:.6f}")
+        print(f"IQR: [{final_q1:.6f}, {final_q3:.6f}]")
+        if ci_method != "N/A":
+            print(f"{confidence_level*100:.0f}% {ci_method} bootstrap CI for median (over trajectories): "
+                  f"[{final_ci_lower:.6f}, {final_ci_upper:.6f}]")
+        print(f"N_traj={N_traj}, N_obs={num_points}, N_permutations={n_permutations}, n={n}")
+        if np.any(valid_mask):
+            print(f"First valid point count: {point_counts[valid_mask][0]}")
+
+    results = {
+        'variance_raw': variance_raw,
+        'variance_avg': variance_avg,
+        'point_counts': point_counts,
+        'valid_mask': valid_mask,
+        'valid_fraction_per_point': valid_fraction_per_point,
+        'valid_fraction_threshold': valid_fraction_threshold,
+        'median_curve': median_curve,
+        'p25_curve': p25_curve,
+        'p75_curve': p75_curve,
+        'final_median': final_median,
+        'final_q1': final_q1,
+        'final_q3': final_q3,
+        'final_ci_lower': final_ci_lower,
+        'final_ci_upper': final_ci_upper,
+        'ci_method': ci_method,
+        'segment_indices_dict': segment_indices_dict,
+        'Tmax': Tmax,
+        't': t_np,
+        'rng_seed': rng_seed,
+        'N_traj': N_traj,
+        'N_obs': num_points,
+        'n_permutations': n_permutations,
+        'confidence_level': confidence_level,
+        'X_final_array': X_final_array,       # (N_traj, N_obs, n)
+        'U_final_array': U_final_array,       # (N_traj, N_obs, n)
+        'n': n,
+        'pos_cols': tuple(pos_cols),
+        'mom_cols': tuple(mom_cols),
+    }
+
+    return results
+
+
+def plot_variance_results_general(results, dof_index=0, figsize=(20, 6),
+                                  only_plot_percentage=None, band_alpha=0.3):
+    """
+    General-n plot. Identical to the n = 1 version except panels 1-2 draw a single
+    chosen DOF of Q / P, selected by `dof_index` in {0, ..., n-1}. Panel 3 (the
+    within-segment CV curve, the actual result) is unchanged, since the metric is
+    already scalar.
+
+    Args:
+        results: dict from test_model_variance_with_varying_observed_points_general
+        dof_index: which DOF to display in the Q(t) / P(t) panels
+        (remaining args as in the n = 1 version)
+    """
+    point_counts = results['point_counts']
+    valid_mask = results['valid_mask']
+    median_curve = results['median_curve']
+    p25_curve = results['p25_curve']
+    p75_curve = results['p75_curve']
+    final_median = results['final_median']
+    final_q1 = results['final_q1']
+    final_q3 = results['final_q3']
+    final_ci_lower = results['final_ci_lower']
+    final_ci_upper = results['final_ci_upper']
+    ci_method = results['ci_method']
+    confidence_level = results['confidence_level']
+    N_traj = results['N_traj']
+    N_obs = results['N_obs']
+    n_permutations = results['n_permutations']
+    t_np = results['t']
+    Tmax = results['Tmax']
+    X_final_array = results['X_final_array']       # (N_traj, N_obs, n)
+    U_final_array = results['U_final_array']
+    n = results['n']
+
+    if not (0 <= dof_index < n):
+        raise ValueError(f"dof_index={dof_index} out of range for n={n}")
+    Xd = X_final_array[:, :, dof_index]            # (N_traj, N_obs)
+    Ud = U_final_array[:, :, dof_index]
+    dof_lbl = dof_index + 1
+
+    if only_plot_percentage is not None:
+        if not (0.0 <= only_plot_percentage <= 1.0):
+            raise ValueError("only_plot_percentage must be between 0.0 and 1.0")
+        n_to_plot = max(1, int(N_traj * only_plot_percentage))
+        plot_indices = np.random.choice(N_traj, size=n_to_plot, replace=False)
+        plot_indices = sorted(plot_indices)
+    else:
+        plot_indices = list(range(N_traj))
+
+    import matplotlib.cm as cm
+    colors = cm.get_cmap('tab10' if N_traj <= 10 else 'tab20' if N_traj <= 20 else 'hsv')(
+        np.linspace(0, 1, N_traj))
+
+    fig, (ax3, ax1, ax2) = plt.subplots(1, 3, figsize=figsize)
+
+    # === Plot 1: Q_dof(t) ===
+    for i in plot_indices:
+        ax1.plot(t_np, Xd[i], alpha=0.7, color=colors[i])
+
+    max_time = t_np[-1]
+    current_marker = Tmax
+    first_line = True
+    while current_marker < max_time:
+        label = f'Tmax ({Tmax:.3f})' if first_line else None
+        ax1.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+        current_marker += Tmax
+        first_line = False
+
+    ax1.set_xlabel('Time (t)')
+    ax1.set_ylabel(f'$Q_{{{dof_lbl}}}(t)$')
+    if only_plot_percentage is not None:
+        ax1.set_title(f"$Q_{{{dof_lbl}}}(t)$ — {len(plot_indices)} of {N_traj}\n({only_plot_percentage*100:.1f}%)")
+    else:
+        ax1.set_title(f"$Q_{{{dof_lbl}}}(t)$ — All {N_traj} Trajectories")
+    ax1.grid(True, alpha=0.3)
+    if first_line is False:
+        ax1.legend(loc='upper right', fontsize=8)
+
+    # === Plot 2: P_dof(t) ===
+    for i in plot_indices:
+        ax2.plot(t_np, Ud[i], alpha=0.7, color=colors[i])
+
+    current_marker = Tmax
+    first_line = True
+    while current_marker < max_time:
+        label = f'Tmax ({Tmax:.3f})' if first_line else None
+        ax2.axvline(x=current_marker, color='black', linestyle='--', alpha=0.5, label=label)
+        current_marker += Tmax
+        first_line = False
+
+    ax2.set_xlabel('Time (t)')
+    ax2.set_ylabel(f'$P_{{{dof_lbl}}}(t)$')
+    if only_plot_percentage is not None:
+        ax2.set_title(f"$P_{{{dof_lbl}}}(t)$ — {len(plot_indices)} of {N_traj}\n({only_plot_percentage*100:.1f}%)")
+    else:
+        ax2.set_title(f"$P_{{{dof_lbl}}}(t)$ — All {N_traj} Trajectories")
+    ax2.grid(True, alpha=0.3)
+    if first_line is False:
+        ax2.legend(loc='upper right', fontsize=8)
+
+    # === Plot 3: Variance curve (unchanged; scalar metric) ===
+    if not np.any(valid_mask):
+        ax3.text(0.5, 0.5, 'No valid data to plot', transform=ax3.transAxes,
+                 ha='center', va='center', fontsize=12)
+    else:
+        plot_points = point_counts[valid_mask]
+        plot_median = median_curve[valid_mask]
+        plot_p25 = p25_curve[valid_mask]
+        plot_p75 = p75_curve[valid_mask]
+
+        ax3.fill_between(plot_points, plot_p25, plot_p75,
+                         alpha=band_alpha, color='red', label='IQR across trajectories')
+        ax3.plot(plot_points, plot_median, color='red', linewidth=1.5,
+                 label='Median across trajectories')
+
+        ax3.set_xlim(plot_points[0], plot_points[-1])
+
+        ci_str = (f"{confidence_level*100:.0f}% {ci_method} CI for median:\n"
+                  f"[{final_ci_lower:.4f}, {final_ci_upper:.4f}]") if ci_method != "N/A" else "CI: N/A"
+        textstr = (
+            f"At all {N_obs} pts sampled:\n"
+            f"Median [IQR]: {final_median:.4f}\n"
+            f"[{final_q1:.4f}, {final_q3:.4f}]\n"
+            f"{ci_str}"
+        )
+        ax3.text(0.98, 0.98, textstr, transform=ax3.transAxes, fontsize=8,
+                 ha='right', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+        ax3.legend(loc='upper left', fontsize=8)
+
+    ax3.set_xlabel('Sampled Points per Trajectory')
+    ax3.set_ylabel(r'$\frac{1}{2n}\sum_i(\mathrm{CV}(Q_i)+\mathrm{CV}(P_i))$')
+    ax3.set_title(f'Within-Segment Consistency\n(N_perm={n_permutations})')
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
