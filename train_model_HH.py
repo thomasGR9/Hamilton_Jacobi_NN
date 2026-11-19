@@ -37,14 +37,14 @@ from modules_general import (
 # ===========================================================================
 # RUN-SPECIFIC KNOBS (edit these)
 # ===========================================================================
-RESUME            = True       # False = fresh training; True = resume from checkpoint
+RESUME            = False       # False = fresh training; True = resume from checkpoint
 RESUME_MODE_A     = True        # (resume only) True = load optimizer/scheduler state (Mode A)
 RESUME_NUM_EPOCHS = 2000         # (resume only) additional epochs
 
 DATA_PICKLE   = "all_dataframes_HH_portable.pkl"
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
-SEED          = 42
-SAVE_DIR      = "./save_directory_HH_general_1"
+SEED          = 62
+SAVE_DIR      = "./save_directory_HH_seed_62"
 
 # columns (n = len(POS_COLS)); this dataset is n = 2
 POS_COLS      = ("x", "y")
@@ -55,16 +55,16 @@ ADD_NOISE       = True          # paper adds N(0, sigma^2) noise to encode input
 NOISE_VARIANCE  = 0.0045          # paper sigma^2 for noisy tasks
 LAMBDA_PRED     = 2.0           # paper lambda_pred (Tasks 1-2)
 LAMBDA_HSIC     = 0.35          # paper lambda_HSIC (Task 2 value; adjust per task)
-WEIGHT_DECAY    = None         # paper lambda_WD on MLP weights (Task 2 value)
-LEARNING_RATE   = None
+WEIGHT_DECAY    = 0.000001         # paper lambda_WD on MLP weights (Task 2 value)
+LEARNING_RATE   = 0.003
 GRAD_CLIP       = 60.0
-NUM_EPOCHS      = 1600
+NUM_EPOCHS      = 2111
 NOISE_THRESHOLD = 2.0           # calibration mean/std switch (kept from old code)
 
 
 
 # early stopping
-EARLY_STOPPING = True
+EARLY_STOPPING = False
 PATIENCE       = 800
 MIN_DELTA      = 0
 SCHEDULER_THRESHOLD = 0.001 
@@ -74,8 +74,8 @@ SCHEDULER_PARAMS = {'mode': 'min', 'factor': 0.5, 'patience': 200, 'threshold': 
 
 # checkpoint / logging
 SAVE_BEST_ONLY   = False
-SAVE_FREQ_EPOCHS = 20
-LOG_FREQ_BATCHES = 10
+SAVE_FREQ_EPOCHS = 211
+LOG_FREQ_BATCHES = 115
 VERBOSE          = 1
 
 
@@ -187,7 +187,7 @@ def main():
             grad_clip_value=GRAD_CLIP,
             num_epochs=NUM_EPOCHS, reshuffle_each_epoch=True,
             early_stopping=EARLY_STOPPING, patience=PATIENCE, min_delta=MIN_DELTA,
-            save_dir=SAVE_DIR, save_best_only=SAVE_BEST_ONLY, save_freq_epochs=SAVE_FREQ_EPOCHS,
+            save_dir=SAVE_DIR, save_best_only=SAVE_BEST_ONLY, save_freq_epochs=SAVE_FREQ_EPOCHS, log_segment_progress=False,
             auto_rescue=True, log_freq_batches=LOG_FREQ_BATCHES, verbose=VERBOSE, device=DEVICE,
         )
     else:
@@ -211,7 +211,7 @@ def main():
             scheduler_params=SCHEDULER_PARAMS, reset_scheduler_patience=False,
             num_epochs=RESUME_NUM_EPOCHS, grad_clip_value=GRAD_CLIP, reshuffle_each_epoch=True,
             early_stopping=EARLY_STOPPING, patience=PATIENCE, min_delta=MIN_DELTA,
-            save_dir=SAVE_DIR, save_best_only=SAVE_BEST_ONLY, save_freq_epochs=SAVE_FREQ_EPOCHS,
+            save_dir=SAVE_DIR, save_best_only=SAVE_BEST_ONLY, save_freq_epochs=SAVE_FREQ_EPOCHS, log_segment_progress=False,
             auto_rescue=True, log_freq_batches=LOG_FREQ_BATCHES, verbose=VERBOSE, device=DEVICE,
         )
 

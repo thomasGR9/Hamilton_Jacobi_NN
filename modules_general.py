@@ -5,6 +5,12 @@ from typing import Union, List, Optional
 import torch.nn.functional as F
 import pandas as pd
 
+import contextlib
+import hashlib
+import inspect
+import platform
+import sys
+
 
 def get_data_from_trajectory_id(ids_df, data_df, trajectory_ids):
     """
@@ -1678,6 +1684,7 @@ def train_model_general(
     save_dir='./checkpoints',
     save_best_only=True,
     save_freq_epochs=1,
+    log_segment_progress=True,
     auto_rescue=True,
     log_freq_batches=10,
     verbose=1,
@@ -1878,18 +1885,19 @@ def train_model_general(
             if val_batch is not None:
                 val_loss = validation_step(val_batch, mapping_net, inverse_net).item()
             if val_train_batch is not None:
-                seg_ids_t, seg_losses_t = validation_step_per_segment(
-                    val_train_batch, mapping_net, inverse_net)
-                for sid, sl in zip(seg_ids_t.tolist(), seg_losses_t.tolist()):
-                    segment_progress_rows.append(
-                        {'epoch': epoch, 'segment_id': int(sid), 'val_train_pred_loss': float(sl)})
-                # flush every epoch (append-safe): rewrite the full accumulated frame
-                prog_df = pd.DataFrame(segment_progress_rows)
-                prog_path = os.path.join(save_dir, "segment_progress.parquet")
-                try:
-                    prog_df.to_parquet(prog_path, index=False)
-                except Exception:
-                    prog_df.to_csv(os.path.join(save_dir, "segment_progress.csv"), index=False)
+                if log_segment_progress:
+                    seg_ids_t, seg_losses_t = validation_step_per_segment(
+                        val_train_batch, mapping_net, inverse_net)
+                    for sid, sl in zip(seg_ids_t.tolist(), seg_losses_t.tolist()):
+                        segment_progress_rows.append(
+                            {'epoch': epoch, 'segment_id': int(sid), 'val_train_pred_loss': float(sl)})
+                    # flush every epoch (append-safe): rewrite the full accumulated frame
+                    prog_df = pd.DataFrame(segment_progress_rows)
+                    prog_path = os.path.join(save_dir, "segment_progress.parquet")
+                    try:
+                        prog_df.to_parquet(prog_path, index=False)
+                    except Exception:
+                        prog_df.to_csv(os.path.join(save_dir, "segment_progress.csv"), index=False)
                 val_train_loss = validation_step(val_train_batch, mapping_net, inverse_net).item()
  
             criterion = val_loss if val_batch is not None else train_pred
@@ -2023,6 +2031,7 @@ def resume_training_from_checkpoint_general(
     save_dir='./checkpoints',
     save_best_only=False,
     save_freq_epochs=2,
+    log_segment_progress=True,
     auto_rescue=True,
     log_freq_batches=10,
     verbose=1,
@@ -2112,7 +2121,7 @@ def resume_training_from_checkpoint_general(
         grad_clip_value=grad_clip_value,
         num_epochs=num_epochs, reshuffle_each_epoch=reshuffle_each_epoch,
         early_stopping=early_stopping, patience=patience, min_delta=min_delta,
-        save_dir=save_dir, save_best_only=save_best_only, save_freq_epochs=save_freq_epochs,
+        save_dir=save_dir, save_best_only=save_best_only, save_freq_epochs=save_freq_epochs, log_segment_progress=log_segment_progress,
         auto_rescue=auto_rescue, log_freq_batches=log_freq_batches, verbose=verbose, device=device,
         optimizer=optimizer, scheduler=scheduler,
         continue_from_epoch=continue_from_epoch,
@@ -4525,3 +4534,282 @@ def plot_variance_results_general(results, dof_index=0, figsize=(20, 6),
 
     plt.tight_layout()
     plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+SET_NAMES = ("Train", "TestA", "TestB")
+METRICS = ("D0", "W0max", "rms_delta", "max_delta", "rms_disp")
+
+
+def _sha_arrays(*arrays):
+    h = hashlib.sha256()
+    for a in arrays:
+        a = np.ascontiguousarray(a)
+        h.update(f"{a.dtype}|{a.shape}|".encode())
+        h.update(a.tobytes())
+    return h.hexdigest()
+
+
+def _source(obj):
+    try:
+        return inspect.getsource(obj)
+    except (OSError, TypeError):
+        return repr(obj)
+
+def create_segments(data_df, id_df, Tmax, default_split='train'):
+    """
+    Segments each trajectory into contiguous chunks of duration at most Tmax.
+    Interior segments are exactly [k*Tmax, (k+1)*Tmax); the final segment is the
+    shorter remainder. After normalization t' = t - t_start, every t' <= Tmax.
+    """
+    assert 'tau_L' in data_df.columns or True, \
+        "note: tau_L on data_df is carried into segments if present; absent is fine for geometry"
+
+    id_records = []
+    segmented_chunks = []
+
+    global_segment_id = 0
+    current_start_index = 0
+
+    for traj_id, group in data_df.groupby('trajectory_id', sort=False):
+        group = group.sort_values('t')
+        times = group['t'].values
+
+        t_min = times[0]
+        t_max = times[-1]
+
+        K = int(np.ceil((t_max - t_min) / Tmax - 1e-9))
+        K = max(K, 1)
+
+        traj_meta = id_df.loc[id_df['trajectory_id'] == traj_id].iloc[0]
+        energy = traj_meta['energy'] if 'energy' in traj_meta else np.nan
+        split_val = traj_meta['split'] if 'split' in traj_meta else default_split
+
+        for k in range(K):
+            T_start_k = t_min + k * Tmax
+            T_end_k = t_min + (k + 1) * Tmax          # hard width Tmax, never clamped
+
+            if k == K - 1:
+                mask = (times >= T_start_k)            # final remainder: all that is left
+            else:
+                mask = (times >= T_start_k) & (times < T_end_k)
+
+            chunk = group.iloc[np.where(mask)[0]].copy()
+            if chunk.empty:
+                continue
+
+            t_start = chunk['t'].iloc[0]
+
+            x0 = chunk['x'].iloc[0]
+            y0 = chunk['y'].iloc[0]
+            px0 = chunk['px'].iloc[0]
+            py0 = chunk['py'].iloc[0]
+
+            chunk['t'] = chunk['t'] - t_start
+            chunk['segment_id'] = global_segment_id
+
+            n_pts = len(chunk)
+
+            id_records.append({
+                'segment_id': global_segment_id,
+                'trajectory_id': traj_id,
+                'start_index': current_start_index,
+                'end_index': current_start_index + n_pts,
+                'generated_points': n_pts,
+                't_start': t_start,
+                'energy': energy,
+                'split': split_val,
+                'x0': x0,
+                'y0': y0,
+                'px0': px0,
+                'py0': py0
+            })
+
+            segmented_chunks.append(chunk)
+
+            global_segment_id += 1
+            current_start_index += n_pts
+
+    segments_df = pd.concat(segmented_chunks, ignore_index=True)
+
+    cols = ['trajectory_id', 'segment_id', 'x', 'y', 'px', 'py', 't']
+    if 'tau_L' in segments_df.columns:
+        cols.append('tau_L')
+    segments_df = segments_df[cols]
+
+    segments_id_df = pd.DataFrame(id_records)
+
+    return segments_df, segments_id_df
+
+@contextlib.contextmanager
+def _fixed_numerics(enc, dec):
+    """Eval mode on both nets (flags do not propagate) and full float32 matmul
+    precision for the duration of one evaluation; everything restored afterwards."""
+    saved = (enc.training, dec.training, torch.backends.cuda.matmul.allow_tf32,
+             torch.backends.cudnn.allow_tf32, torch.get_float32_matmul_precision())
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        enc.train(False)
+        dec.train(False)
+        yield
+    finally:
+        enc.train(saved[0])
+        dec.train(saved[1])
+        torch.backends.cuda.matmul.allow_tf32 = saved[2]
+        torch.backends.cudnn.allow_tf32 = saved[3]
+        torch.set_float32_matmul_precision(saved[4])
+
+
+def _encode_to_gauge(enc, dec, z32, t32, n):
+    """Raw latents l = M(z, t') and gauge latents g = M^{-1}(l, 0).
+    One batch, float32, autograd enabled (the shear terms are autograd gradients)."""
+    device = next(enc.parameters()).device
+    z = torch.tensor(z32, dtype=torch.float32, device=device)
+    t = torch.tensor(t32, dtype=torch.float32, device=device).reshape(-1, 1)
+    with _fixed_numerics(enc, dec), torch.enable_grad():
+        out = enc(z[:, :n], z[:, n:], t)
+        Q, P = out[0].detach(), out[1].detach()
+        out = dec(Q, P, torch.zeros_like(t))
+        q, p = out[0].detach(), out[1].detach()
+    return torch.cat([Q, P], dim=1).cpu().numpy(), torch.cat([q, p], dim=1).cpu().numpy()
+
+
+def _per_trajectory(seg_df, id_df, delta, disp, eligible):
+    tid = seg_df["trajectory_id"].to_numpy()[eligible]
+    d_all, D_all = delta[eligible], disp[eligible]
+    energy = id_df.set_index("trajectory_id")["energy"] if "energy" in id_df.columns else None
+    rows = []
+    for traj, idx in sorted(pd.DataFrame({"tid": tid}).groupby("tid").indices.items()):
+        d, D = d_all[idx], D_all[idx]
+        rows.append({
+            "trajectory_id": traj,
+            "energy": float(energy.loc[traj]) if energy is not None else np.nan,
+            "n_eligible": int(len(idx)),
+            "D0": float(np.sqrt(np.sum(d * d) / np.sum(D * D))),      # Step 8
+            "W0max": float(d.max() / D.max()),                        # Step 9
+            "rms_delta": float(np.sqrt(np.mean(d * d))),
+            "max_delta": float(d.max()),
+            "rms_disp": float(np.sqrt(np.mean(D * D))),
+            "max_disp": float(D.max()),
+        })
+    return pd.DataFrame(rows)
+
+
+def _summary(pt):
+    out = {}
+    for m in METRICS:
+        v = pt[m].to_numpy()
+        q25, q50, q75 = np.percentile(v, [25, 50, 75])              # linear interpolation
+        out[m] = {"median": float(q50), "q25": float(q25), "q75": float(q75),
+                  "min": float(v.min()), "max": float(v.max())}
+    return out
+
+
+def run_constancy_experiment(mapping_net, inverse_net, n, Tmax, sets, segment_fn,
+                             pos_cols, mom_cols, sigma2, metadata=None, verbose=True):
+    """
+    mapping_net, inverse_net : trained encoder and its inverse, called as net(q, p, t), t of shape (N, 1)
+    n                        : degrees of freedom
+    Tmax                     : segment duration used in training
+    sets                     : {"Train": (data_df, id_df), "TestA": (...), "TestB": (...)}, UNSEGMENTED
+    segment_fn               : training loader's segmentation, (data_df, id_df, Tmax) -> (seg_df, seg_id_df)
+    pos_cols, mom_cols       : column names of q and p, in network order
+    sigma2                   : training-noise variance (noise reference sigma*sqrt(2n))
+    metadata                 : optional dict stored verbatim
+    Returns a dict. No file I/O.
+    """
+    enc, dec = mapping_net, inverse_net
+    cols = list(pos_cols) + list(mom_cols)
+    noise_ref = float(np.sqrt(sigma2) * np.sqrt(2 * n))
+    device = next(enc.parameters()).device
+    state = enc.state_dict()
+
+    res = {
+        "spec": {
+            "n": int(n), "Tmax": float(Tmax), "sigma2": float(sigma2), "noise_ref": noise_ref,
+            "pos_cols": list(pos_cols), "mom_cols": list(mom_cols), "set_names": list(SET_NAMES),
+            "gauge": "g = M^{-1}(M(z, t'), 0)",
+            "reference": "gauge latent of the segment's t'=0 observation",
+            "eligible": "t' > 0 in segments with >= 2 observations",
+            "norm": "Euclidean on raw (q, p)",
+            "D0": "sqrt(sum ||g_t - g_0||^2 / sum ||z_t - z_0||^2) per trajectory, eligible observations",
+            "W0max": "max ||g_t - g_0|| / max ||z_t - z_0|| per trajectory, eligible observations",
+            "aggregation": "median and IQR over trajectories, numpy.percentile (linear)",
+            "precision": "float32 network and metrics; inputs cast from float64",
+            "batching": "one batch per set, rows in segment order",
+        },
+        "metadata": dict(metadata) if metadata else {},
+        "environment": {
+            "numpy": np.__version__, "pandas": pd.__version__, "torch": torch.__version__,
+            "cuda": torch.version.cuda, "device": str(device),
+            "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        },
+        "model_sha256": _sha_arrays(*(state[k].detach().cpu().numpy() for k in sorted(state))),
+        "sets": {}, "reading": {}, "hashes": {},
+    }
+
+    for name in SET_NAMES:
+        data_df, id_df = sets[name]
+        seg_df, _ = segment_fn(data_df, id_df, Tmax)                                # Steps 1-2
+        seg_df = seg_df.reset_index(drop=True)
+        sid = seg_df["segment_id"].to_numpy()
+        pos = pd.Series(np.arange(len(seg_df)))
+        ref = pos.groupby(sid).transform("min").to_numpy()                          # segment's t'=0 row
+        size = pos.groupby(sid).transform("size").to_numpy()
+        z32 = seg_df[cols].to_numpy(np.float32)
+        t32 = seg_df["t"].to_numpy(np.float32)
+
+        lat, g = _encode_to_gauge(enc, dec, z32, t32, n)                            # Steps 3-4
+        eligible = (size >= 2) & (seg_df["t"].to_numpy() > 0)                      # Step 6
+        delta = np.linalg.norm(g - g[ref], axis=1)                                  # Steps 5, 7
+        disp = np.linalg.norm(z32 - z32[ref], axis=1)
+        pt = _per_trajectory(seg_df, id_df, delta, disp, eligible)                  # Steps 8-9
+        ref_rows = np.unique(ref)
+        floor_t0 = np.linalg.norm(g[ref_rows] - z32[ref_rows], axis=1)
+
+        res["sets"][name] = {
+            "trajectory_id": seg_df["trajectory_id"].to_numpy(),
+            "segment_id": sid,
+            "t_local": t32,
+            "ref_row": ref,
+            "eligible": eligible,
+            "latents": lat,
+            "gauge": g,
+            "delta": delta,
+            "disp": disp,
+            "per_trajectory": pt,
+            "summary": {"n_traj": int(len(pt)), "n_segments": int(len(np.unique(sid))),
+                        "n_obs": int(len(seg_df)), "n_eligible": int(eligible.sum()), **_summary(pt), "floor_t0_max": float(floor_t0.max()),"floor_t0_rms": float(np.sqrt(np.mean(floor_t0 ** 2))), "min_rms_delta": float(pt["rms_delta"].min()),},
+        }
+        res["hashes"][name] = {"inputs_z_t": _sha_arrays(z32, t32),
+                               "latents": _sha_arrays(lat), "gauge": _sha_arrays(g)}
+
+    d0_train = res["sets"]["Train"]["summary"]["D0"]["median"]                      # Step 14
+    for name in SET_NAMES:
+        s = res["sets"][name]["summary"]
+        res["reading"][name] = {"rms_delta_median_over_noise_ref": s["rms_delta"]["median"] / noise_ref,
+                                "D0_median_over_Train": s["D0"]["median"] / d0_train}
+    res["hashes"]["all_outputs"] = _sha_arrays(*(res["sets"][k][a] for k in SET_NAMES
+                                                  for a in ("latents", "gauge")))
+
+    if verbose:
+        print(f"model {res['model_sha256'][:16]} | outputs {res['hashes']['all_outputs'][:16]}")
+        for name in SET_NAMES:
+            s, r = res["sets"][name]["summary"], res["reading"][name]
+            print(f"{name:<6} n_traj={s['n_traj']:<3} "
+                  + " | ".join(f"{m} {s[m]['median']:.3g} [{s[m]['q25']:.3g}, {s[m]['q75']:.3g}]" for m in METRICS)
+                  + f" | noise ratio {r['rms_delta_median_over_noise_ref']:.3g}"
+                  + f" | D0/Train {r['D0_median_over_Train']:.3g}")
+    return res
