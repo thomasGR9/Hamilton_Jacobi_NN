@@ -219,5 +219,4 @@ dependencies:
       - urllib3==2.7.0
       - wadler-lindig==0.1.7
       - wandb==0.27.0
-variables:
-  LD_LIBRARY_PATH: ''
+
